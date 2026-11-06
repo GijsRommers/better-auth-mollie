@@ -45,8 +45,14 @@ export type RunOperationOptions<T> = {
 	 */
 	scope: string;
 	/**
-	 * Return an earlier successful attempt instead of calling Mollie again.
-	 * `true` for one-shot intents (create the customer for X, activate Y).
+	 * `true`: return an earlier successful attempt instead of calling Mollie
+	 * again (one-shot intents: create the customer for X, activate Y).
+	 *
+	 * `false`: start a new attempt even if an earlier one succeeded. Attempts
+	 * that are still unresolved (in flight, recoverable, or finishing while
+	 * being written off) are always joined, so concurrent callers of the same
+	 * scope share one Mollie resource. Put everything that must not be shared
+	 * (e.g. plan and amount of a checkout) into `scope`.
 	 */
 	reuseSucceeded: boolean;
 	/**

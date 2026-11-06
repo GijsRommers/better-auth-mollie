@@ -156,6 +156,26 @@ export function isMollieConflict(error: unknown): boolean {
 	return isMollieApiError(error) && error.statusCode === 409;
 }
 
+const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Merges flat metadata objects for Mollie. `internal` (keys the plugin relies
+ * on) always wins; prototype-polluting keys are dropped.
+ */
+export function mergeMetadata(
+	internal: Record<string, unknown>,
+	...sources: (Record<string, unknown> | null | undefined)[]
+): Record<string, unknown> {
+	const merged: Record<string, unknown> = {};
+	for (const source of sources) {
+		if (!source) continue;
+		for (const [key, value] of Object.entries(source)) {
+			if (!UNSAFE_KEYS.has(key)) merged[key] = value;
+		}
+	}
+	return { ...merged, ...internal };
+}
+
 export function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }

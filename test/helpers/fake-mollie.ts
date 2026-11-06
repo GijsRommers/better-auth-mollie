@@ -1,15 +1,18 @@
-import type { MollieClient } from "@mollie/api-client";
+import type { Client } from "mollie-api-typescript";
 
 /**
- * In-memory stand-in for the parts of `@mollie/api-client` the plugin uses.
+ * In-memory stand-in for the parts of `mollie-api-typescript` the plugin uses
+ * (customers, payments, subscriptions, sales invoices), with the SDK's request
+ * envelopes and response shapes.
  *
- * It keeps state like Mollie does (customers, payments, mandates,
- * subscriptions), replays requests that reuse an idempotency key, and lets
- * tests drive payments to final states and inject failures.
+ * It keeps state like Mollie does, applies Mollie's idempotency rules (replay
+ * on the same key and parameters, 400 on different parameters, 409 while the
+ * first request is still processing), and lets tests drive payments to final
+ * states, simulate the subscription scheduler and inject failures.
  */
 
 type Amount = { currency: string; value: string };
-type Links = Record<string, { href: string; type: string } | undefined>;
+type Link = { href: string; type: string };
 
 export type FakePayment = {
 	resource: "payment";
@@ -19,21 +22,22 @@ export type FakePayment = {
 	amount: Amount;
 	description: string;
 	sequenceType: "oneoff" | "first" | "recurring";
+	profileId: string;
 	customerId?: string | undefined;
-	mandateId?: string | undefined;
-	subscriptionId?: string | undefined;
+	mandateId?: string | null | undefined;
+	subscriptionId?: string | null | undefined;
 	method?: string | null;
 	metadata: unknown;
-	redirectUrl?: string | undefined;
-	cancelUrl?: string | undefined;
-	webhookUrl?: string | undefined;
-	locale?: string | undefined;
+	redirectUrl?: string | null | undefined;
+	cancelUrl?: string | null | undefined;
+	webhookUrl?: string | null | undefined;
+	locale?: string | null | undefined;
 	createdAt: string;
-	paidAt?: string | undefined;
-	failedAt?: string | undefined;
-	expiredAt?: string | undefined;
-	canceledAt?: string | undefined;
-	_links: Links;
+	paidAt?: string | null | undefined;
+	failedAt?: string | null | undefined;
+	expiredAt?: string | null | undefined;
+	canceledAt?: string | null | undefined;
+	links: { self: Link; dashboard: Link; checkout?: Link; changePaymentState?: Link | null };
 };
 
 export type FakeSubscription = {
@@ -42,25 +46,32 @@ export type FakeSubscription = {
 	mode: "test";
 	status: "pending" | "active" | "canceled" | "suspended" | "completed";
 	amount: Amount;
+	times: number | null;
+	timesRemaining: number | null;
 	interval: string;
 	description: string;
 	startDate: string;
-	nextPaymentDate?: string | undefined;
+	nextPaymentDate?: string | null | undefined;
+	method: string | null;
 	customerId: string;
 	mandateId?: string | undefined;
-	webhookUrl?: string | undefined;
+	webhookUrl: string | null;
 	metadata: unknown;
 	createdAt: string;
-	canceledAt?: string | undefined;
+	canceledAt?: string | null | undefined;
+	links: { self: Link };
 };
 
 export type FakeCustomer = {
 	resource: "customer";
 	id: string;
-	name?: string | undefined;
-	email?: string | undefined;
+	mode: "test";
+	name: string | null;
+	email: string | null;
+	locale: string | null;
 	metadata: unknown;
 	createdAt: string;
+	links: { self: Link };
 };
 
 export type FakeMandate = {
@@ -72,10 +83,21 @@ export type FakeMandate = {
 	createdAt: string;
 };
 
+export type FakeSalesInvoice = {
+	resource: "sales-invoice";
+	id: string;
+	mode: "test";
+	status: string;
+	invoiceNumber: string | null;
+	metadata: unknown;
+	request: Record<string, unknown>;
+	createdAt: string;
+};
+
 export type FakeCall = { method: string; args: unknown[] };
 
 export function mollieError(statusCode: number, message = `Mollie error ${statusCode}`) {
-	return Object.assign(new Error(message), { name: "ApiError", statusCode });
+	return Object.assign(new Error(message), { name: "ErrorResponse", statusCode });
 }
 
 function addMonths(date: string, months: number): string {
@@ -88,6 +110,11 @@ function addMonths(date: string, months: number): string {
 	return d.toISOString().slice(0, 10);
 }
 
+const link = (href: string): Link => ({ href, type: "application/hal+json" });
+const page = <K extends string, T>(key: K, items: T[]) => ({
+	result: { count: items.length, embedded: { [key]: items } as Record<K, T[]>, links: {} },
+});
+
 export function createFakeMollie(options: { now?: () => Date } = {}) {
 	let clock = options.now ?? (() => new Date());
 	let counter = 0;
@@ -98,6 +125,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const payments = new Map<string, FakePayment>();
 	const subscriptions = new Map<string, FakeSubscription>();
 	const mandates = new Map<string, FakeMandate>();
+	const salesInvoices = new Map<string, FakeSalesInvoice>();
 	/** Mollie's stored responses per idempotency key (kept for one hour in reality). */
 	const idempotency = new Map<string, { fingerprint: string; value?: unknown; error?: unknown }>();
 	const inFlight = new Set<string>();
@@ -110,10 +138,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	function record(method: string, args: unknown[]) {
 		calls.push({ method, args });
 		const queue = failures.get(method);
-		if (queue && queue.length > 0) {
-			const error = queue.shift();
-			throw error;
-		}
+		if (queue && queue.length > 0) throw queue.shift();
 	}
 
 	function stableStringify(value: unknown): string {
@@ -142,10 +167,10 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	 * parameters it is rejected with 400, and while the first request is still
 	 * processing a second one gets 409.
 	 */
-	async function idempotent<T>(method: string, params: any, create: () => T): Promise<T> {
+	async function idempotent<T>(method: string, request: any, create: () => T): Promise<T> {
+		record(method, [request]);
 		await takeHold(method, "arrival");
-		const key: string | undefined = params.idempotencyKey;
-		const { idempotencyKey: _ignored, ...rest } = params;
+		const { idempotencyKey: key, ...rest } = request as { idempotencyKey?: string };
 		const fingerprint = `${method}:${stableStringify(rest)}`;
 		if (key) {
 			const stored = idempotency.get(key);
@@ -168,9 +193,10 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			await takeHold(method, "processing");
 			const created = create();
 			if (key) idempotency.set(key, { fingerprint, value: structuredClone(created) });
-			return created;
+			afterCreate.get(method)?.();
+			return structuredClone(created);
 		} catch (error) {
-			if (key) idempotency.set(key, { fingerprint, error });
+			if (key && !idempotency.has(key)) idempotency.set(key, { fingerprint, error });
 			throw error;
 		} finally {
 			if (key) inFlight.delete(key);
@@ -181,37 +207,35 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		throw mollieError(404, "The resource could not be found");
 	}
 
-	function clone<T>(value: T): T {
-		return structuredClone(value);
-	}
+	const clone = <T>(value: T): T => structuredClone(value);
 
-	function createPayment(params: any): FakePayment {
+	function createPayment(body: any): FakePayment {
 		const paymentId = id("tr");
 		const payment: FakePayment = {
 			resource: "payment",
 			id: paymentId,
 			mode: "test",
 			status: "open",
-			amount: { ...params.amount },
-			description: params.description,
-			sequenceType: params.sequenceType ?? "oneoff",
-			customerId: params.customerId,
-			mandateId: params.mandateId,
-			method: Array.isArray(params.method) ? null : (params.method ?? null),
-			metadata: params.metadata ?? null,
-			redirectUrl: params.redirectUrl,
-			cancelUrl: params.cancelUrl,
-			webhookUrl: params.webhookUrl,
-			locale: params.locale,
+			amount: { ...body.amount },
+			description: body.description,
+			sequenceType: body.sequenceType ?? "oneoff",
+			profileId: "pfl_fake",
+			customerId: body.customerId,
+			mandateId: body.mandateId ?? null,
+			subscriptionId: null,
+			method: Array.isArray(body.method) ? null : (body.method ?? null),
+			metadata: body.metadata ?? null,
+			redirectUrl: body.redirectUrl ?? null,
+			cancelUrl: body.cancelUrl ?? null,
+			webhookUrl: body.webhookUrl ?? null,
+			locale: body.locale ?? null,
 			createdAt: iso(),
-			_links: {
-				checkout:
-					params.sequenceType === "recurring"
-						? undefined
-						: {
-								href: `https://www.mollie.com/checkout/test-mode?token=${paymentId}`,
-								type: "text/html",
-							},
+			links: {
+				self: link(`https://api.mollie.com/v2/payments/${paymentId}`),
+				dashboard: link(`https://my.mollie.com/dashboard/payments/${paymentId}`),
+				...(body.sequenceType === "recurring"
+					? { changePaymentState: link(`https://www.mollie.com/checkout/test-mode?t=${paymentId}`) }
+					: { checkout: link(`https://www.mollie.com/checkout/test-mode?t=${paymentId}`) }),
 			},
 		};
 		payments.set(paymentId, payment);
@@ -220,164 +244,208 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 
 	const client = {
 		customers: {
-			async create(params: any) {
-				record("customers.create", [params]);
-				const result = await idempotent("customers.create", params, () => {
+			create: (request: any) =>
+				idempotent("customers.create", request, () => {
+					const body = request.entityCustomer ?? {};
 					const customer: FakeCustomer = {
 						resource: "customer",
 						id: id("cst"),
-						name: params.name,
-						email: params.email,
-						metadata: params.metadata ?? null,
+						mode: "test",
+						name: body.name ?? null,
+						email: body.email ?? null,
+						locale: body.locale ?? null,
+						metadata: body.metadata ?? null,
 						createdAt: iso(),
+						links: { self: link("https://api.mollie.com/v2/customers") },
 					};
 					customers.set(customer.id, customer);
 					return customer;
-				});
-				afterCreate.get("customers.create")?.();
-				return clone(result);
+				}),
+			async get(request: { customerId: string }) {
+				record("customers.get", [request]);
+				return clone(customers.get(request.customerId) ?? notFound());
 			},
-			async get(customerId: string) {
-				record("customers.get", [customerId]);
-				return clone(customers.get(customerId) ?? notFound());
-			},
-			async update(customerId: string, params: any) {
-				record("customers.update", [customerId, params]);
-				const customer = customers.get(customerId) ?? notFound();
-				Object.assign(customer, params);
+			async update(request: { customerId: string; requestBody?: any }) {
+				record("customers.update", [request]);
+				const customer = customers.get(request.customerId) ?? notFound();
+				Object.assign(customer, request.requestBody ?? {});
 				return clone(customer);
 			},
-			async page(params: any = {}) {
-				record("customers.page", [params]);
-				return [...customers.values()]
-					.reverse()
-					.slice(0, params.limit ?? 50)
-					.map(clone);
+			async list(request: { limit?: number } = {}) {
+				record("customers.list", [request]);
+				return page(
+					"customers",
+					[...customers.values()]
+						.reverse()
+						.slice(0, request.limit ?? 50)
+						.map(clone),
+				);
+			},
+			async listPayments(request: { customerId: string; limit?: number }) {
+				record("customers.listPayments", [request]);
+				return page(
+					"payments",
+					[...payments.values()]
+						.filter((p) => p.customerId === request.customerId)
+						.reverse()
+						.slice(0, request.limit ?? 50)
+						.map(clone),
+				);
 			},
 		},
 		payments: {
-			async create(params: any) {
-				record("payments.create", [params]);
-				const result = await idempotent("payments.create", params, () => createPayment(params));
-				afterCreate.get("payments.create")?.();
-				return clone(result);
-			},
-			async get(paymentId: string) {
-				record("payments.get", [paymentId]);
-				return clone(payments.get(paymentId) ?? notFound());
+			create: (request: any) =>
+				idempotent("payments.create", request, () => createPayment(request.paymentRequest)),
+			async get(request: { paymentId: string }) {
+				record("payments.get", [request]);
+				return clone(payments.get(request.paymentId) ?? notFound());
 			},
 		},
-		customerPayments: {
-			async page(params: any) {
-				record("customerPayments.page", [params]);
-				return [...payments.values()]
-					.filter((p) => p.customerId === params.customerId)
-					.reverse()
-					.slice(0, params.limit ?? 50)
-					.map(clone);
+		mandates: {
+			async list(request: { customerId: string }) {
+				record("mandates.list", [request]);
+				return page(
+					"mandates",
+					[...mandates.values()].filter((m) => m.customerId === request.customerId).map(clone),
+				);
 			},
 		},
-		customerMandates: {
-			async page(params: any) {
-				record("customerMandates.page", [params]);
-				return [...mandates.values()]
-					.filter((m) => m.customerId === params.customerId)
-					.reverse()
-					.map(clone);
-			},
-			async get(mandateId: string, params: any) {
-				record("customerMandates.get", [mandateId, params]);
-				const mandate = mandates.get(mandateId);
-				if (!mandate || mandate.customerId !== params.customerId) notFound();
-				return clone(mandate);
-			},
-		},
-		customerSubscriptions: {
-			async create(params: any) {
-				record("customerSubscriptions.create", [params]);
-				const result = await idempotent("customerSubscriptions.create", params, () => {
-					const mandate = params.mandateId ? mandates.get(params.mandateId) : undefined;
-					if (params.mandateId && (!mandate || mandate.status === "invalid")) {
+		subscriptions: {
+			create: (request: any) =>
+				idempotent("subscriptions.create", request, () => {
+					const body = request.subscriptionRequest ?? {};
+					const mandate = body.mandateId ? mandates.get(body.mandateId) : undefined;
+					if (body.mandateId && (!mandate || mandate.status === "invalid")) {
 						throw mollieError(422, "The mandate is invalid");
 					}
-					const description = params.description as string;
 					const duplicate = [...subscriptions.values()].some(
 						(s) =>
-							s.customerId === params.customerId &&
+							s.customerId === request.customerId &&
 							s.status === "active" &&
-							s.description === description,
+							s.description === body.description,
 					);
-					if (duplicate) throw mollieError(422, "Description must be unique");
-					const startDate = params.startDate ?? iso().slice(0, 10);
+					if (duplicate) throw mollieError(422, "The subscription description must be unique");
+					const startDate = body.startDate ?? iso().slice(0, 10);
 					const subscription: FakeSubscription = {
 						resource: "subscription",
 						id: id("sub"),
 						mode: "test",
 						status: "active",
-						amount: { ...params.amount },
-						interval: params.interval,
-						description,
+						amount: { ...body.amount },
+						times: body.times ?? null,
+						timesRemaining: body.times ?? null,
+						interval: body.interval,
+						description: body.description,
 						startDate,
 						nextPaymentDate: startDate,
-						customerId: params.customerId,
-						mandateId: params.mandateId,
-						webhookUrl: params.webhookUrl,
-						metadata: params.metadata ?? null,
+						method: body.method ?? null,
+						customerId: request.customerId,
+						mandateId: body.mandateId,
+						webhookUrl: body.webhookUrl ?? null,
+						metadata: body.metadata ?? null,
 						createdAt: iso(),
+						links: { self: link("https://api.mollie.com/v2/subscriptions") },
 					};
 					subscriptions.set(subscription.id, subscription);
 					return subscription;
-				});
-				afterCreate.get("customerSubscriptions.create")?.();
-				return clone(result);
-			},
-			async get(subscriptionId: string, params: any) {
-				record("customerSubscriptions.get", [subscriptionId, params]);
-				const subscription = subscriptions.get(subscriptionId);
-				if (!subscription || subscription.customerId !== params.customerId) notFound();
+				}),
+			async get(request: { customerId: string; subscriptionId: string }) {
+				record("subscriptions.get", [request]);
+				const subscription = subscriptions.get(request.subscriptionId);
+				if (!subscription || subscription.customerId !== request.customerId) notFound();
 				return clone(subscription);
 			},
-			async cancel(subscriptionId: string, params: any) {
-				record("customerSubscriptions.cancel", [subscriptionId, params]);
-				const subscription = subscriptions.get(subscriptionId);
-				if (!subscription || subscription.customerId !== params.customerId) notFound();
-				if (subscription.status === "canceled") {
-					throw mollieError(422, "The subscription has been canceled");
-				}
-				subscription.status = "canceled";
-				subscription.canceledAt = iso();
-				subscription.nextPaymentDate = undefined;
-				return clone(subscription);
+			cancel: (request: { customerId: string; subscriptionId: string; idempotencyKey?: string }) =>
+				idempotent("subscriptions.cancel", request, () => {
+					const subscription = subscriptions.get(request.subscriptionId);
+					if (!subscription || subscription.customerId !== request.customerId) notFound();
+					if (subscription.status === "canceled") {
+						throw mollieError(422, "The subscription has been canceled");
+					}
+					subscription.status = "canceled";
+					subscription.canceledAt = iso();
+					subscription.nextPaymentDate = null;
+					return clone(subscription);
+				}),
+			async list(request: { customerId: string; limit?: number }) {
+				record("subscriptions.list", [request]);
+				return page(
+					"subscriptions",
+					[...subscriptions.values()]
+						.filter((s) => s.customerId === request.customerId)
+						.reverse()
+						.slice(0, request.limit ?? 50)
+						.map(clone),
+				);
 			},
-			async page(params: any) {
-				record("customerSubscriptions.page", [params]);
-				return [...subscriptions.values()]
-					.filter((s) => s.customerId === params.customerId)
-					.reverse()
-					.map(clone);
+			async listPayments(request: { customerId: string; subscriptionId: string; limit?: number }) {
+				record("subscriptions.listPayments", [request]);
+				return page(
+					"payments",
+					[...payments.values()]
+						.filter((p) => p.subscriptionId === request.subscriptionId)
+						.reverse()
+						.slice(0, request.limit ?? 50)
+						.map(clone),
+				);
 			},
 		},
-		subscriptionPayments: {
-			async page(params: any) {
-				record("subscriptionPayments.page", [params]);
-				return [...payments.values()]
-					.filter((p) => p.subscriptionId === params.subscriptionId)
-					.reverse()
-					.slice(0, params.limit ?? 50)
-					.map(clone);
+		salesInvoices: {
+			create: (request: any) =>
+				idempotent("salesInvoices.create", request, () => {
+					const body = request.salesInvoiceRequest ?? {};
+					const invoice: FakeSalesInvoice = {
+						resource: "sales-invoice",
+						id: id("invoice"),
+						mode: "test",
+						status: body.status,
+						invoiceNumber: body.status === "draft" ? null : `INV-${counter}`,
+						metadata: body.metadata ?? null,
+						request: clone(body),
+						createdAt: iso(),
+					};
+					salesInvoices.set(invoice.id, invoice);
+					return invoice;
+				}),
+			async list(request: { limit?: number } = {}) {
+				record("salesInvoices.list", [request]);
+				return page(
+					"invoices",
+					[...salesInvoices.values()]
+						.reverse()
+						.slice(0, request.limit ?? 50)
+						.map(clone),
+				);
 			},
 		},
 	};
 
 	const controls = {
-		client: client as unknown as MollieClient,
+		client: client as unknown as Client,
 		calls,
 		customers,
 		payments,
 		subscriptions,
 		mandates,
+		salesInvoices,
 		setNow(now: () => Date) {
 			clock = now;
+		},
+		callsTo(method: string) {
+			return calls.filter((c) => c.method === method);
+		},
+		/** Queue an error for the next call to `method` (thrown before Mollie sees it). */
+		failNext(method: string, error: unknown) {
+			const queue = failures.get(method) ?? [];
+			queue.push(error);
+			failures.set(method, queue);
+		},
+		/** Run `fn` after the next successful create of `method`, e.g. to lose the response. */
+		afterNextCreate(method: string, fn: () => void) {
+			afterCreate.set(method, () => {
+				afterCreate.delete(method);
+				fn();
+			});
 		},
 		/** Mollie forgets idempotency keys after an hour. */
 		expireIdempotencyKeys() {
@@ -396,22 +464,6 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			holds.set(method, { phase, gate });
 			return release;
 		},
-		callsTo(method: string) {
-			return calls.filter((c) => c.method === method);
-		},
-		/** Queue an error for the next call to `method`. */
-		failNext(method: string, error: unknown) {
-			const queue = failures.get(method) ?? [];
-			queue.push(error);
-			failures.set(method, queue);
-		},
-		/** Run `fn` after the next successful create of `method` (e.g. to simulate a crash). */
-		afterNextCreate(method: string, fn: () => void) {
-			afterCreate.set(method, () => {
-				afterCreate.delete(method);
-				fn();
-			});
-		},
 		/**
 		 * Simulates the customer finishing (or abandoning) checkout. A paid
 		 * first payment creates a valid mandate, like Mollie does.
@@ -422,13 +474,13 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			payment.status = status;
 			if (status === "paid") {
 				payment.paidAt = iso();
-				payment._links.checkout = undefined;
+				delete payment.links.checkout;
 				if (payment.sequenceType === "first" && payment.customerId && !payment.mandateId) {
 					const mandate: FakeMandate = {
 						resource: "mandate",
 						id: id("mdt"),
 						status: "valid",
-						method: "directdebit",
+						method: "creditcard",
 						customerId: payment.customerId,
 						createdAt: iso(),
 					};
@@ -471,7 +523,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			const subscription = subscriptions.get(subscriptionId);
 			if (!subscription) throw new Error(`Unknown subscription ${subscriptionId}`);
 			subscription.status = status;
-			if (status === "canceled" || status === "completed") subscription.nextPaymentDate = undefined;
+			if (status === "canceled" || status === "completed") subscription.nextPaymentDate = null;
 		},
 		activeSubscriptionsFor(customerId: string) {
 			return [...subscriptions.values()].filter(

@@ -1,12 +1,12 @@
-import type {
-	Customer,
-	CustomerCreateParams,
-	MollieClient,
-	Payment,
-	PaymentCreateParams,
-} from "@mollie/api-client";
 import type { GenericEndpointContext, InferOptionSchema, Session, User } from "better-auth";
 import type { Organization } from "better-auth/plugins/organization";
+import type { Client } from "mollie-api-typescript";
+import type {
+	CustomerResponse,
+	EntityCustomer,
+	PaymentRequest,
+} from "mollie-api-typescript/models";
+import type { MolliePayment } from "./gateway";
 import type { getSchemaDefinition } from "./schema";
 
 /**
@@ -134,8 +134,7 @@ export type MollieOperationKind =
 	| "create_customer"
 	| "create_first_payment"
 	| "create_subscription"
-	| "cancel_subscription"
-	| "create_sales_invoice";
+	| "cancel_subscription";
 
 /**
  * Write-ahead journal entry. Written before every mutating Mollie call so a
@@ -166,7 +165,7 @@ export type MollieCtxSession = {
 
 export type PaymentHookData = {
 	/** The payment exactly as fetched from the Mollie API. */
-	payment: Payment;
+	payment: MolliePayment;
 	/** The local `molliePayment` row after this update. */
 	record: MolliePaymentRecord;
 	subscription: Subscription;
@@ -183,7 +182,7 @@ export type PaymentHookData = {
  * plugin controls (amount, sequence type, customer, URLs) cannot be overridden.
  */
 export type FirstPaymentParams = Omit<
-	Partial<PaymentCreateParams>,
+	Partial<PaymentRequest>,
 	| "amount"
 	| "sequenceType"
 	| "customerId"
@@ -191,7 +190,7 @@ export type FirstPaymentParams = Omit<
 	| "redirectUrl"
 	| "cancelUrl"
 	| "webhookUrl"
-	| "idempotencyKey"
+	| "testmode"
 >;
 
 export type SubscriptionOptions = {
@@ -264,7 +263,7 @@ export type SubscriptionOptions = {
 	 */
 	onSubscriptionActivated?:
 		| ((
-				data: { subscription: Subscription; plan: MolliePlan | undefined; payment: Payment },
+				data: { subscription: Subscription; plan: MolliePlan | undefined; payment: MolliePayment },
 				ctx: GenericEndpointContext,
 		  ) => Promise<void>)
 		| undefined;
@@ -297,85 +296,12 @@ export type SubscriptionOptions = {
 		| undefined;
 };
 
-export type SalesInvoiceRecipient = {
-	type: "consumer" | "business";
-	email: string;
-	streetAndNumber: string;
-	postalCode: string;
-	city: string;
-	country: string;
-	locale: string;
-	givenName?: string | undefined;
-	familyName?: string | undefined;
-	organizationName?: string | undefined;
-	organizationNumber?: string | undefined;
-	vatNumber?: string | undefined;
-	[key: string]: unknown;
-};
-
-export type SalesInvoiceLine = {
-	description: string;
-	quantity: number;
-	/** VAT rate as a string, e.g. `"21.00"`. */
-	vatRate: string;
-	/** Unit price excluding VAT. */
-	unitPrice: { currency: string; value: string };
-	[key: string]: unknown;
-};
-
-/**
- * Parameters for `POST /v2/sales-invoices`. The plugin sets `status: "paid"`,
- * `paymentDetails`, `metadata` and the idempotency key.
- */
-export type SalesInvoiceParams = {
-	/** @default the subscription's referenceId */
-	recipientIdentifier?: string | undefined;
-	recipient: SalesInvoiceRecipient;
-	lines: SalesInvoiceLine[];
-	/** Deliver through Peppol (Belgium, Germany and the Netherlands). */
-	isEInvoice?: boolean | undefined;
-	[key: string]: unknown;
-};
-
-export type SalesInvoice = {
-	id: string;
-	invoiceNumber?: string | null;
-	status: string;
-	[key: string]: unknown;
-};
-
-export type SalesInvoicesOptions = {
-	enabled: boolean;
-	/**
-	 * Mollie API key (or access token) used for the Sales Invoices API, which
-	 * `@mollie/api-client` does not cover yet.
-	 */
-	apiKey: string;
-	/**
-	 * Build the invoice for a paid payment. Return `null` to skip that payment,
-	 * e.g. trial verification payments.
-	 */
-	getInvoiceParams: (
-		data: PaymentHookData,
-		ctx: GenericEndpointContext,
-	) => SalesInvoiceParams | null | Promise<SalesInvoiceParams | null>;
-	onInvoiceCreated?:
-		| ((
-				data: PaymentHookData & { invoice: SalesInvoice },
-				ctx: GenericEndpointContext,
-		  ) => Promise<void>)
-		| undefined;
-	/** @default "https://api.mollie.com/v2/" */
-	apiEndpoint?: string | undefined;
-	/** Custom fetch implementation (useful for tests). */
-	fetch?: typeof fetch | undefined;
-};
-
 export interface MollieOptions {
 	/**
-	 * A client created with `createMollieClient` from `@mollie/api-client`.
+	 * A client from Mollie's TypeScript SDK (`mollie-api-typescript`), e.g.
+	 * `new Client({ security: { apiKey: process.env.MOLLIE_API_KEY } })`.
 	 */
-	mollieClient: MollieClient;
+	mollieClient: Client;
 	/**
 	 * Absolute webhook URL Mollie should call. Defaults to
 	 * `${baseURL}/mollie/webhook`. Set this when Mollie must reach your app
@@ -388,11 +314,11 @@ export interface MollieOptions {
 	 */
 	createCustomerOnSignUp?: boolean | undefined;
 	getCustomerCreateParams?:
-		| ((user: User, ctx: GenericEndpointContext) => Promise<Partial<CustomerCreateParams>>)
+		| ((user: User, ctx: GenericEndpointContext) => Promise<Partial<EntityCustomer>>)
 		| undefined;
 	onCustomerCreate?:
 		| ((
-				data: { mollieCustomer: Customer; user: User & WithMollieCustomerId },
+				data: { mollieCustomer: CustomerResponse; user: User & WithMollieCustomerId },
 				ctx: GenericEndpointContext,
 		  ) => Promise<void>)
 		| undefined;
@@ -408,12 +334,12 @@ export interface MollieOptions {
 					| ((
 							organization: Organization,
 							ctx: GenericEndpointContext,
-					  ) => Promise<Partial<CustomerCreateParams>>)
+					  ) => Promise<Partial<EntityCustomer>>)
 					| undefined;
 				onCustomerCreate?:
 					| ((
 							data: {
-								mollieCustomer: Customer;
+								mollieCustomer: CustomerResponse;
 								organization: Organization & WithMollieCustomerId;
 							},
 							ctx: GenericEndpointContext,
@@ -421,11 +347,6 @@ export interface MollieOptions {
 					| undefined;
 		  }
 		| undefined;
-	/**
-	 * Optional: create a Mollie sales invoice with status `paid` for every
-	 * paid payment, as proof of payment. Experimental.
-	 */
-	salesInvoices?: SalesInvoicesOptions | undefined;
 	/**
 	 * Customize table and field names.
 	 */

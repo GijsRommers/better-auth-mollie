@@ -1,6 +1,7 @@
 import type { AuthContext } from "better-auth";
 import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createGateway, type MollieGateway } from "../../src/gateway";
 import {
 	findByOperationKey,
 	OperationInProgressError,
@@ -32,8 +33,10 @@ const later = (ms: number) => () => new Date(Date.now() + ms);
  * A realistic operation: create a Mollie subscription. Parameters depend only
  * on the key, as the journal requires.
  */
+let gateway: MollieGateway;
+
 function createSubscriptionOperation(
-	fake: FakeMollie,
+	_fake: FakeMollie,
 	customerId: string,
 	overrides: Partial<RunOperationOptions<{ id: string }>> = {},
 ): RunOperationOptions<{ id: string }> {
@@ -43,22 +46,21 @@ function createSubscriptionOperation(
 		scope: "activate:sub_local:tr_1",
 		reuseSucceeded: true,
 		execute: (idempotencyKey) =>
-			fake.client.customerSubscriptions.create({
+			gateway.createSubscription(
 				customerId,
-				amount: { currency: "EUR", value: "9.95" },
-				interval: "1 month",
-				description: "Pro subscription · sub_local",
-				metadata: { subscriptionId: "sub_local", operationKey: idempotencyKey },
-				idempotencyKey,
-			}),
-		getId: (subscription) => subscription.id,
-		recover: async (idempotencyKey) =>
-			findByOperationKey(
-				await fake.client.customerSubscriptions.page({ customerId }),
+				{
+					amount: { currency: "EUR", value: "9.95" },
+					interval: "1 month",
+					description: "Pro subscription · sub_local",
+					metadata: { subscriptionId: "sub_local", operationKey: idempotencyKey },
+				},
 				idempotencyKey,
 			),
+		getId: (subscription) => subscription.id,
+		recover: async (idempotencyKey) =>
+			findByOperationKey(await gateway.listSubscriptions(customerId), idempotencyKey),
 		compensate: async (mollieId) => {
-			await fake.client.customerSubscriptions.cancel(mollieId, { customerId });
+			await gateway.cancelSubscription(customerId, mollieId, `compensate:${mollieId}`);
 		},
 		...overrides,
 	};
@@ -72,7 +74,8 @@ describe("runOperation", () => {
 	beforeEach(async () => {
 		context = await setup();
 		fake = createFakeMollie();
-		customerId = (await fake.client.customers.create({ name: "Acme" })).id;
+		gateway = createGateway(fake.client);
+		customerId = (await gateway.createCustomer({ name: "Acme" }, "customer:acme")).id;
 	});
 
 	it("journals the call before executing it and passes the key to Mollie", async () => {
@@ -85,7 +88,7 @@ describe("runOperation", () => {
 		const result = await runOperation(context, { ...operation, execute });
 		expect(result.replayed).toBe(false);
 		expect(execute).toHaveBeenCalledWith("activate:sub_local:tr_1#1");
-		const [call] = fake.callsTo("customerSubscriptions.create");
+		const [call] = fake.callsTo("subscriptions.create");
 		expect(call?.args[0]).toMatchObject({ idempotencyKey: "activate:sub_local:tr_1#1" });
 		const [op] = await listOps(context);
 		expect(op).toMatchObject({ status: "succeeded", mollieId: result.mollieId });
@@ -96,21 +99,23 @@ describe("runOperation", () => {
 		const first = await runOperation(context, operation);
 		const again = await runOperation(context, operation);
 		expect(again).toMatchObject({ mollieId: first.mollieId, replayed: true });
-		expect(fake.callsTo("customerSubscriptions.create")).toHaveLength(1);
+		expect(fake.callsTo("subscriptions.create")).toHaveLength(1);
 	});
 
 	it("starts a new numbered attempt when reuse is not wanted", async () => {
 		const operation = createSubscriptionOperation(fake, customerId, {
 			reuseSucceeded: false,
 			execute: (key) =>
-				fake.client.payments.create({
-					amount: { currency: "EUR", value: "0.02" },
-					description: "verification",
-					sequenceType: "first",
-					customerId,
-					metadata: { operationKey: key },
-					idempotencyKey: key,
-				} as never),
+				gateway.createPayment(
+					{
+						amount: { currency: "EUR", value: "0.02" },
+						description: "verification",
+						sequenceType: "first",
+						customerId,
+						metadata: { operationKey: key },
+					},
+					key,
+				),
 		});
 		await runOperation(context, operation);
 		const second = await runOperation(context, operation);
@@ -119,7 +124,7 @@ describe("runOperation", () => {
 	});
 
 	it("recovers a lost response by operationKey instead of creating a duplicate", async () => {
-		fake.afterNextCreate("customerSubscriptions.create", () => {
+		fake.afterNextCreate("subscriptions.create", () => {
 			throw new TypeError("socket hang up");
 		});
 		const operation = createSubscriptionOperation(fake, customerId);
@@ -137,7 +142,7 @@ describe("runOperation", () => {
 
 	it("re-sends a slow pending attempt with the same key, so it cannot duplicate", async () => {
 		// Attempt A is journaled, then stalls before its request reaches Mollie.
-		const release = fake.hold("customerSubscriptions.create", "arrival");
+		const release = fake.hold("subscriptions.create", "arrival");
 		const operation = createSubscriptionOperation(fake, customerId);
 		const attemptA = runOperation(context, operation);
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
@@ -155,10 +160,10 @@ describe("runOperation", () => {
 	});
 
 	it("reports an attempt Mollie is still processing as in progress", async () => {
-		const release = fake.hold("customerSubscriptions.create", "processing");
+		const release = fake.hold("subscriptions.create", "processing");
 		const operation = createSubscriptionOperation(fake, customerId);
 		const attemptA = runOperation(context, operation);
-		await vi.waitFor(() => expect(fake.callsTo("customerSubscriptions.create")).toHaveLength(1));
+		await vi.waitFor(() => expect(fake.callsTo("subscriptions.create")).toHaveLength(1));
 
 		await expect(runOperation(context, operation)).rejects.toBeInstanceOf(OperationInProgressError);
 		expect((await listOps(context))[0]?.status).toBe("pending");
@@ -169,23 +174,25 @@ describe("runOperation", () => {
 	});
 
 	it("compensates an attempt that completes after it was written off", async () => {
-		const release = fake.hold("customerSubscriptions.create", "arrival");
+		const release = fake.hold("subscriptions.create", "arrival");
 		const compensate = vi.fn(async (mollieId: string) => {
-			await fake.client.customerSubscriptions.cancel(mollieId, { customerId });
+			await gateway.cancelSubscription(customerId, mollieId, `compensate:${mollieId}`);
 		});
 		// Per-attempt descriptions, so Mollie's description-uniqueness rule (see
 		// the next test) does not reject the late duplicate first.
 		const operation = createSubscriptionOperation(fake, customerId, {
 			compensate,
 			execute: (idempotencyKey) =>
-				fake.client.customerSubscriptions.create({
+				gateway.createSubscription(
 					customerId,
-					amount: { currency: "EUR", value: "9.95" },
-					interval: "1 month",
-					description: `Pro subscription · ${idempotencyKey}`,
-					metadata: { operationKey: idempotencyKey },
+					{
+						amount: { currency: "EUR", value: "9.95" },
+						interval: "1 month",
+						description: `Pro subscription · ${idempotencyKey}`,
+						metadata: { operationKey: idempotencyKey },
+					},
 					idempotencyKey,
-				}),
+				),
 		});
 		const attemptA = runOperation(context, operation);
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
@@ -236,20 +243,22 @@ describe("runOperation", () => {
 	function unprotectedOperation(overrides: Partial<RunOperationOptions<{ id: string }>> = {}) {
 		return createSubscriptionOperation(fake, customerId, {
 			execute: (idempotencyKey) =>
-				fake.client.customerSubscriptions.create({
+				gateway.createSubscription(
 					customerId,
-					amount: { currency: "EUR", value: "9.95" },
-					interval: "1 month",
-					description: `Pro subscription · ${idempotencyKey}`,
-					metadata: { operationKey: idempotencyKey },
+					{
+						amount: { currency: "EUR", value: "9.95" },
+						interval: "1 month",
+						description: `Pro subscription · ${idempotencyKey}`,
+						metadata: { operationKey: idempotencyKey },
+					},
 					idempotencyKey,
-				}),
+				),
 			...overrides,
 		});
 	}
 
 	it("uses a stale attempt's result when it finishes while being written off", async () => {
-		const release = fake.hold("customerSubscriptions.create", "arrival");
+		const release = fake.hold("subscriptions.create", "arrival");
 		const operation = unprotectedOperation();
 		const attemptA = runOperation(context, operation);
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
@@ -280,7 +289,7 @@ describe("runOperation", () => {
 	});
 
 	it("never hands out a recovered resource whose attempt was written off", async () => {
-		const releaseA = fake.hold("customerSubscriptions.create", "arrival");
+		const releaseA = fake.hold("subscriptions.create", "arrival");
 		const operation = unprotectedOperation();
 		const attemptA = runOperation(context, operation);
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
@@ -313,7 +322,7 @@ describe("runOperation", () => {
 	});
 
 	it("relies on Mollie's unique subscription description as a second safety net", async () => {
-		const release = fake.hold("customerSubscriptions.create", "arrival");
+		const release = fake.hold("subscriptions.create", "arrival");
 		const operation = createSubscriptionOperation(fake, customerId);
 		const attemptA = runOperation(context, operation);
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
@@ -325,7 +334,7 @@ describe("runOperation", () => {
 	});
 
 	it("keeps the attempt pending when Mollie rejects a reused key with different parameters", async () => {
-		fake.afterNextCreate("customerSubscriptions.create", () => {
+		fake.afterNextCreate("subscriptions.create", () => {
 			throw new TypeError("socket hang up");
 		});
 		const operation = createSubscriptionOperation(fake, customerId, {
@@ -336,14 +345,16 @@ describe("runOperation", () => {
 		const changed = createSubscriptionOperation(fake, customerId, {
 			recover: async () => null,
 			execute: (idempotencyKey) =>
-				fake.client.customerSubscriptions.create({
+				gateway.createSubscription(
 					customerId,
-					amount: { currency: "EUR", value: "19.95" },
-					interval: "1 month",
-					description: "Business subscription",
-					metadata: { operationKey: idempotencyKey },
+					{
+						amount: { currency: "EUR", value: "19.95" },
+						interval: "1 month",
+						description: "Business subscription",
+						metadata: { operationKey: idempotencyKey },
+					},
 					idempotencyKey,
-				}),
+				),
 		});
 		await expect(runOperation(context, changed)).rejects.toMatchObject({ statusCode: 400 });
 		// A 400 here does not prove the first request failed: stay pending.
@@ -356,7 +367,7 @@ describe("runOperation", () => {
 	});
 
 	it("marks requests Mollie rejected as failed so the next attempt runs immediately", async () => {
-		fake.failNext("customerSubscriptions.create", mollieError(422, "The mandate is invalid"));
+		fake.failNext("subscriptions.create", mollieError(422, "The mandate is invalid"));
 		const operation = createSubscriptionOperation(fake, customerId);
 		await expect(runOperation(context, operation)).rejects.toThrow("The mandate is invalid");
 		expect((await listOps(context))[0]?.status).toBe("failed");
