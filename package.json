@@ -5,13 +5,13 @@
 	"type": "module",
 	"license": "MIT",
 	"author": "Gijs Rommers",
-	"homepage": "https://github.com/gijs-rommers/better-auth-mollie#readme",
+	"homepage": "https://github.com/GijsRommers/better-auth-mollie#readme",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/gijs-rommers/better-auth-mollie.git"
+		"url": "git+https://github.com/GijsRommers/better-auth-mollie.git"
 	},
 	"bugs": {
-		"url": "https://github.com/gijs-rommers/better-auth-mollie/issues"
+		"url": "https://github.com/GijsRommers/better-auth-mollie/issues"
 	},
 	"keywords": [
 		"better-auth",
