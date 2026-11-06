@@ -3,7 +3,6 @@ import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createGateway, type MollieGateway } from "../../src/gateway";
 import {
-	findByOperationKey,
 	OperationInProgressError,
 	OperationSupersededError,
 	REPLAY_WINDOW_MS,
@@ -57,8 +56,8 @@ function createSubscriptionOperation(
 				idempotencyKey,
 			),
 		getId: (subscription) => subscription.id,
-		recover: async (idempotencyKey) =>
-			findByOperationKey(await gateway.listSubscriptions(customerId), idempotencyKey),
+		recover: (idempotencyKey, attempt) =>
+			gateway.findSubscriptionByOperationKey(customerId, idempotencyKey, attempt.createdAt),
 		compensate: async (mollieId) => {
 			await gateway.cancelSubscription(customerId, mollieId, `compensate:${mollieId}`);
 		},
@@ -212,8 +211,10 @@ describe("runOperation", () => {
 	});
 
 	/** Pauses inside `recover` until released; resolves `paused` when reached. */
+	type Recover = (key: string, attempt: { createdAt: Date }) => Promise<string | null>;
+
 	function pausableRecover(
-		recover: (key: string) => Promise<string | null>,
+		recover: Recover,
 		pause: "before-lookup" | "after-lookup" = "before-lookup",
 	) {
 		let resume!: () => void;
@@ -228,13 +229,13 @@ describe("runOperation", () => {
 		return {
 			paused,
 			resume,
-			recover: async (key: string) => {
-				if (!first) return recover(key);
+			recover: async (key: string, attempt: { createdAt: Date }) => {
+				if (!first) return recover(key, attempt);
 				first = false;
-				const found = pause === "after-lookup" ? await recover(key) : undefined;
+				const found = pause === "after-lookup" ? await recover(key, attempt) : undefined;
 				reached();
 				await gate;
-				return pause === "after-lookup" ? (found ?? null) : recover(key);
+				return pause === "after-lookup" ? (found ?? null) : recover(key, attempt);
 			},
 		};
 	}
@@ -264,8 +265,8 @@ describe("runOperation", () => {
 		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
 
 		// B finds nothing for key #1 (A has not reached Mollie yet), then pauses.
-		const lookup = pausableRecover(async (key) => {
-			const found = await operation.recover(key);
+		const lookup = pausableRecover(async (key, attempt) => {
+			const found = await operation.recover(key, attempt);
 			expect(found).toBeNull();
 			return found;
 		}, "after-lookup");
@@ -333,37 +334,87 @@ describe("runOperation", () => {
 		expect(fake.activeSubscriptionsFor(customerId)).toHaveLength(1);
 	});
 
-	it("keeps the attempt pending when Mollie rejects a reused key with different parameters", async () => {
-		fake.afterNextCreate("subscriptions.create", () => {
-			throw new TypeError("socket hang up");
-		});
-		const operation = createSubscriptionOperation(fake, customerId, {
-			recover: async () => null, // a lookup that misses the created resource
-		});
-		await expect(runOperation(context, operation)).rejects.toThrow("socket hang up");
-
-		const changed = createSubscriptionOperation(fake, customerId, {
-			recover: async () => null,
+	/** Same intent, different parameters (e.g. the customer renamed their organization). */
+	function changedOperation() {
+		return unprotectedOperation({
 			execute: (idempotencyKey) =>
 				gateway.createSubscription(
 					customerId,
 					{
 						amount: { currency: "EUR", value: "19.95" },
 						interval: "1 month",
-						description: "Business subscription",
+						description: `Business subscription · ${idempotencyKey}`,
 						metadata: { operationKey: idempotencyKey },
 					},
 					idempotencyKey,
 				),
 		});
-		await expect(runOperation(context, changed)).rejects.toMatchObject({ statusCode: 400 });
-		// A 400 here does not prove the first request failed: stay pending.
+	}
+
+	it("starts over when a re-send hits a stored error under the same key", async () => {
+		// Mollie rejects the first request (and stores that answer), but the
+		// response never reaches us: the attempt stays pending.
+		fake.mandates.set("mdt_revoked", {
+			resource: "mandate",
+			id: "mdt_revoked",
+			status: "invalid",
+			method: "creditcard",
+			customerId,
+			createdAt: new Date().toISOString(),
+		});
+		fake.loseNextResponse("subscriptions.create");
+		const invalid = unprotectedOperation({
+			execute: (idempotencyKey) =>
+				gateway.createSubscription(
+					customerId,
+					{
+						amount: { currency: "EUR", value: "9.95" },
+						interval: "1 month",
+						description: "Pro",
+						mandateId: "mdt_revoked",
+						metadata: { operationKey: idempotencyKey },
+					},
+					idempotencyKey,
+				),
+		});
+		await expect(runOperation(context, invalid)).rejects.toThrow("socket hang up");
 		expect((await listOps(context))[0]?.status).toBe("pending");
 
-		// A working lookup later resolves it to the subscription that exists.
-		const resolved = await runOperation(context, createSubscriptionOperation(fake, customerId));
-		expect(resolved.replayed).toBe(true);
+		// Re-sent with other parameters: 400, the full lookup finds nothing, so
+		// the attempt is written off and a new one runs.
+		const result = await runOperation(context, changedOperation());
+		expect(result.idempotencyKey).toBe("activate:sub_local:tr_1#2");
 		expect(fake.subscriptions.size).toBe(1);
+		expect((await listOps(context)).map((op) => op.status).sort()).toEqual(["failed", "succeeded"]);
+	});
+
+	it("recovers instead of duplicating when a re-send with other parameters races the original", async () => {
+		// A is journaled, then stalls on its way to Mollie.
+		const releaseA = fake.hold("subscriptions.create", "arrival");
+		const attemptA = runOperation(context, unprotectedOperation());
+		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
+
+		// B (other parameters) finds nothing yet and pauses before re-sending.
+		const changed = changedOperation();
+		const lookup = pausableRecover(changed.recover, "after-lookup");
+		const attemptB = runOperation(context, { ...changed, recover: lookup.recover });
+		await lookup.paused;
+
+		// A lands and creates the subscription; then B re-sends: Mollie says 400.
+		releaseA();
+		const resultA = await attemptA;
+		lookup.resume();
+		const resultB = await attemptB;
+		expect(resultB.mollieId).toBe(resultA.mollieId);
+		expect(fake.subscriptions.size).toBe(1);
+	});
+
+	it("treats a 400 for a fresh key as a rejected request", async () => {
+		fake.failNext("subscriptions.create", mollieError(400, "Malformed request"));
+		await expect(
+			runOperation(context, createSubscriptionOperation(fake, customerId)),
+		).rejects.toMatchObject({ statusCode: 400 });
+		expect((await listOps(context))[0]?.status).toBe("failed");
 	});
 
 	it("marks requests Mollie rejected as failed so the next attempt runs immediately", async () => {

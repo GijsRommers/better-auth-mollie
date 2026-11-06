@@ -1,7 +1,7 @@
 import type { GenericEndpointContext } from "better-auth";
 import type { SalesInvoiceRequest, SalesInvoiceResponse } from "mollie-api-typescript/models";
 import { gatewayFor } from "./gateway";
-import { findByOperationKey, runOperation } from "./operations";
+import { runOperation } from "./operations";
 import type { MollieOptions, PaymentHookData } from "./types";
 import { mergeMetadata } from "./utils";
 
@@ -80,8 +80,8 @@ export async function createSalesInvoice(
 				idempotencyKey,
 			),
 		getId: (invoice) => invoice.id,
-		recover: async (idempotencyKey) =>
-			findByOperationKey(await gateway.listSalesInvoices(), idempotencyKey),
+		recover: (idempotencyKey, attempt) =>
+			gateway.findSalesInvoiceByOperationKey(idempotencyKey, attempt.createdAt),
 	});
 	if (!operation.result) return null;
 	await config.onInvoiceCreated?.({ ...data, invoice: operation.result }, ctx);

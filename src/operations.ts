@@ -1,6 +1,6 @@
 import type { AuthContext } from "better-auth";
 import type { MollieOperation, MollieOperationKind } from "./types";
-import { isMollieConflict, isRejectedMollieRequest } from "./utils";
+import { isMollieBadRequest, isMollieConflict, isRejectedMollieRequest } from "./utils";
 
 /**
  * Mollie keeps idempotency keys for one hour. Within this window a pending
@@ -56,16 +56,19 @@ export type RunOperationOptions<T> = {
 	 */
 	reuseSucceeded: boolean;
 	/**
-	 * Performs the Mollie call with `idempotencyKey`. For a given key it must
-	 * send the same parameters, because a pending attempt is re-sent.
+	 * Performs the Mollie call with `idempotencyKey`. A pending attempt is
+	 * re-sent with its key; if the parameters changed meanwhile, Mollie answers
+	 * 400 and the journal falls back to `recover`.
 	 */
 	execute: (idempotencyKey: string) => Promise<T>;
 	getId: (result: T) => string;
 	/**
-	 * Find the resource an earlier attempt may have created, by the
-	 * `operationKey` stored in its Mollie metadata. Returns its id or `null`.
+	 * Find the resource an attempt may have created, by the `operationKey`
+	 * stored in its Mollie metadata. Must search completely (all resources
+	 * created since `attempt.createdAt`, with some slack for clock skew) or
+	 * throw: `null` is taken as proof that nothing was created.
 	 */
-	recover: (idempotencyKey: string) => Promise<string | null>;
+	recover: (idempotencyKey: string, attempt: { createdAt: Date }) => Promise<string | null>;
 	/**
 	 * Undo a resource created by an attempt that finished after it was
 	 * superseded, e.g. cancel a duplicate subscription.
@@ -204,7 +207,8 @@ async function runRound<T>(
 
 	for (const op of attempts) {
 		if (op.status !== "pending") continue;
-		const recovered = await options.recover(op.idempotencyKey);
+		const createdAt = new Date(op.createdAt);
+		const recovered = await options.recover(op.idempotencyKey, { createdAt });
 		if (recovered) {
 			if (await resolveOperation(context, op.idempotencyKey, "succeeded", recovered)) {
 				context.logger.info(
@@ -216,9 +220,9 @@ async function runRound<T>(
 			// resource we found is being compensated and must not be used.
 			return settleLostTransition(context, op.idempotencyKey);
 		}
-		const age = now().getTime() - new Date(op.createdAt).getTime();
+		const age = now().getTime() - createdAt.getTime();
 		if (age < REPLAY_WINDOW_MS) {
-			return executeAttempt(context, options, op.idempotencyKey);
+			return executeAttempt(context, options, op.idempotencyKey, { resend: true, createdAt });
 		}
 		// Mollie no longer remembers this key and nothing carries its
 		// operationKey, so the attempt never took effect...
@@ -233,6 +237,7 @@ async function runRound<T>(
 		...attempts.map((op) => attemptNumber(op.idempotencyKey, options.scope)),
 	);
 	const idempotencyKey = `${options.scope}#${next + 1}`;
+	const createdAt = now();
 	try {
 		await context.adapter.create({
 			model: "mollieOperation",
@@ -242,7 +247,7 @@ async function runRound<T>(
 				referenceId: options.referenceId,
 				status: "pending",
 				mollieId: null,
-				createdAt: now(),
+				createdAt,
 			},
 		});
 	} catch (error) {
@@ -254,24 +259,44 @@ async function runRound<T>(
 		if (existing) throw new OperationInProgressError(idempotencyKey);
 		throw error;
 	}
-	return executeAttempt(context, options, idempotencyKey);
+	return executeAttempt(context, options, idempotencyKey, { resend: false, createdAt });
 }
 
 async function executeAttempt<T>(
 	context: AuthContext,
 	options: RunOperationOptions<T>,
 	idempotencyKey: string,
-): Promise<OperationResult<T>> {
+	attempt: { resend: boolean; createdAt: Date },
+): Promise<OperationResult<T> | typeof RELOAD> {
 	let result: T;
 	try {
 		result = await options.execute(idempotencyKey);
 	} catch (error) {
 		if (isMollieConflict(error)) throw new OperationInProgressError(idempotencyKey);
+		if (isMollieBadRequest(error)) {
+			if (!attempt.resend) {
+				// A fresh key cannot clash, so Mollie rejected the request itself.
+				await resolveOperation(context, idempotencyKey, "failed", null);
+				throw error;
+			}
+			// Mollie already holds a response for this key, but for other
+			// parameters. If that response created the resource, the lookup finds
+			// it; otherwise the earlier request failed and a new attempt is safe.
+			const recovered = await options.recover(idempotencyKey, { createdAt: attempt.createdAt });
+			if (recovered) {
+				if (await resolveOperation(context, idempotencyKey, "succeeded", recovered)) {
+					return { mollieId: recovered, idempotencyKey, replayed: true };
+				}
+				return settleLostTransition(context, idempotencyKey);
+			}
+			if (await resolveOperation(context, idempotencyKey, "failed", null)) return RELOAD;
+			return settleLostTransition(context, idempotencyKey);
+		}
 		if (isRejectedMollieRequest(error)) {
 			await resolveOperation(context, idempotencyKey, "failed", null);
 		}
-		// Anything else (network errors, 5xx, 429, a 400 that may be an
-		// idempotency-key mismatch) leaves the outcome unknown: stay pending.
+		// Anything else (network errors, timeouts, 5xx, 429) leaves the outcome
+		// unknown: stay pending so the next call recovers or re-sends it.
 		throw error;
 	}
 	const mollieId = options.getId(result);

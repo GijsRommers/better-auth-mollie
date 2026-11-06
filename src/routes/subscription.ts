@@ -15,7 +15,7 @@ import { toAPIError } from "../errors";
 import { dispatchEvents } from "../events";
 import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
-import { findByOperationKey, runOperation } from "../operations";
+import { runOperation } from "../operations";
 import {
 	ACCESS_STATUSES,
 	BILLING_STATUSES,
@@ -432,8 +432,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							idempotencyKey,
 						),
 					getId: (created) => created.id,
-					recover: async (idempotencyKey) =>
-						findByOperationKey(await gateway.listCustomerPayments(customerId), idempotencyKey),
+					recover: (idempotencyKey, attempt) =>
+						gateway.findCustomerPaymentByOperationKey(
+							customerId,
+							idempotencyKey,
+							attempt.createdAt,
+						),
 				});
 				payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
 			} catch (error) {

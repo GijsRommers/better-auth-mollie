@@ -1,7 +1,7 @@
 import type { GenericEndpointContext, Where } from "better-auth";
 import type { BillingEvent } from "./events";
 import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } from "./gateway";
-import { findByOperationKey, runOperation } from "./operations";
+import { runOperation } from "./operations";
 import {
 	BILLING_STATUSES,
 	canAdvancePayment,
@@ -442,8 +442,8 @@ export async function createScheduledSubscription(
 				idempotencyKey,
 			),
 		getId: (created) => created.id,
-		recover: async (idempotencyKey) =>
-			findByOperationKey(await gateway.listSubscriptions(customerId), idempotencyKey),
+		recover: (idempotencyKey, attempt) =>
+			gateway.findSubscriptionByOperationKey(customerId, idempotencyKey, attempt.createdAt),
 		compensate: async (mollieId) => {
 			await gateway.cancelSubscription(customerId, mollieId, `compensate:${mollieId}`);
 		},

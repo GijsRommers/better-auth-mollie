@@ -151,6 +151,11 @@ export function isRejectedMollieRequest(error: unknown): boolean {
 	);
 }
 
+/** 400: a malformed request, or an idempotency key reused with other parameters. */
+export function isMollieBadRequest(error: unknown): boolean {
+	return isMollieApiError(error) && error.statusCode === 400;
+}
+
 /** Mollie is still processing an earlier request with the same idempotency key. */
 export function isMollieConflict(error: unknown): boolean {
 	return isMollieApiError(error) && error.statusCode === 409;

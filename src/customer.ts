@@ -5,7 +5,7 @@ import type { CustomerResponse } from "mollie-api-typescript/models";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
 import { toAPIError } from "./errors";
 import { gatewayFor } from "./gateway";
-import { findByOperationKey, runOperation } from "./operations";
+import { runOperation } from "./operations";
 import type { CustomerType, MollieOptions, WithMollieCustomerId } from "./types";
 import { mergeMetadata } from "./utils";
 
@@ -50,7 +50,6 @@ export async function getOrCreateCustomer(
 	}
 
 	const gateway = gatewayFor(options);
-	let created: CustomerResponse | undefined;
 	let mollieCustomerId: string;
 	try {
 		const operation = await runOperation(ctx.context, {
@@ -78,10 +77,9 @@ export async function getOrCreateCustomer(
 					idempotencyKey,
 				),
 			getId: (customer) => customer.id,
-			recover: async (idempotencyKey) =>
-				findByOperationKey(await gateway.listCustomers(), idempotencyKey),
+			recover: (idempotencyKey, attempt) =>
+				gateway.findCustomerByOperationKey(idempotencyKey, attempt.createdAt),
 		});
-		created = operation.result;
 		mollieCustomerId = operation.mollieId;
 	} catch (error) {
 		ctx.context.logger.error("[mollie] Unable to create customer", error);
@@ -94,7 +92,17 @@ export async function getOrCreateCustomer(
 		update: { mollieCustomerId },
 	});
 
-	if (created) {
+	const hook = organization ? options.organization?.onCustomerCreate : options.onCustomerCreate;
+	if (
+		hook &&
+		(await claimDelivery(
+			ctx,
+			`hook:customer-created:${customerType}:${referenceId}`,
+			referenceId,
+			mollieCustomerId,
+		))
+	) {
+		const created: CustomerResponse = await gateway.getCustomer(mollieCustomerId);
 		if (organization) {
 			await options.organization?.onCustomerCreate?.(
 				{ mollieCustomer: created, organization: { ...organization, mollieCustomerId } },
@@ -108,4 +116,37 @@ export async function getOrCreateCustomer(
 		}
 	}
 	return mollieCustomerId;
+}
+
+/**
+ * Claims a one-time delivery (e.g. of a hook) by inserting a journal row
+ * with a unique key. Exactly one concurrent caller gets `true`.
+ */
+export async function claimDelivery(
+	ctx: GenericEndpointContext,
+	key: string,
+	referenceId: string,
+	mollieId: string,
+): Promise<boolean> {
+	try {
+		await ctx.context.adapter.create({
+			model: "mollieOperation",
+			data: {
+				idempotencyKey: key,
+				kind: "hook_delivery",
+				referenceId,
+				status: "succeeded",
+				mollieId,
+				createdAt: new Date(),
+			},
+		});
+		return true;
+	} catch (error) {
+		const existing = await ctx.context.adapter.findOne({
+			model: "mollieOperation",
+			where: [{ field: "idempotencyKey", value: key }],
+		});
+		if (existing) return false;
+		throw error;
+	}
 }

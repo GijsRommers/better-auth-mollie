@@ -138,7 +138,9 @@ export type MollieOperationKind =
 	| "create_first_payment"
 	| "create_subscription"
 	| "cancel_subscription"
-	| "create_sales_invoice";
+	| "create_sales_invoice"
+	/** Marks a hook as delivered, so it runs at most once. */
+	| "hook_delivery";
 
 /**
  * Write-ahead journal entry. Written before every mutating Mollie call so a
@@ -406,6 +408,13 @@ export interface MollieOptions {
 	 * through a different host, e.g. a tunnel during development.
 	 */
 	webhookUrl?: string | undefined;
+	/**
+	 * Timeout for each Mollie API request, in milliseconds. The SDK has none
+	 * of its own; a bounded request keeps webhooks within Mollie's 15-second
+	 * limit and the operation journal's assumptions valid.
+	 * @default 10000
+	 */
+	requestTimeoutMs?: number | undefined;
 	/**
 	 * Create a Mollie customer when a user signs up.
 	 * @default false

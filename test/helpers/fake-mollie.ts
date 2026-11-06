@@ -115,6 +115,23 @@ const page = <K extends string, T>(key: K, items: T[]) => ({
 	result: { count: items.length, embedded: { [key]: items } as Record<K, T[]>, links: {} },
 });
 
+/**
+ * Like the SDK's PageIterator: the first page's fields, plus async
+ * iteration over all pages (first page included).
+ */
+function paginate<K extends string, T>(key: K, items: T[], limit = 50) {
+	const size = Math.min(Math.max(limit, 1), 250);
+	const pages: ReturnType<typeof page<K, T>>[] = [];
+	for (let i = 0; i < items.length; i += size) pages.push(page(key, items.slice(i, i + size)));
+	if (pages.length === 0) pages.push(page(key, []));
+	return {
+		...pages[0]!,
+		async *[Symbol.asyncIterator]() {
+			for (const p of pages) yield p;
+		},
+	};
+}
+
 export function createFakeMollie(options: { now?: () => Date } = {}) {
 	let clock = options.now ?? (() => new Date());
 	let counter = 0;
@@ -134,6 +151,12 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const failures = new Map<string, unknown[]>();
 	/** Called after a create succeeds but before the response returns. */
 	const afterCreate = new Map<string, () => void>();
+	/** Methods whose next response (success or error) is lost on the way back. */
+	const lostResponses = new Set<string>();
+	const loseResponse = (method: string) => {
+		if (!lostResponses.delete(method)) return;
+		throw new TypeError("socket hang up");
+	};
 
 	function record(method: string, args: unknown[]) {
 		calls.push({ method, args });
@@ -194,9 +217,11 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			const created = create();
 			if (key) idempotency.set(key, { fingerprint, value: structuredClone(created) });
 			afterCreate.get(method)?.();
+			loseResponse(method);
 			return structuredClone(created);
 		} catch (error) {
 			if (key && !idempotency.has(key)) idempotency.set(key, { fingerprint, error });
+			loseResponse(method);
 			throw error;
 		} finally {
 			if (key) inFlight.delete(key);
@@ -273,23 +298,17 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			},
 			async list(request: { limit?: number } = {}) {
 				record("customers.list", [request]);
-				return page(
-					"customers",
-					[...customers.values()]
-						.reverse()
-						.slice(0, request.limit ?? 50)
-						.map(clone),
-				);
+				return paginate("customers", [...customers.values()].reverse().map(clone), request.limit);
 			},
 			async listPayments(request: { customerId: string; limit?: number }) {
 				record("customers.listPayments", [request]);
-				return page(
+				return paginate(
 					"payments",
 					[...payments.values()]
 						.filter((p) => p.customerId === request.customerId)
 						.reverse()
-						.slice(0, request.limit ?? 50)
 						.map(clone),
+					request.limit,
 				);
 			},
 		},
@@ -304,7 +323,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		mandates: {
 			async list(request: { customerId: string }) {
 				record("mandates.list", [request]);
-				return page(
+				return paginate(
 					"mandates",
 					[...mandates.values()].filter((m) => m.customerId === request.customerId).map(clone),
 				);
@@ -369,24 +388,24 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				}),
 			async list(request: { customerId: string; limit?: number }) {
 				record("subscriptions.list", [request]);
-				return page(
+				return paginate(
 					"subscriptions",
 					[...subscriptions.values()]
 						.filter((s) => s.customerId === request.customerId)
 						.reverse()
-						.slice(0, request.limit ?? 50)
 						.map(clone),
+					request.limit,
 				);
 			},
 			async listPayments(request: { customerId: string; subscriptionId: string; limit?: number }) {
 				record("subscriptions.listPayments", [request]);
-				return page(
+				return paginate(
 					"payments",
 					[...payments.values()]
 						.filter((p) => p.subscriptionId === request.subscriptionId)
 						.reverse()
-						.slice(0, request.limit ?? 50)
 						.map(clone),
+					request.limit,
 				);
 			},
 		},
@@ -409,12 +428,10 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				}),
 			async list(request: { limit?: number } = {}) {
 				record("salesInvoices.list", [request]);
-				return page(
+				return paginate(
 					"invoices",
-					[...salesInvoices.values()]
-						.reverse()
-						.slice(0, request.limit ?? 50)
-						.map(clone),
+					[...salesInvoices.values()].reverse().map(clone),
+					request.limit,
 				);
 			},
 		},
@@ -446,6 +463,13 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				afterCreate.delete(method);
 				fn();
 			});
+		},
+		/**
+		 * Mollie fully handles the next call to `method` (storing its success or
+		 * error under the idempotency key), but the response never arrives.
+		 */
+		loseNextResponse(method: string) {
+			lostResponses.add(method);
 		},
 		/** Mollie forgets idempotency keys after an hour. */
 		expireIdempotencyKeys() {
