@@ -109,6 +109,9 @@ importers:
 
   .:
     dependencies:
+      sales-tax:
+        specifier: ^2.23.0
+        version: 2.23.0
       zod:
         specifier: ^4.5.4
         version: 4.6.7
@@ -941,6 +944,10 @@ packages:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
 
+  ein-validator@1.0.1:
+    resolution: {integrity: sha512-Qhf7R4YeKCt/06J0CmxzDvqyzpkQvcUls3uJAamh5jrLxv0ZNTCzuzVIU2rXDZk8LKwLXNRFsL4ScAvtdBZsKA==}
+    engines: {node: '>=0.10'}
+
   emoji-regex@8.0.0:
     resolution: {integrity: sha512-MSjYzcWNOA0ewAHpz0MxpYFvwg6yjy1NG3xteoqz644VCo/RPgnr1/GGt+ic3iJTzQ8Eu3TdM14SawnVUmGE6A==}
 
@@ -1011,6 +1018,9 @@ packages:
   joycon@3.1.1:
     resolution: {integrity: sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==}
     engines: {node: '>=10'}
+
+  jsvat-next@3.0.4:
+    resolution: {integrity: sha512-Q9wV2xfBG8yaD4WkskQMLKWXy9vbU5GUABp9tIPldjp7eyLCGK4BLyIYxUP+lXr1E6pIbI0HlSBocF5YSqZduw==}
 
   kysely@0.29.8:
     resolution: {integrity: sha512-ixHU1H4R+LeC5Y0nAhYgiGRFpFRHm2DXKEmJSs/vbes9sKXyssyzxzE/NYiOJX5fY0BL28biCre3GqlCqUwyXQ==}
@@ -1251,6 +1261,10 @@ packages:
     resolution: {integrity: sha512-xal3CZX1Xlo/k4ApwCFrHVACi9fBqJ7V+mwhBsuf/1IOKbBy098Fex+Wa/5QMubw09pSZ/u8EY8PWgevJsXp1A==}
     engines: {node: '>=6'}
 
+  sales-tax@2.23.0:
+    resolution: {integrity: sha512-dr0VcnZMGzgvxlP5hN1xXFUrE+/axY47ZxSTDJ8KMJvLyt9VYk2kZaYwU/71uAzOgFmO8oOZuD9UERbkha08zA==}
+    engines: {node: '>= 10.0.0'}
+
   semver@7.8.6:
     resolution: {integrity: sha512-9lpSSU4Mly3mrtruwLs1eLK6+gzbzqeBFwRNjIjE+9LuDpWdYctrQlQ3ej1Ilgi7gknpsTRnPoLP8DpCHqHIJw==}
     engines: {node: '>=10'}
@@ -1359,6 +1373,9 @@ packages:
   validate-npm-package-name@5.0.1:
     resolution: {integrity: sha512-OljLrQ9SQdOUqTaQxqL5dEfZWrXExyyWsozYlAWFawPVNuD83igl7uJD2RTkNMbniIYgt8l81eCJGIdQF7avLQ==}
     engines: {node: ^14.17.0 || ^16.13.0 || >=18.0.0}
+
+  validate-vat@0.9.0:
+    resolution: {integrity: sha512-Lbi+g3NAG/v3KHNk912soN4XrIN0GFY9tDtUzzu9MVuJ2zd5MnLJ0OQGol1eqgu71z0dJCDdA+n9oqbxPpzlGw==}
 
   vite@8.3.6:
     resolution: {integrity: sha512-UI7dK29NnS54Fk+mmo7o+jI6U8Fp7hDl+X5Q1k45WH+d4dSlbLVUETGQ+hfkNgvLQGyoElPj837nZyv4MBc0VA==}
@@ -1964,6 +1981,8 @@ snapshots:
 
   detect-libc@2.1.2: {}
 
+  ein-validator@1.0.1: {}
+
   emoji-regex@8.0.0: {}
 
   emojilib@2.4.0: {}
@@ -2035,6 +2054,8 @@ snapshots:
   jose@6.2.15: {}
 
   joycon@3.1.1: {}
+
+  jsvat-next@3.0.4: {}
 
   kysely@0.29.8: {}
 
@@ -2264,6 +2285,12 @@ snapshots:
     dependencies:
       mri: 1.2.0
 
+  sales-tax@2.23.0:
+    dependencies:
+      ein-validator: 1.0.1
+      jsvat-next: 3.0.4
+      validate-vat: 0.9.0
+
   semver@7.8.6: {}
 
   set-cookie-parser@3.2.2: {}
@@ -2364,6 +2391,8 @@ snapshots:
   unicode-emoji-modifier-base@1.0.0: {}
 
   validate-npm-package-name@5.0.1: {}
+
+  validate-vat@0.9.0: {}
 
   vite@8.3.6(@types/node@24.19.2)(esbuild@0.28.2):
     dependencies:

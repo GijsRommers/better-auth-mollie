@@ -43,12 +43,19 @@
 			"types": "./dist/client.d.ts",
 			"default": "./dist/client.js"
 		},
+		"./vat": {
+			"types": "./dist/vat.d.ts",
+			"default": "./dist/vat.js"
+		},
 		"./package.json": "./package.json"
 	},
 	"typesVersions": {
 		"*": {
 			"client": [
 				"./dist/client.d.ts"
+			],
+			"vat": [
+				"./dist/vat.d.ts"
 			]
 		}
 	},
@@ -69,6 +76,7 @@
 		"prepublishOnly": "pnpm run build"
 	},
 	"dependencies": {
+		"sales-tax": "^2.23.0",
 		"zod": "^4.5.4"
 	},
 	"peerDependencies": {
