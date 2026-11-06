@@ -15,6 +15,11 @@ export const subscriptionSchema = {
 				type: "string",
 				required: true,
 			},
+			pendingPlan: {
+				type: "string",
+				required: false,
+				input: false,
+			},
 			status: {
 				type: "string",
 				required: true,

@@ -3,9 +3,11 @@ import { APIError, createAuthEndpoint, originCheck } from "better-auth/api";
 import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
+	applyTimeTransitions,
 	cancelMollieSubscription,
 	createScheduledSubscription,
 	guardedUpdate,
+	paymentPurpose,
 	processPayment,
 	recordPayment,
 } from "../billing";
@@ -22,15 +24,17 @@ import {
 	DEFAULT_VERIFICATION_AMOUNT,
 	isFinalPaymentStatus,
 } from "../status";
-import { chargeAmount, resolveTax, taxMetadata } from "../tax";
+import { chargeAmount, fromCents, resolveTax, taxMetadata, toCents } from "../tax";
 import type {
 	CustomerType,
 	MollieCtxSession,
 	MollieOptions,
 	MolliePaymentRecord,
 	MolliePlan,
+	PaymentPurpose,
 	Subscription,
 	SubscriptionOptions,
+	TaxBreakdown,
 } from "../types";
 import {
 	ceilToUTCDate,
@@ -39,6 +43,7 @@ import {
 	getUrl,
 	getWebhookUrl,
 	mergeMetadata,
+	parseInterval,
 	planCurrency,
 	toMollieDate,
 } from "../utils";
@@ -84,16 +89,15 @@ const PROTECTED_PAYMENT_KEYS = [
 ] as const;
 
 /**
- * Reuses a still-open checkout for the same plan and amount. Attempts that
- * changed state are processed on the way; if one was paid meanwhile (e.g. in
- * another tab), the subscription is active and no new checkout is needed.
+ * Reuses a still-open checkout for the same plan, amount and purpose.
+ * Attempts that changed state are processed on the way; if one was paid
+ * meanwhile (e.g. in another tab), no new checkout is needed.
  */
 async function findOpenCheckout(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
 	subscription: Subscription,
-	planName: string,
-	amount: string,
+	match: { plan: string; amount: string; purpose: PaymentPurpose },
 ): Promise<{ url?: string; activated?: boolean }> {
 	const gateway = gatewayFor(options);
 	const attempts = await ctx.context.adapter.findMany<MolliePaymentRecord>({
@@ -111,14 +115,15 @@ async function findOpenCheckout(
 		if (
 			payment.status === "open" &&
 			url &&
-			payment.amount.value === amount &&
-			metadataOf(payment).plan === planName
+			payment.amount.value === match.amount &&
+			metadataOf(payment).plan === match.plan &&
+			paymentPurpose(payment) === match.purpose
 		) {
 			return { url };
 		}
 		const result = await processPayment(ctx, options, payment);
 		dispatchEvents(ctx, options, result.events);
-		if (result.subscription && ACCESS_STATUSES.includes(result.subscription.status)) {
+		if (result.subscription?.status === "active" || result.subscription?.status === "trialing") {
 			return { activated: true };
 		}
 	}
@@ -126,9 +131,144 @@ async function findOpenCheckout(
 }
 
 /**
- * Plan change without proration: stop the current Mollie subscription and
- * schedule a new one for the new plan from the end of the current period.
- * The plan (and its limits) change immediately.
+ * Points billing at `plan` from `startAt`: stops the current Mollie
+ * subscription (if still running) and creates a new one. If the new one
+ * cannot be created, the subscription is marked to end at `periodEnd`,
+ * which is the truth at that point.
+ */
+async function reschedule(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	current: Subscription,
+	input: { plan: MolliePlan; customerType: CustomerType; startAt: Date; tag: string },
+): Promise<string> {
+	const { plan, customerType, startAt, tag } = input;
+	if (!current.mollieCustomerId || !current.mollieMandateId) {
+		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.MANDATE_NOT_FOUND);
+	}
+	const tax = await resolveTax(ctx, options, {
+		referenceId: current.referenceId,
+		customerType,
+		plan,
+	});
+	if (current.mollieSubscriptionId && !current.cancelAtPeriodEnd) {
+		try {
+			await cancelMollieSubscription(ctx, options, current);
+		} catch (error) {
+			throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
+		}
+	}
+	try {
+		return await createScheduledSubscription(ctx, options, {
+			subscription: current,
+			plan,
+			mandateId: current.mollieMandateId,
+			startAt,
+			tax,
+			scope: `subscription:${current.id}:${tag}:${plan.name.toLowerCase()}:${toMollieDate(startAt)}:${chargeAmount(plan, tax)}:${current.mollieSubscriptionId}`,
+		});
+	} catch (error) {
+		await guardedUpdate(ctx, current.id, BILLING_STATUSES, {
+			cancelAtPeriodEnd: true,
+			pendingPlan: null,
+		});
+		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_SUBSCRIPTION);
+	}
+}
+
+/** When the next period starts (the end of the current one, or now if it already ended). */
+function nextPeriodStart(subscription: Subscription, now: Date): Date {
+	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	return periodEnd && periodEnd > now ? periodEnd : ceilToUTCDate(now);
+}
+
+/**
+ * The pro-rata price difference (in cents, before VAT) for the rest of the
+ * current period when moving from `from` to `to`.
+ */
+export function prorationCents(
+	subscription: Subscription,
+	from: MolliePlan,
+	to: MolliePlan,
+	now: Date,
+) {
+	const start = subscription.periodStart ? new Date(subscription.periodStart).getTime() : null;
+	const end = subscription.periodEnd ? new Date(subscription.periodEnd).getTime() : null;
+	if (start === null || end === null || end <= start || end <= now.getTime()) return 0;
+	const remaining = Math.min(1, Math.max(0, (end - now.getTime()) / (end - start)));
+	return Math.max(0, Math.round((toCents(to.amount) - toCents(from.amount)) * remaining));
+}
+
+/**
+ * Charges the pro-rata difference of an upgrade right away, on the mandate
+ * of the subscription (no checkout). One charge per plan per period.
+ */
+async function chargeProration(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	current: Subscription,
+	plan: MolliePlan,
+	customerType: CustomerType,
+	cents: number,
+) {
+	const customerId = current.mollieCustomerId as string;
+	const planName = plan.name.toLowerCase();
+	const net = fromCents(cents);
+	const tax = await resolveTax(
+		ctx,
+		options,
+		{ referenceId: current.referenceId, customerType, plan },
+		net,
+	);
+	const amount = tax?.gross ?? net;
+	const periodEnd = toMollieDate(nextPeriodStart(current, new Date()));
+	const gateway = gatewayFor(options);
+	try {
+		const operation = await runOperation(ctx.context, {
+			kind: "create_proration_payment",
+			referenceId: current.referenceId,
+			scope: `proration:${current.id}:${planName}:${periodEnd}`,
+			reuseSucceeded: true,
+			execute: (idempotencyKey) =>
+				gateway.createPayment(
+					{
+						amount: { currency: planCurrency(plan), value: amount },
+						description: `${plan.name}: upgrade for the rest of this period`,
+						sequenceType: "recurring",
+						customerId,
+						mandateId: current.mollieMandateId as string,
+						webhookUrl: getWebhookUrl(ctx, options),
+						metadata: {
+							subscriptionId: current.id,
+							referenceId: current.referenceId,
+							plan: planName,
+							purpose: "proration",
+							operationKey: idempotencyKey,
+							...taxMetadata(tax),
+						},
+					},
+					idempotencyKey,
+				),
+			getId: (created) => created.id,
+			recover: (idempotencyKey, attempt) =>
+				gateway.findCustomerPaymentByOperationKey(customerId, idempotencyKey, attempt.createdAt),
+		});
+		const payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
+		await recordPayment(ctx, payment, current.id);
+		return payment;
+	} catch (error) {
+		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
+	}
+}
+
+/**
+ * Changes the plan of a running subscription:
+ * - during a trial: right away, nothing to charge;
+ * - upgrade (same interval and currency, higher price): right away, and the
+ *   pro-rata difference for the rest of the period is charged now;
+ * - anything else (downgrade, other interval): from the next period, kept in
+ *   `pendingPlan` until then.
+ * In every case Mollie bills the new plan from the next period.
  */
 async function changePlan(
 	ctx: GenericEndpointContext,
@@ -137,47 +277,87 @@ async function changePlan(
 	plan: MolliePlan,
 	customerType: CustomerType,
 ) {
-	if (!current.mollieCustomerId || !current.mollieMandateId) {
-		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.MANDATE_NOT_FOUND);
-	}
 	const now = new Date();
-	const periodEnd = current.periodEnd ? new Date(current.periodEnd) : null;
-	const startAt = periodEnd && periodEnd > now ? periodEnd : ceilToUTCDate(now);
-	const tax = await resolveTax(ctx, options, {
-		referenceId: current.referenceId,
-		customerType,
-		plan,
-	});
+	const startAt = nextPeriodStart(current, now);
+	const planName = plan.name.toLowerCase();
+	const oldPlan = await getPlanByName(options, current.plan);
+	const sameTerms =
+		!!oldPlan &&
+		planCurrency(oldPlan) === planCurrency(plan) &&
+		JSON.stringify(parseInterval(oldPlan.interval)) ===
+			JSON.stringify(parseInterval(plan.interval));
+	const mode =
+		current.status === "trialing"
+			? "switch"
+			: sameTerms && oldPlan && toCents(plan.amount) > toCents(oldPlan.amount)
+				? "upgrade"
+				: "schedule";
 
-	if (!current.cancelAtPeriodEnd) {
-		try {
-			await cancelMollieSubscription(ctx, options, current);
-		} catch (error) {
-			throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
-		}
+	if (mode === "schedule") {
+		const mollieSubscriptionId = await reschedule(ctx, options, current, {
+			plan,
+			customerType,
+			startAt,
+			tag: "change",
+		});
+		return guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
+			pendingPlan: planName,
+			mollieSubscriptionId,
+			cancelAtPeriodEnd: false,
+		});
 	}
+
+	const cents = mode === "upgrade" && oldPlan ? prorationCents(current, oldPlan, plan, now) : 0;
+	const proration =
+		cents > 0 ? await chargeProration(ctx, options, current, plan, customerType, cents) : null;
 	let mollieSubscriptionId: string;
 	try {
-		mollieSubscriptionId = await createScheduledSubscription(ctx, options, {
-			subscription: current,
+		mollieSubscriptionId = await reschedule(ctx, options, current, {
 			plan,
-			mandateId: current.mollieMandateId,
+			customerType,
 			startAt,
-			tax,
-			scope: `subscription:${current.id}:change:${plan.name.toLowerCase()}:${toMollieDate(startAt)}:${chargeAmount(plan, tax)}:${current.mollieSubscriptionId}`,
+			tag: "change",
 		});
 	} catch (error) {
-		// The old Mollie subscription is gone: record that nothing renews.
-		await guardedUpdate(ctx, current.id, ACCESS_STATUSES, { cancelAtPeriodEnd: true });
-		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_SUBSCRIPTION);
+		// Already charged for the upgrade: grant it, even though renewal failed.
+		if (proration) {
+			await guardedUpdate(ctx, current.id, ACCESS_STATUSES, { plan: planName, pendingPlan: null });
+		}
+		throw error;
 	}
 	const updated = await guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
-		plan: plan.name.toLowerCase(),
+		plan: planName,
+		pendingPlan: null,
 		mollieSubscriptionId,
 		cancelAtPeriodEnd: false,
 	});
-	if (!updated) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
+	if (proration) {
+		const result = await processPayment(ctx, options, proration);
+		dispatchEvents(ctx, options, result.events);
+	}
 	return updated;
+}
+
+/** Undo a scheduled plan change: keep billing the current plan. */
+async function cancelPendingChange(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	current: Subscription,
+	customerType: CustomerType,
+) {
+	const plan = await getPlanByName(options, current.plan);
+	if (!plan) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
+	const mollieSubscriptionId = await reschedule(ctx, options, current, {
+		plan,
+		customerType,
+		startAt: nextPeriodStart(current, new Date()),
+		tag: "keep",
+	});
+	return guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
+		pendingPlan: null,
+		mollieSubscriptionId,
+		cancelAtPeriodEnd: false,
+	});
 }
 
 /**
@@ -318,17 +498,60 @@ export const upgradeSubscription = (options: MollieOptions) =>
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
 			const current =
-				target && ACCESS_STATUSES.includes(target.status)
+				target && BILLING_STATUSES.includes(target.status)
 					? target
-					: subscriptions.find((s) => ACCESS_STATUSES.includes(s.status));
+					: subscriptions.find((s) => BILLING_STATUSES.includes(s.status));
+
+			const checkout = async (
+				row: Subscription,
+				input: { purpose: PaymentPurpose; trialDays: number; customerId: string },
+			) => {
+				const tax = await resolveTax(ctx, options, { referenceId, customerType, plan });
+				const amount =
+					input.purpose === "verification"
+						? (config.verificationAmount ?? DEFAULT_VERIFICATION_AMOUNT)
+						: chargeAmount(plan, tax);
+				const open = await findOpenCheckout(ctx, options, row, {
+					plan: planName,
+					amount,
+					purpose: input.purpose,
+				});
+				if (open.activated) return respond(body.successUrl);
+				if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
+				const url = await createCheckout(ctx, options, {
+					row,
+					plan,
+					amount,
+					tax,
+					purpose: input.purpose,
+					trialDays: input.trialDays,
+					customerId: input.customerId,
+					referenceId,
+					body,
+					user,
+					session,
+				});
+				return ctx.json({ url, redirect: !body.disableRedirect });
+			};
 
 			if (current) {
+				// Payment failed and was not recovered: pay again with a new card or
+				// mandate to restart the subscription.
+				if (current.status === "past_due" || current.status === "unpaid") {
+					const customerId =
+						current.mollieCustomerId ??
+						(await getOrCreateCustomer(ctx, options, { customerType, referenceId }));
+					return checkout(current, { purpose: "recovery", trialDays: 0, customerId });
+				}
 				if (current.plan === planName) {
-					if (!current.cancelAtPeriodEnd) {
+					if (current.pendingPlan) {
+						await cancelPendingChange(ctx, options, current, customerType);
+					} else if (current.cancelAtPeriodEnd) {
+						await restore(ctx, options, current, customerType);
+					} else {
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ALREADY_SUBSCRIBED_PLAN);
 					}
-					await restore(ctx, options, current, customerType);
-				} else {
+				} else if (current.pendingPlan !== planName || current.cancelAtPeriodEnd) {
 					await changePlan(ctx, options, current, plan, customerType);
 				}
 				return respond(body.returnUrl ?? body.successUrl);
@@ -364,92 +587,115 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					},
 				});
 			}
-
 			const hadTrial = subscriptions.some((s) => s.trialEnd || s.status === "trialing");
 			const trialDays = plan.freeTrial && !hadTrial ? plan.freeTrial.days : 0;
-			const tax = await resolveTax(ctx, options, { referenceId, customerType, plan });
-			const amount = trialDays
-				? (config.verificationAmount ?? DEFAULT_VERIFICATION_AMOUNT)
-				: chargeAmount(plan, tax);
-
-			const open = await findOpenCheckout(ctx, options, row, planName, amount);
-			if (open.activated) return respond(body.successUrl);
-			if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
-
-			const extra: Record<string, any> = {
-				...((await config.getFirstPaymentParams?.(
-					{ user, session, plan, subscription: row, isTrial: trialDays > 0 },
-					ctx,
-				)) ?? {}),
-			};
-			for (const key of PROTECTED_PAYMENT_KEYS) delete extra[key];
-			const subscription = row;
-			const redirectUrl = `${ctx.context.baseURL}/subscription/success?${new URLSearchParams({
-				subscriptionId: subscription.id,
-				callbackURL: body.successUrl,
-			})}`;
-			const gateway = gatewayFor(options);
-
-			let payment: Awaited<ReturnType<typeof gateway.getPayment>>;
-			try {
-				const operation = await runOperation(ctx.context, {
-					kind: "create_first_payment",
-					referenceId,
-					scope: `first-payment:${subscription.id}:${planName}:${amount}`,
-					reuseSucceeded: false,
-					execute: (idempotencyKey) =>
-						gateway.createPayment(
-							{
-								...extra,
-								description:
-									extra.description ??
-									(trialDays
-										? `${plan.name}: payment method verification`
-										: (plan.description ?? `${plan.name} subscription`)),
-								amount: { currency: planCurrency(plan), value: amount },
-								sequenceType: "first",
-								customerId,
-								redirectUrl,
-								cancelUrl: getUrl(ctx, body.cancelUrl),
-								webhookUrl: getWebhookUrl(ctx, options),
-								...((body.locale ?? extra.locale)
-									? { locale: (body.locale ?? extra.locale) as PaymentRequest["locale"] }
-									: {}),
-								metadata: mergeMetadata(
-									{
-										subscriptionId: subscription.id,
-										referenceId,
-										plan: planName,
-										trial: trialDays > 0,
-										trialDays,
-										operationKey: idempotencyKey,
-										...taxMetadata(tax),
-									},
-									body.metadata,
-									extra.metadata,
-								),
-							} as PaymentRequest,
-							idempotencyKey,
-						),
-					getId: (created) => created.id,
-					recover: (idempotencyKey, attempt) =>
-						gateway.findCustomerPaymentByOperationKey(
-							customerId,
-							idempotencyKey,
-							attempt.createdAt,
-						),
-				});
-				payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
-			} catch (error) {
-				ctx.context.logger.error("[mollie] Unable to create first payment", error);
-				throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
-			}
-			await recordPayment(ctx, payment, subscription.id);
-			const url = checkoutUrl(payment);
-			if (!url) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
-			return ctx.json({ url, redirect: !body.disableRedirect });
+			return checkout(row, {
+				purpose: trialDays ? "verification" : "checkout",
+				trialDays,
+				customerId,
+			});
 		},
 	);
+
+/**
+ * Creates the first payment (`sequenceType: "first"`, so it creates a
+ * mandate) through the journal and returns its checkout URL.
+ */
+async function createCheckout(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	input: {
+		row: Subscription;
+		plan: MolliePlan;
+		amount: string;
+		tax: TaxBreakdown | null;
+		purpose: PaymentPurpose;
+		trialDays: number;
+		customerId: string;
+		referenceId: string;
+		body: z.infer<typeof upgradeSubscriptionBodySchema>;
+		user: MollieCtxSession["user"];
+		session: MollieCtxSession["session"];
+	},
+): Promise<string> {
+	const { row, plan, amount, tax, purpose, trialDays, customerId, referenceId, body } = input;
+	const config = subscriptionOptions(options);
+	const planName = plan.name.toLowerCase();
+	const extra: Record<string, any> = {
+		...((await config.getFirstPaymentParams?.(
+			{
+				user: input.user,
+				session: input.session,
+				plan,
+				subscription: row,
+				isTrial: purpose === "verification",
+			},
+			ctx,
+		)) ?? {}),
+	};
+	for (const key of PROTECTED_PAYMENT_KEYS) delete extra[key];
+	const redirectUrl = `${ctx.context.baseURL}/subscription/success?${new URLSearchParams({
+		subscriptionId: row.id,
+		callbackURL: body.successUrl,
+	})}`;
+	const description =
+		extra.description ??
+		(purpose === "verification"
+			? `${plan.name}: payment method verification`
+			: (plan.description ?? `${plan.name} subscription`));
+	const locale = body.locale ?? extra.locale;
+	const gateway = gatewayFor(options);
+
+	let payment: Awaited<ReturnType<typeof gateway.getPayment>>;
+	try {
+		const operation = await runOperation(ctx.context, {
+			kind: "create_first_payment",
+			referenceId,
+			scope: `${purpose === "recovery" ? "recovery" : "first-payment"}:${row.id}:${planName}:${amount}`,
+			reuseSucceeded: false,
+			execute: (idempotencyKey) =>
+				gateway.createPayment(
+					{
+						...extra,
+						description,
+						amount: { currency: planCurrency(plan), value: amount },
+						sequenceType: "first",
+						customerId,
+						redirectUrl,
+						cancelUrl: getUrl(ctx, body.cancelUrl),
+						webhookUrl: getWebhookUrl(ctx, options),
+						...(locale ? { locale: locale as PaymentRequest["locale"] } : {}),
+						metadata: mergeMetadata(
+							{
+								subscriptionId: row.id,
+								referenceId,
+								plan: planName,
+								purpose,
+								trial: purpose === "verification",
+								trialDays,
+								operationKey: idempotencyKey,
+								...taxMetadata(tax),
+							},
+							body.metadata,
+							extra.metadata,
+						),
+					} as PaymentRequest,
+					idempotencyKey,
+				),
+			getId: (created) => created.id,
+			recover: (idempotencyKey, attempt) =>
+				gateway.findCustomerPaymentByOperationKey(customerId, idempotencyKey, attempt.createdAt),
+		});
+		payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
+	} catch (error) {
+		ctx.context.logger.error("[mollie] Unable to create first payment", error);
+		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
+	}
+	await recordPayment(ctx, payment, row.id);
+	const url = checkoutUrl(payment);
+	if (!url) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
+	return url;
+}
 
 const cancelSubscriptionBodySchema = z.object({
 	referenceId: z.string().optional(),
@@ -505,7 +751,10 @@ export const cancelSubscription = (options: MollieOptions) =>
 				} catch (error) {
 					throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
 				}
-				await guardedUpdate(ctx, subscription.id, BILLING_STATUSES, { cancelAtPeriodEnd: true });
+				await guardedUpdate(ctx, subscription.id, BILLING_STATUSES, {
+					cancelAtPeriodEnd: true,
+					pendingPlan: null,
+				});
 			}
 			return ctx.json({
 				url: getUrl(ctx, ctx.body.returnUrl),
@@ -591,7 +840,15 @@ export const listActiveSubscriptions = (options: MollieOptions) =>
 		},
 		async (ctx) => {
 			const { referenceId } = ctx.context as unknown as ReferenceContext;
-			const subscriptions = await referenceSubscriptions(ctx, referenceId);
+			const now = new Date();
+			const subscriptions: Subscription[] = [];
+			// Apply clock-based changes (period ended, scheduled plan change) so
+			// the answer is right even before the app's cron has run.
+			for (const subscription of await referenceSubscriptions(ctx, referenceId)) {
+				const timed = await applyTimeTransitions(ctx, options, subscription, now);
+				dispatchEvents(ctx, options, timed.events);
+				subscriptions.push(timed.subscription);
+			}
 			const plans = await getPlans(options);
 			return ctx.json(
 				subscriptions

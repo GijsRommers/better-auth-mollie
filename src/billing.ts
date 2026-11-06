@@ -17,6 +17,7 @@ import type {
 	MolliePaymentRecord,
 	MolliePlan,
 	PaymentHookData,
+	PaymentPurpose,
 	Subscription,
 	SubscriptionStatus,
 	TaxBreakdown,
@@ -175,6 +176,28 @@ export async function recordPayment(
 	return { record: updated, transitioned: isFinalPaymentStatus(status) };
 }
 
+const PURPOSES: readonly PaymentPurpose[] = [
+	"checkout",
+	"verification",
+	"renewal",
+	"proration",
+	"recovery",
+];
+
+/** Why a payment exists, from the metadata we set (or its sequence type). */
+export function paymentPurpose(payment: MolliePayment): PaymentPurpose {
+	const metadata = metadataOf(payment);
+	if (
+		typeof metadata.purpose === "string" &&
+		PURPOSES.includes(metadata.purpose as PaymentPurpose)
+	) {
+		return metadata.purpose as PaymentPurpose;
+	}
+	if (payment.sequenceType === "first")
+		return metadata.trial === true ? "verification" : "checkout";
+	return "renewal";
+}
+
 /**
  * Applies a payment fetched from Mollie to local state. Safe to call any
  * number of times for the same payment: state changes are driven by the
@@ -189,41 +212,52 @@ export async function processPayment(
 	let subscription = await resolveSubscription(ctx, payment);
 	if (!subscription) return { subscription: null, events: [], ignored: "unknown payment" };
 
-	const plan = await getPlanByName(options, subscription.plan);
-	const { record, transitioned } = await recordPayment(ctx, payment, subscription.id);
 	const metadata = metadataOf(payment);
-	const isFirst = payment.sequenceType === "first";
-	const isVerification = isFirst && metadata.trial === true;
+	const purpose = paymentPurpose(payment);
+	const paidPlanName = typeof metadata.plan === "string" ? metadata.plan : subscription.plan;
+	const plan = await getPlanByName(options, paidPlanName);
+	const { record, transitioned } = await recordPayment(ctx, payment, subscription.id);
 	const status = payment.status as string;
 	const events: BillingEvent[] = [];
+	const isCheckout = purpose === "checkout" || purpose === "verification";
 
-	if (isFirst && status === "paid") {
-		const activated = await activateSubscription(ctx, options, subscription, payment, plan);
-		if (activated) {
-			subscription = activated;
-			events.push({ type: "subscription.activated", subscription: activated, plan, payment });
+	if (status === "paid") {
+		if (isCheckout || purpose === "recovery") {
+			const activated =
+				purpose === "recovery"
+					? await recoverSubscription(ctx, options, subscription, payment, plan)
+					: await activateSubscription(ctx, options, subscription, payment, plan);
+			if (activated) {
+				subscription = activated;
+				events.push({ type: "subscription.activated", subscription: activated, plan, payment });
+			}
+		} else if (purpose === "renewal") {
+			subscription = (await applyRenewal(ctx, options, subscription, payment)) ?? subscription;
 		}
-	} else if (isFirst && isFinalPaymentStatus(status) && transitioned) {
-		subscription = (await expireCheckout(ctx, subscription)) ?? subscription;
-	} else if (payment.sequenceType === "recurring" && status === "paid") {
-		subscription = (await applyRenewal(ctx, options, subscription, payment, plan)) ?? subscription;
-	} else if (payment.sequenceType === "recurring" && isFailedPaymentStatus(status)) {
-		subscription = (await applyFailedRenewal(ctx, subscription, payment)) ?? subscription;
+		// A paid proration changes nothing: the upgrade was applied when charged.
+	} else if (isFinalPaymentStatus(status)) {
+		if (isCheckout && transitioned) {
+			subscription = (await expireCheckout(ctx, subscription)) ?? subscription;
+		} else if (
+			(purpose === "renewal" || purpose === "proration") &&
+			isFailedPaymentStatus(status)
+		) {
+			subscription = (await applyFailedRenewal(ctx, subscription, payment)) ?? subscription;
+		}
+		// A failed recovery leaves the subscription as it was.
 	}
 
 	if (transitioned && (status === "paid" || isFailedPaymentStatus(status))) {
 		const latest =
 			(await findSubscription(ctx, [{ field: "id", value: subscription.id }])) ?? subscription;
-		const tax: TaxBreakdown | null = isVerification
-			? null
-			: taxFromMetadata(metadata, payment.amount.currency);
 		const data: PaymentHookData = {
 			payment,
+			purpose,
 			record,
 			subscription: latest,
 			plan,
-			isVerification,
-			tax,
+			isVerification: purpose === "verification",
+			tax: purpose === "verification" ? null : taxFromMetadata(metadata, payment.amount.currency),
 		};
 		events.push({ type: status === "paid" ? "payment.paid" : "payment.failed", data });
 	}
@@ -232,8 +266,9 @@ export async function processPayment(
 
 /**
  * First payment paid: create the Mollie subscription with the new mandate and
- * move `incomplete → trialing | active`. Idempotent: the Mollie call is
- * journaled per payment, and the status change is guarded.
+ * move `incomplete → trialing | active`. The customer gets the plan they paid
+ * for, even if they started another checkout afterwards. Idempotent: the
+ * Mollie call is journaled per payment, and the status change is guarded.
  */
 async function activateSubscription(
 	ctx: Ctx,
@@ -246,16 +281,7 @@ async function activateSubscription(
 	const metadata = metadataOf(payment);
 	const logger = ctx.context.logger;
 	if (!plan) {
-		logger.error(
-			`[mollie] Cannot activate ${subscription.id}: plan "${subscription.plan}" not found`,
-		);
-		return null;
-	}
-	if (typeof metadata.plan === "string" && metadata.plan !== subscription.plan) {
-		// A checkout for a plan the customer switched away from before paying.
-		logger.warn(
-			`[mollie] Payment ${payment.id} was for plan "${metadata.plan}" but ${subscription.id} is now "${subscription.plan}"; not activating`,
-		);
+		logger.error(`[mollie] Cannot activate ${subscription.id}: the paid plan is not configured`);
 		return null;
 	}
 	const customerId = payment.customerId ?? subscription.mollieCustomerId;
@@ -282,12 +308,60 @@ async function activateSubscription(
 
 	return guardedUpdate(ctx, subscription.id, ["incomplete"], {
 		status: isTrial ? "trialing" : "active",
+		plan: plan.name.toLowerCase(),
+		pendingPlan: null,
 		mollieCustomerId: customerId,
 		mollieMandateId: payment.mandateId,
 		mollieSubscriptionId,
 		periodStart: anchor,
 		periodEnd,
 		trialEnd,
+		cancelAtPeriodEnd: false,
+	});
+}
+
+/**
+ * Recovery payment paid (a new first payment for a `past_due` or `unpaid`
+ * subscription): a fresh period starts now, and the Mollie subscription is
+ * replaced by one on the new mandate, starting at the end of that period.
+ */
+async function recoverSubscription(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscription: Subscription,
+	payment: MolliePayment,
+	plan: MolliePlan | undefined,
+): Promise<Subscription | null> {
+	if (subscription.status !== "past_due" && subscription.status !== "unpaid") return null;
+	const customerId = payment.customerId ?? subscription.mollieCustomerId;
+	if (!plan || !payment.mandateId || !customerId) {
+		ctx.context.logger.error(
+			`[mollie] Cannot recover ${subscription.id} from payment ${payment.id}`,
+		);
+		return null;
+	}
+	const anchor = toDate(payment.paidAt) ?? new Date(payment.createdAt);
+	const periodEnd = ceilToUTCDate(addInterval(anchor, plan.interval));
+	if (subscription.mollieSubscriptionId && !subscription.cancelAtPeriodEnd) {
+		await cancelMollieSubscription(ctx, options, subscription);
+	}
+	const mollieSubscriptionId = await createScheduledSubscription(ctx, options, {
+		subscription: { ...subscription, mollieCustomerId: customerId },
+		plan,
+		mandateId: payment.mandateId,
+		startAt: periodEnd,
+		tax: taxFromMetadata(metadataOf(payment), planCurrency(plan)),
+		scope: `subscription:${subscription.id}:recover:${payment.id}`,
+	});
+	return guardedUpdate(ctx, subscription.id, ["past_due", "unpaid"], {
+		status: "active",
+		plan: plan.name.toLowerCase(),
+		pendingPlan: null,
+		mollieCustomerId: customerId,
+		mollieMandateId: payment.mandateId,
+		mollieSubscriptionId,
+		periodStart: anchor,
+		periodEnd,
 		cancelAtPeriodEnd: false,
 	});
 }
@@ -321,9 +395,13 @@ async function applyRenewal(
 	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
-	plan: MolliePlan | undefined,
 ): Promise<Subscription | null> {
 	const createdAt = new Date(payment.createdAt);
+	const billedPlan = metadataOf(payment).plan;
+	const plan = await getPlanByName(
+		options,
+		typeof billedPlan === "string" ? billedPlan : initial.plan,
+	);
 	let interval = plan?.interval as string | undefined;
 	let nextPaymentDate: Date | null = null;
 	const customerId = payment.customerId ?? initial.mollieCustomerId;
@@ -358,13 +436,20 @@ async function applyRenewal(
 		const advance = !!periodEnd && (!currentEnd || periodEnd > currentEnd);
 		const current = !subscription.periodStart || createdAt >= new Date(subscription.periodStart);
 		const recover = subscription.status !== "active" && current;
+		// The first charge of a scheduled plan change: that plan is now active.
+		const switchPlan =
+			advance && !!subscription.pendingPlan && billedPlan === subscription.pendingPlan;
 		if (!advance && !recover) return null;
 
 		const updated = await guardedUpdate(
 			ctx,
 			subscription.id,
 			["trialing", "active", "past_due", "unpaid"],
-			{ status: "active", ...(advance ? { periodStart, periodEnd } : {}) },
+			{
+				status: "active",
+				...(advance ? { periodStart, periodEnd } : {}),
+				...(switchPlan ? { plan: subscription.pendingPlan as string, pendingPlan: null } : {}),
+			},
 			currentEnd ? [{ field: "periodEnd", value: currentEnd }] : [],
 		);
 		if (updated) return updated;
@@ -544,10 +629,13 @@ export async function applyTimeTransitions(
 	now: Date,
 ): Promise<{ subscription: Subscription; events: BillingEvent[] }> {
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
-	if (!periodEnd) return { subscription, events: [] };
+	if (!periodEnd || !BILLING_STATUSES.includes(subscription.status)) {
+		return { subscription, events: [] };
+	}
 	if (subscription.cancelAtPeriodEnd && now >= periodEnd) {
 		const canceled = await guardedUpdate(ctx, subscription.id, BILLING_STATUSES, {
 			status: "canceled",
+			pendingPlan: null,
 		});
 		if (!canceled) return { subscription, events: [] };
 		const plan = await getPlanByName(options, canceled.plan);
@@ -557,6 +645,18 @@ export async function applyTimeTransitions(
 				{ type: "subscription.canceled", subscription: canceled, plan, reason: "period_ended" },
 			],
 		};
+	}
+	if (subscription.pendingPlan && now >= periodEnd) {
+		// A scheduled plan change takes effect at the end of the period, even if
+		// the first payment for the new plan is still on its way.
+		const switched = await guardedUpdate(
+			ctx,
+			subscription.id,
+			BILLING_STATUSES,
+			{ plan: subscription.pendingPlan, pendingPlan: null },
+			[{ field: "pendingPlan", value: subscription.pendingPlan }],
+		);
+		if (switched) return applyTimeTransitions(ctx, options, switched, now);
 	}
 	if (subscription.status === "past_due" && now >= addDays(periodEnd, gracePeriodDays(options))) {
 		const unpaid = await guardedUpdate(ctx, subscription.id, ["past_due"], { status: "unpaid" });
@@ -586,31 +686,34 @@ export async function syncSubscription(
 	const gateway = gatewayFor(options);
 	const events: BillingEvent[] = [];
 
-	if (initial.status === "incomplete") {
-		const attempts = await ctx.context.adapter.findMany<MolliePaymentRecord>({
-			model: "molliePayment",
-			where: [
-				{ field: "subscriptionId", value: initial.id },
-				{ field: "sequenceType", value: "first" },
-			],
-			limit: 100,
-		});
-		let checkedRemote = false;
-		for (const attempt of attempts) {
-			if (isFinalPaymentStatus(attempt.status) && attempt.status !== "paid") continue;
-			checkedRemote = true;
-			const result = await processPayment(
-				ctx,
-				options,
-				await gateway.getPayment(attempt.molliePaymentId),
-			);
-			events.push(...result.events);
-		}
-		return { events, checkedRemote };
+	// Checkouts (first payments, including recovery checkouts) still open.
+	const attempts = await ctx.context.adapter.findMany<MolliePaymentRecord>({
+		model: "molliePayment",
+		where: [
+			{ field: "subscriptionId", value: initial.id },
+			{ field: "sequenceType", value: "first" },
+		],
+		limit: 100,
+	});
+	let checkedAttempts = false;
+	for (const attempt of attempts) {
+		const unresolved = !isFinalPaymentStatus(attempt.status);
+		const paidButIncomplete = attempt.status === "paid" && initial.status === "incomplete";
+		if (!unresolved && !paidButIncomplete) continue;
+		checkedAttempts = true;
+		const result = await processPayment(
+			ctx,
+			options,
+			await gateway.getPayment(attempt.molliePaymentId),
+		);
+		events.push(...result.events);
 	}
+	if (initial.status === "incomplete") return { events, checkedRemote: checkedAttempts };
 
-	if (!BILLING_STATUSES.includes(initial.status)) return { events, checkedRemote: false };
-	const timed = await applyTimeTransitions(ctx, options, initial, now);
+	const reloaded = checkedAttempts ? ((await reload(ctx, initial.id)) ?? initial) : initial;
+	if (!BILLING_STATUSES.includes(reloaded.status))
+		return { events, checkedRemote: checkedAttempts };
+	const timed = await applyTimeTransitions(ctx, options, reloaded, now);
 	events.push(...timed.events);
 	let subscription = timed.subscription;
 	if (!BILLING_STATUSES.includes(subscription.status) || subscription.cancelAtPeriodEnd) {

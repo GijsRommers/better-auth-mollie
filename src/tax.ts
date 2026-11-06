@@ -61,23 +61,20 @@ export function computeTax(
 }
 
 /**
- * Asks the app for the tax decision and returns the breakdown for `plan`, or
- * `null` when no `subscription.tax` is configured.
+ * Asks the app for the tax decision and returns the breakdown for `amount`
+ * (the plan amount by default), or `null` when no `subscription.tax` is
+ * configured.
  */
 export async function resolveTax(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
 	data: { referenceId: string; customerType: CustomerType; plan: MolliePlan },
+	amount: string = data.plan.amount,
 ): Promise<TaxBreakdown | null> {
 	const tax = options.subscription?.enabled ? options.subscription.tax : undefined;
 	if (!tax) return null;
 	const decision = await tax.calculate(data, ctx);
-	return computeTax(
-		data.plan.amount,
-		planCurrency(data.plan),
-		decision,
-		tax.pricesIncludeVat ?? false,
-	);
+	return computeTax(amount, planCurrency(data.plan), decision, tax.pricesIncludeVat ?? false);
 }
 
 /** The amount Mollie should charge for a plan. */

@@ -102,6 +102,11 @@ export interface Subscription {
 	referenceId: string;
 	/** Lower-cased plan name. */
 	plan: string;
+	/**
+	 * A scheduled plan change (downgrade, or a different interval): billed
+	 * from `periodEnd`, and becomes `plan` at `periodEnd`.
+	 */
+	pendingPlan?: string | null | undefined;
 	status: SubscriptionStatus;
 	mollieCustomerId?: string | null | undefined;
 	mollieMandateId?: string | null | undefined;
@@ -138,6 +143,7 @@ export type MollieOperationKind =
 	| "create_first_payment"
 	| "create_subscription"
 	| "cancel_subscription"
+	| "create_proration_payment"
 	| "create_sales_invoice"
 	/** Marks a hook as delivered, so it runs at most once. */
 	| "hook_delivery";
@@ -169,9 +175,20 @@ export type MollieCtxSession = {
 	user: User & WithMollieCustomerId;
 };
 
+/**
+ * Why a payment exists:
+ * - `checkout`: first payment of a new subscription (pays the first period)
+ * - `verification`: first payment of a trial (only creates the mandate)
+ * - `renewal`: charged by the Mollie subscription each period
+ * - `proration`: the pro-rata difference charged on an upgrade
+ * - `recovery`: a new first payment that restarts a past-due subscription
+ */
+export type PaymentPurpose = "checkout" | "verification" | "renewal" | "proration" | "recovery";
+
 export type PaymentHookData = {
 	/** The payment exactly as fetched from the Mollie API. */
 	payment: MolliePayment;
+	purpose: PaymentPurpose;
 	/** The local `molliePayment` row after this update. */
 	record: MolliePaymentRecord;
 	subscription: Subscription;

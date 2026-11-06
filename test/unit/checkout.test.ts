@@ -263,18 +263,17 @@ describe("first payment → activation", () => {
 		expect((await env.subscriptions())[0]).toMatchObject({ status: "active", plan: "business" });
 	});
 
-	it("does not activate from a paid checkout for a plan the customer switched away from", async () => {
+	it("activates the plan that was actually paid for, even after switching checkouts", async () => {
 		const env = await setup();
 		const first = await env.checkout("starter");
 		await env.checkout("business");
 		env.fake.completePayment(first.payment.id, "paid");
 		await env.webhook(`id=${first.payment.id}`);
 		const [subscription] = await env.subscriptions();
-		expect(subscription).toMatchObject({ status: "incomplete", plan: "business" });
-		expect(env.fake.subscriptions.size).toBe(0);
+		expect(subscription).toMatchObject({ status: "active", plan: "starter" });
+		expect([...env.fake.subscriptions.values()][0]?.amount.value).toBe("9.95");
 		await settle();
-		// The payment is still reported, so the app can refund it.
-		expect(env.hooks.onPaymentPaid).toHaveBeenCalledTimes(1);
+		expect(env.hooks.onSubscriptionActivated).toHaveBeenCalledTimes(1);
 	});
 });
 
