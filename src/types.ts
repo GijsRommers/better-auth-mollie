@@ -5,6 +5,9 @@ import type {
 	CustomerResponse,
 	EntityCustomer,
 	PaymentRequest,
+	SalesInvoiceRecipient,
+	SalesInvoiceRequest,
+	SalesInvoiceResponse,
 } from "mollie-api-typescript/models";
 import type { MolliePayment } from "./gateway";
 import type { getSchemaDefinition } from "./schema";
@@ -134,7 +137,8 @@ export type MollieOperationKind =
 	| "create_customer"
 	| "create_first_payment"
 	| "create_subscription"
-	| "cancel_subscription";
+	| "cancel_subscription"
+	| "create_sales_invoice";
 
 /**
  * Write-ahead journal entry. Written before every mutating Mollie call so a
@@ -175,6 +179,56 @@ export type PaymentHookData = {
 	 * may want to refund it or leave it off invoices.
 	 */
 	isVerification: boolean;
+	/**
+	 * VAT breakdown of this payment when `subscription.tax` is configured
+	 * (`null` otherwise, and for verification payments).
+	 */
+	tax: TaxBreakdown | null;
+};
+
+/**
+ * The tax treatment of a customer, returned by `subscription.tax.calculate`.
+ */
+export type TaxDecision = {
+	/**
+	 * VAT rate in percent with two decimals, e.g. `"21.00"`. Use `"0.00"` for
+	 * reverse charge and exempt customers.
+	 */
+	rate: string;
+	/** ISO 3166-1 alpha-2 country of the customer, kept for your records. */
+	country?: string | undefined;
+	/** Intra-EU B2B supply: VAT is accounted for by the customer. */
+	reverseCharge?: boolean | undefined;
+};
+
+/** Amounts of one charge, as decimal strings in `currency`. */
+export type TaxBreakdown = {
+	rate: string;
+	net: string;
+	vat: string;
+	gross: string;
+	currency: string;
+	country?: string | undefined;
+	reverseCharge: boolean;
+};
+
+export type TaxOptions = {
+	/**
+	 * Whether plan amounts include VAT.
+	 * - `false` (default): plan amounts are net; the customer pays net + VAT.
+	 * - `true`: plan amounts are what the customer pays; VAT is included.
+	 * @default false
+	 */
+	pricesIncludeVat?: boolean | undefined;
+	/**
+	 * Decide the VAT treatment for a billing reference. Called when a
+	 * subscription starts, changes plan or is restored. Use the bundled
+	 * `euVat()` helper from `better-auth-mollie/vat`, or your own logic.
+	 */
+	calculate: (
+		data: { referenceId: string; customerType: CustomerType; plan: MolliePlan },
+		ctx: GenericEndpointContext,
+	) => TaxDecision | Promise<TaxDecision>;
 };
 
 /**
@@ -258,6 +312,11 @@ export type SubscriptionOptions = {
 		  ) => FirstPaymentParams | Promise<FirstPaymentParams>)
 		| undefined;
 	/**
+	 * VAT handling. Mollie charges exactly the amount it is given and does not
+	 * compute VAT, so configure this to charge net + VAT per customer.
+	 */
+	tax?: TaxOptions | undefined;
+	/**
 	 * Runs once when a subscription moves from `incomplete` to `trialing` or
 	 * `active` after its first payment is paid.
 	 */
@@ -291,6 +350,45 @@ export type SubscriptionOptions = {
 					plan: MolliePlan | undefined;
 					reason: "period_ended" | "mollie_canceled";
 				},
+				ctx: GenericEndpointContext,
+		  ) => Promise<void>)
+		| undefined;
+};
+
+export type SalesInvoicesOptions = {
+	enabled: boolean;
+	/**
+	 * The invoice recipient for a paid payment, from your own customer data
+	 * (Mollie requires name, email and address). Return `null` to skip.
+	 */
+	getRecipient: (
+		data: PaymentHookData,
+		ctx: GenericEndpointContext,
+	) => SalesInvoiceRecipient | null | Promise<SalesInvoiceRecipient | null>;
+	/**
+	 * VAT rate for invoice lines when `subscription.tax` is not configured
+	 * (prices are then treated as VAT-inclusive).
+	 * @default "0.00"
+	 */
+	vatRate?: string | undefined;
+	/** Deliver invoices through Peppol (Belgium, Germany and the Netherlands). */
+	eInvoice?: boolean | undefined;
+	/**
+	 * Also invoice the small mandate-verification payment of trial plans.
+	 * @default false
+	 */
+	invoiceVerificationPayments?: boolean | undefined;
+	/** Adjust the request before it is sent, e.g. add a memo or discount. */
+	getInvoiceParams?:
+		| ((
+				data: PaymentHookData,
+				defaults: SalesInvoiceRequest,
+				ctx: GenericEndpointContext,
+		  ) => SalesInvoiceRequest | Promise<SalesInvoiceRequest>)
+		| undefined;
+	onInvoiceCreated?:
+		| ((
+				data: PaymentHookData & { invoice: SalesInvoiceResponse },
 				ctx: GenericEndpointContext,
 		  ) => Promise<void>)
 		| undefined;
@@ -347,6 +445,11 @@ export interface MollieOptions {
 					| undefined;
 		  }
 		| undefined;
+	/**
+	 * Create a Mollie sales invoice (status `paid`) for every paid payment,
+	 * as proof of payment. Opt-in.
+	 */
+	salesInvoices?: SalesInvoicesOptions | undefined;
 	/**
 	 * Customize table and field names.
 	 */
