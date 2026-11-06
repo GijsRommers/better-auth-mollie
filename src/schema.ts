@@ -2,7 +2,7 @@ import type { BetterAuthPluginDBSchema } from "better-auth";
 import { mergeSchema } from "better-auth/db";
 import type { MollieOptions } from "./types";
 
-export const subscriptions = {
+export const subscriptionSchema = {
 	subscription: {
 		fields: {
 			referenceId: {
@@ -72,7 +72,7 @@ export const subscriptions = {
 	},
 } satisfies BetterAuthPluginDBSchema;
 
-export const molliePayments = {
+export const molliePaymentSchema = {
 	molliePayment: {
 		fields: {
 			molliePaymentId: {
@@ -120,7 +120,7 @@ export const molliePayments = {
 	},
 } satisfies BetterAuthPluginDBSchema;
 
-export const mollieOperations = {
+export const mollieOperationSchema = {
 	mollieOperation: {
 		fields: {
 			idempotencyKey: {
@@ -156,7 +156,7 @@ export const mollieOperations = {
 	},
 } satisfies BetterAuthPluginDBSchema;
 
-export const user = {
+export const userSchema = {
 	user: {
 		fields: {
 			mollieCustomerId: {
@@ -168,7 +168,7 @@ export const user = {
 	},
 } satisfies BetterAuthPluginDBSchema;
 
-export const organization = {
+export const organizationSchema = {
 	organization: {
 		fields: {
 			mollieCustomerId: {
@@ -182,11 +182,11 @@ export const organization = {
 
 /** The full schema, used to type the `schema` customization option. */
 export const getSchemaDefinition = () => ({
-	...subscriptions,
-	...molliePayments,
-	...mollieOperations,
-	...user,
-	...organization,
+	...subscriptionSchema,
+	...molliePaymentSchema,
+	...mollieOperationSchema,
+	...userSchema,
+	...organizationSchema,
 });
 
 export function isOrganizationBillingEnabled(options: MollieOptions): boolean {
@@ -197,11 +197,11 @@ export function isOrganizationBillingEnabled(options: MollieOptions): boolean {
 
 export function getSchema(options: MollieOptions) {
 	const base: BetterAuthPluginDBSchema = {
-		...user,
+		...userSchema,
 		...(options.subscription?.enabled
-			? { ...subscriptions, ...molliePayments, ...mollieOperations }
-			: { ...mollieOperations }),
-		...(isOrganizationBillingEnabled(options) ? organization : {}),
+			? { ...subscriptionSchema, ...molliePaymentSchema, ...mollieOperationSchema }
+			: { ...mollieOperationSchema }),
+		...(isOrganizationBillingEnabled(options) ? organizationSchema : {}),
 	};
 	return mergeSchema(base, options.schema as never);
 }

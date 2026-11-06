@@ -10,13 +10,13 @@ import {
 	type RunOperationOptions,
 	runOperation,
 } from "../../src/operations";
-import { mollieOperations } from "../../src/schema";
+import { mollieOperationSchema } from "../../src/schema";
 import type { MollieOperation } from "../../src/types";
 import { createFakeMollie, type FakeMollie, mollieError } from "../helpers/fake-mollie";
 
 async function setup() {
 	const { auth } = await getTestInstance(
-		{ plugins: [{ id: "operations-test", schema: mollieOperations }] },
+		{ plugins: [{ id: "operations-test", schema: mollieOperationSchema }] },
 		{ disableTestUser: true },
 	);
 	return (await auth.$context) as unknown as AuthContext;
