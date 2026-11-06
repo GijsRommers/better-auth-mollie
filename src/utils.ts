@@ -136,18 +136,24 @@ export function isMollieNotFound(error: unknown): boolean {
 }
 
 /**
- * A Mollie error that definitely did not perform the operation (validation
- * errors, authentication errors). Timeouts, 5xx, 409 (idempotent request in
- * progress) and 429 leave the outcome unknown.
+ * Statuses that prove Mollie rejected the request without performing it.
+ * Deliberately excludes 400: Mollie also answers 400 when an idempotency key
+ * is reused with different parameters, i.e. when the original request may
+ * well have succeeded. 409, 429, 5xx and network errors are unknown too.
  */
-export function isDefinitiveMollieError(error: unknown): boolean {
-	if (!isMollieApiError(error) || typeof error.statusCode !== "number") return false;
+const REJECTED_STATUSES = new Set([401, 403, 404, 410, 422]);
+
+export function isRejectedMollieRequest(error: unknown): boolean {
 	return (
-		error.statusCode >= 400 &&
-		error.statusCode < 500 &&
-		error.statusCode !== 409 &&
-		error.statusCode !== 429
+		isMollieApiError(error) &&
+		typeof error.statusCode === "number" &&
+		REJECTED_STATUSES.has(error.statusCode)
 	);
+}
+
+/** Mollie is still processing an earlier request with the same idempotency key. */
+export function isMollieConflict(error: unknown): boolean {
+	return isMollieApiError(error) && error.statusCode === 409;
 }
 
 export function errorMessage(error: unknown): string {

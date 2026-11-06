@@ -3,7 +3,7 @@ import {
 	addInterval,
 	ceilToUTCDate,
 	fromMollieDate,
-	isDefinitiveMollieError,
+	isRejectedMollieRequest,
 	isValidAmount,
 	parseInterval,
 	toMollieDate,
@@ -94,19 +94,24 @@ describe("amounts and plans", () => {
 	});
 });
 
-describe("isDefinitiveMollieError", () => {
+describe("isRejectedMollieRequest", () => {
 	const apiError = (statusCode: number) =>
 		Object.assign(new Error("mollie"), { name: "ApiError", statusCode });
 
-	it("treats validation errors as definitive", () => {
-		expect(isDefinitiveMollieError(apiError(422))).toBe(true);
-		expect(isDefinitiveMollieError(apiError(404))).toBe(true);
+	it("treats validation, auth and not-found errors as rejected", () => {
+		for (const status of [401, 403, 404, 410, 422]) {
+			expect(isRejectedMollieRequest(apiError(status))).toBe(true);
+		}
+	});
+
+	it("does not treat 400 as rejected: it may be an idempotency-key mismatch", () => {
+		expect(isRejectedMollieRequest(apiError(400))).toBe(false);
 	});
 
 	it("treats conflicts, rate limits, server and network errors as unknown outcomes", () => {
-		expect(isDefinitiveMollieError(apiError(409))).toBe(false);
-		expect(isDefinitiveMollieError(apiError(429))).toBe(false);
-		expect(isDefinitiveMollieError(apiError(503))).toBe(false);
-		expect(isDefinitiveMollieError(new TypeError("fetch failed"))).toBe(false);
+		expect(isRejectedMollieRequest(apiError(409))).toBe(false);
+		expect(isRejectedMollieRequest(apiError(429))).toBe(false);
+		expect(isRejectedMollieRequest(apiError(503))).toBe(false);
+		expect(isRejectedMollieRequest(new TypeError("fetch failed"))).toBe(false);
 	});
 });

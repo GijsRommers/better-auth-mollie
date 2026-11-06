@@ -98,7 +98,10 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const payments = new Map<string, FakePayment>();
 	const subscriptions = new Map<string, FakeSubscription>();
 	const mandates = new Map<string, FakeMandate>();
-	const idempotency = new Map<string, unknown>();
+	/** Mollie's stored responses per idempotency key (kept for one hour in reality). */
+	const idempotency = new Map<string, { fingerprint: string; value?: unknown; error?: unknown }>();
+	const inFlight = new Set<string>();
+	const holds = new Map<string, { phase: "arrival" | "processing"; gate: Promise<void> }>();
 	const calls: FakeCall[] = [];
 	const failures = new Map<string, unknown[]>();
 	/** Called after a create succeeds but before the response returns. */
@@ -113,11 +116,65 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		}
 	}
 
-	function replay<T>(key: string | undefined, create: () => T): T {
-		if (key && idempotency.has(key)) return structuredClone(idempotency.get(key)) as T;
-		const created = create();
-		if (key) idempotency.set(key, structuredClone(created));
-		return created;
+	function stableStringify(value: unknown): string {
+		if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+		if (value && typeof value === "object") {
+			return `{${Object.keys(value)
+				.filter((key) => (value as Record<string, unknown>)[key] !== undefined)
+				.sort()
+				.map((key) => `${JSON.stringify(key)}:${stableStringify((value as any)[key])}`)
+				.join(",")}}`;
+		}
+		return JSON.stringify(value);
+	}
+
+	async function takeHold(method: string, phase: "arrival" | "processing") {
+		const hold = holds.get(method);
+		if (hold && hold.phase === phase) {
+			holds.delete(method);
+			await hold.gate;
+		}
+	}
+
+	/**
+	 * Mollie idempotency semantics: a known key with the same parameters
+	 * replays the stored response (success or error), with different
+	 * parameters it is rejected with 400, and while the first request is still
+	 * processing a second one gets 409.
+	 */
+	async function idempotent<T>(method: string, params: any, create: () => T): Promise<T> {
+		await takeHold(method, "arrival");
+		const key: string | undefined = params.idempotencyKey;
+		const { idempotencyKey: _ignored, ...rest } = params;
+		const fingerprint = `${method}:${stableStringify(rest)}`;
+		if (key) {
+			const stored = idempotency.get(key);
+			if (stored) {
+				if (stored.fingerprint !== fingerprint) {
+					throw mollieError(
+						400,
+						"The Idempotency-Key has already been used with different request parameters",
+					);
+				}
+				if (stored.error) throw stored.error;
+				return structuredClone(stored.value) as T;
+			}
+			if (inFlight.has(key)) {
+				throw mollieError(409, "A request with this Idempotency-Key is still being processed");
+			}
+			inFlight.add(key);
+		}
+		try {
+			await takeHold(method, "processing");
+			const created = create();
+			if (key) idempotency.set(key, { fingerprint, value: structuredClone(created) });
+			return created;
+		} catch (error) {
+			if (key) idempotency.set(key, { fingerprint, error });
+			throw error;
+		} finally {
+			if (key) inFlight.delete(key);
+		}
 	}
 
 	function notFound(): never {
@@ -165,7 +222,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		customers: {
 			async create(params: any) {
 				record("customers.create", [params]);
-				const result = replay(params.idempotencyKey, () => {
+				const result = await idempotent("customers.create", params, () => {
 					const customer: FakeCustomer = {
 						resource: "customer",
 						id: id("cst"),
@@ -201,7 +258,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		payments: {
 			async create(params: any) {
 				record("payments.create", [params]);
-				const result = replay(params.idempotencyKey, () => createPayment(params));
+				const result = await idempotent("payments.create", params, () => createPayment(params));
 				afterCreate.get("payments.create")?.();
 				return clone(result);
 			},
@@ -238,7 +295,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		customerSubscriptions: {
 			async create(params: any) {
 				record("customerSubscriptions.create", [params]);
-				const result = replay(params.idempotencyKey, () => {
+				const result = await idempotent("customerSubscriptions.create", params, () => {
 					const mandate = params.mandateId ? mandates.get(params.mandateId) : undefined;
 					if (params.mandateId && (!mandate || mandate.status === "invalid")) {
 						throw mollieError(422, "The mandate is invalid");
@@ -321,6 +378,23 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		mandates,
 		setNow(now: () => Date) {
 			clock = now;
+		},
+		/** Mollie forgets idempotency keys after an hour. */
+		expireIdempotencyKeys() {
+			idempotency.clear();
+		},
+		/**
+		 * Delay the next call to `method`: `"arrival"` holds it before Mollie
+		 * sees it (network delay), `"processing"` while Mollie is working on it
+		 * (a concurrent request with the same key gets 409). Returns `release`.
+		 */
+		hold(method: string, phase: "arrival" | "processing") {
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			holds.set(method, { phase, gate });
+			return release;
 		},
 		callsTo(method: string) {
 			return calls.filter((c) => c.method === method);
