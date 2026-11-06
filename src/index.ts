@@ -81,7 +81,7 @@ function installOrganizationHooks(ctx: AuthContext, options: MollieOptions) {
 	const existing = organizationPlugin.options.organizationHooks ?? {};
 
 	/** Block deleting an organization whose subscription will still be charged. */
-	const beforeDelete = async (data: OrganizationHookData) => {
+	const beforeDelete = async (data: OrganizationHookData, hookCtx?: unknown) => {
 		const billing = await ctx.adapter.findMany<Subscription>({
 			model: "subscription",
 			where: [
@@ -91,6 +91,16 @@ function installOrganizationHooks(ctx: AuthContext, options: MollieOptions) {
 			limit: 100,
 		});
 		if (billing.some((s) => !s.cancelAtPeriodEnd)) {
+			// Better Auth clears the active organization before this hook runs.
+			// The organization stays, so put the user back where they were.
+			const session = (hookCtx as GenericEndpointContext | undefined)?.context?.session?.session as
+				| { token: string; activeOrganizationId?: string | null }
+				| undefined;
+			if (session?.activeOrganizationId === data.organization.id) {
+				await ctx.internalAdapter
+					.updateSession(session.token, { activeOrganizationId: data.organization.id } as never)
+					.catch(() => {});
+			}
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ORGANIZATION_HAS_ACTIVE_SUBSCRIPTION);
 		}
 	};
@@ -112,7 +122,7 @@ function installOrganizationHooks(ctx: AuthContext, options: MollieOptions) {
 		...existing,
 		beforeDeleteOrganization: async (data: OrganizationHookData, hookCtx?: unknown) => {
 			await existing.beforeDeleteOrganization?.(data, hookCtx);
-			await beforeDelete(data);
+			await beforeDelete(data, hookCtx);
 		},
 		afterUpdateOrganization: async (data: OrganizationHookData, hookCtx?: unknown) => {
 			await existing.afterUpdateOrganization?.(data, hookCtx);

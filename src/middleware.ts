@@ -22,9 +22,9 @@ export const mollieSessionMiddleware = createAuthMiddleware(
  *
  * - `customerType` comes from the request, else `subscription.customerType`
  *   (default `"organization"`).
- * - Organization billing uses `referenceId`, else the active organization.
- *   Without either, and when the request did not ask for organization billing
- *   explicitly, it falls back to billing the user.
+ * - Organization billing uses `referenceId`, else the active organization;
+ *   without either the request fails (`ORGANIZATION_REFERENCE_ID_REQUIRED`).
+ *   It never silently bills the user instead: pass `customerType: "user"`.
  * - `authorizeReference` must approve every organization reference and any
  *   user reference other than the signed-in user.
  */
@@ -51,26 +51,23 @@ export const referenceMiddleware = (options: MollieOptions, action: AuthorizeRef
 		};
 
 		if (customerType === "organization") {
-			const referenceId = explicitReferenceId || session.activeOrganizationId || undefined;
-			if (referenceId || requested === "organization") {
-				if (!isOrganizationBillingEnabled(options)) {
-					throw APIError.from(
-						"BAD_REQUEST",
-						MOLLIE_ERROR_CODES.ORGANIZATION_SUBSCRIPTION_NOT_ENABLED,
-					);
-				}
-				if (!subscriptionOptions.authorizeReference) {
-					throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.AUTHORIZE_REFERENCE_REQUIRED);
-				}
-				if (!referenceId) {
-					throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ORGANIZATION_REFERENCE_ID_REQUIRED);
-				}
-				if (!(await authorize(referenceId))) {
-					throw APIError.from("UNAUTHORIZED", MOLLIE_ERROR_CODES.UNAUTHORIZED);
-				}
-				return { referenceId, customerType: "organization" as CustomerType };
+			if (!isOrganizationBillingEnabled(options)) {
+				throw APIError.from(
+					"BAD_REQUEST",
+					MOLLIE_ERROR_CODES.ORGANIZATION_SUBSCRIPTION_NOT_ENABLED,
+				);
 			}
-			// No organization in play: bill the user.
+			if (!subscriptionOptions.authorizeReference) {
+				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.AUTHORIZE_REFERENCE_REQUIRED);
+			}
+			const referenceId = explicitReferenceId || session.activeOrganizationId;
+			if (!referenceId) {
+				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ORGANIZATION_REFERENCE_ID_REQUIRED);
+			}
+			if (!(await authorize(referenceId))) {
+				throw APIError.from("UNAUTHORIZED", MOLLIE_ERROR_CODES.UNAUTHORIZED);
+			}
+			return { referenceId, customerType: "organization" as CustomerType };
 		}
 
 		const referenceId = explicitReferenceId || user.id;
