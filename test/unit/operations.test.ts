@@ -204,6 +204,114 @@ describe("runOperation", () => {
 		expect(fake.activeSubscriptionsFor(customerId).map((s) => s.id)).toEqual([attemptB.mollieId]);
 	});
 
+	/** Pauses inside `recover` until released; resolves `paused` when reached. */
+	function pausableRecover(
+		recover: (key: string) => Promise<string | null>,
+		pause: "before-lookup" | "after-lookup" = "before-lookup",
+	) {
+		let resume!: () => void;
+		let reached!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			resume = resolve;
+		});
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		let first = true;
+		return {
+			paused,
+			resume,
+			recover: async (key: string) => {
+				if (!first) return recover(key);
+				first = false;
+				const found = pause === "after-lookup" ? await recover(key) : undefined;
+				reached();
+				await gate;
+				return pause === "after-lookup" ? (found ?? null) : recover(key);
+			},
+		};
+	}
+
+	/** Descriptions differ per attempt, so Mollie's uniqueness rule cannot help. */
+	function unprotectedOperation(overrides: Partial<RunOperationOptions<{ id: string }>> = {}) {
+		return createSubscriptionOperation(fake, customerId, {
+			execute: (idempotencyKey) =>
+				fake.client.customerSubscriptions.create({
+					customerId,
+					amount: { currency: "EUR", value: "9.95" },
+					interval: "1 month",
+					description: `Pro subscription · ${idempotencyKey}`,
+					metadata: { operationKey: idempotencyKey },
+					idempotencyKey,
+				}),
+			...overrides,
+		});
+	}
+
+	it("uses a stale attempt's result when it finishes while being written off", async () => {
+		const release = fake.hold("customerSubscriptions.create", "arrival");
+		const operation = unprotectedOperation();
+		const attemptA = runOperation(context, operation);
+		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
+
+		// B finds nothing for key #1 (A has not reached Mollie yet), then pauses.
+		const lookup = pausableRecover(async (key) => {
+			const found = await operation.recover(key);
+			expect(found).toBeNull();
+			return found;
+		}, "after-lookup");
+		const attemptB = runOperation(context, {
+			...operation,
+			recover: lookup.recover,
+			now: later(REPLAY_WINDOW_MS + minutes(1)),
+		});
+		await lookup.paused;
+
+		// Meanwhile A completes and records success.
+		release();
+		const resultA = await attemptA;
+
+		// B's write-off now loses; it must adopt A's result, not start #2.
+		lookup.resume();
+		const resultB = await attemptB;
+		expect(resultB).toMatchObject({ mollieId: resultA.mollieId, replayed: true });
+		expect(fake.subscriptions.size).toBe(1);
+		expect(await listOps(context)).toHaveLength(1);
+	});
+
+	it("never hands out a recovered resource whose attempt was written off", async () => {
+		const releaseA = fake.hold("customerSubscriptions.create", "arrival");
+		const operation = unprotectedOperation();
+		const attemptA = runOperation(context, operation);
+		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
+
+		// B loads A as pending; its lookup stalls.
+		const lookup = pausableRecover(operation.recover);
+		const attemptB = runOperation(context, {
+			...operation,
+			recover: lookup.recover,
+			now: later(REPLAY_WINDOW_MS + minutes(1)),
+		});
+		await lookup.paused;
+
+		// C writes A off and creates the replacement attempt.
+		const resultC = await runOperation(context, {
+			...operation,
+			now: later(REPLAY_WINDOW_MS + minutes(1)),
+		});
+		expect(resultC.idempotencyKey).toBe("activate:sub_local:tr_1#2");
+
+		// A's request lands late; A sees it was written off and compensates.
+		releaseA();
+		await expect(attemptA).rejects.toBeInstanceOf(OperationSupersededError);
+
+		// B's lookup now finds A's compensated subscription, but must return C's.
+		lookup.resume();
+		const resultB = await attemptB;
+		expect(resultB.mollieId).toBe(resultC.mollieId);
+		expect(fake.activeSubscriptionsFor(customerId).map((s) => s.id)).toEqual([resultC.mollieId]);
+	});
+
 	it("relies on Mollie's unique subscription description as a second safety net", async () => {
 		const release = fake.hold("customerSubscriptions.create", "arrival");
 		const operation = createSubscriptionOperation(fake, customerId);

@@ -146,6 +146,46 @@ export async function runOperation<T>(
 	context: AuthContext,
 	options: RunOperationOptions<T>,
 ): Promise<OperationResult<T>> {
+	for (let round = 0; round < MAX_ROUNDS; round++) {
+		const outcome = await runRound(context, options);
+		if (outcome !== RELOAD) return outcome;
+	}
+	// Persistent contention on this scope; the caller should retry later.
+	throw new OperationInProgressError(`${options.scope}#*`);
+}
+
+/** Returned by a round that lost a race and must re-read the journal. */
+const RELOAD = Symbol("reload");
+const MAX_ROUNDS = 3;
+
+async function readOperation(context: AuthContext, idempotencyKey: string) {
+	return context.adapter.findOne<MollieOperation>({
+		model: "mollieOperation",
+		where: [{ field: "idempotencyKey", value: idempotencyKey }],
+	});
+}
+
+/**
+ * Called after losing a guarded transition on `idempotencyKey`. Only the
+ * journal row decides what happened: if the attempt succeeded in the
+ * meantime its resource is the result; if it was written off, the round
+ * reloads so it sees (and joins) the replacement attempt.
+ */
+async function settleLostTransition<T>(
+	context: AuthContext,
+	idempotencyKey: string,
+): Promise<OperationResult<T> | typeof RELOAD> {
+	const current = await readOperation(context, idempotencyKey);
+	if (current?.status === "succeeded" && current.mollieId) {
+		return { mollieId: current.mollieId, idempotencyKey, replayed: true };
+	}
+	return RELOAD;
+}
+
+async function runRound<T>(
+	context: AuthContext,
+	options: RunOperationOptions<T>,
+): Promise<OperationResult<T> | typeof RELOAD> {
 	const now = options.now ?? (() => new Date());
 	const attempts = await loadAttempts(context, options as RunOperationOptions<unknown>);
 
@@ -160,19 +200,26 @@ export async function runOperation<T>(
 		if (op.status !== "pending") continue;
 		const recovered = await options.recover(op.idempotencyKey);
 		if (recovered) {
-			await resolveOperation(context, op.idempotencyKey, "succeeded", recovered);
-			context.logger.info(
-				`[mollie] Recovered ${options.kind} ${recovered} from pending operation ${op.idempotencyKey}`,
-			);
-			return { mollieId: recovered, idempotencyKey: op.idempotencyKey, replayed: true };
+			if (await resolveOperation(context, op.idempotencyKey, "succeeded", recovered)) {
+				context.logger.info(
+					`[mollie] Recovered ${options.kind} ${recovered} from pending operation ${op.idempotencyKey}`,
+				);
+				return { mollieId: recovered, idempotencyKey: op.idempotencyKey, replayed: true };
+			}
+			// The row was resolved concurrently. If it was written off, the
+			// resource we found is being compensated and must not be used.
+			return settleLostTransition(context, op.idempotencyKey);
 		}
 		const age = now().getTime() - new Date(op.createdAt).getTime();
 		if (age < REPLAY_WINDOW_MS) {
 			return executeAttempt(context, options, op.idempotencyKey);
 		}
 		// Mollie no longer remembers this key and nothing carries its
-		// operationKey, so the attempt never took effect.
-		await resolveOperation(context, op.idempotencyKey, "failed", null);
+		// operationKey, so the attempt never took effect...
+		if (!(await resolveOperation(context, op.idempotencyKey, "failed", null))) {
+			// ...unless it just finished: then its result is ours.
+			return settleLostTransition(context, op.idempotencyKey);
+		}
 	}
 
 	const next = Math.max(
@@ -227,10 +274,7 @@ async function executeAttempt<T>(
 	}
 
 	// The row was resolved while we were waiting for Mollie.
-	const current = await context.adapter.findOne<MollieOperation>({
-		model: "mollieOperation",
-		where: [{ field: "idempotencyKey", value: idempotencyKey }],
-	});
+	const current = await readOperation(context, idempotencyKey);
 	if (current?.status === "succeeded" && current.mollieId === mollieId) {
 		// A concurrent re-send of this key got Mollie's replay of our request.
 		return { mollieId, idempotencyKey, result, replayed: false };
