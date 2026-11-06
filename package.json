@@ -1,0 +1,93 @@
+{
+	"name": "better-auth-mollie",
+	"version": "0.1.0",
+	"description": "Mollie subscriptions for Better Auth: mandates, recurring billing via the Mollie Subscriptions API, idempotent webhooks and organization billing.",
+	"type": "module",
+	"license": "MIT",
+	"author": "Gijs Rommers",
+	"homepage": "https://github.com/gijs-rommers/better-auth-mollie#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gijs-rommers/better-auth-mollie.git"
+	},
+	"bugs": {
+		"url": "https://github.com/gijs-rommers/better-auth-mollie/issues"
+	},
+	"keywords": [
+		"better-auth",
+		"better-auth-plugin",
+		"mollie",
+		"subscriptions",
+		"recurring",
+		"billing",
+		"payments",
+		"sepa",
+		"bancontact",
+		"ideal"
+	],
+	"sideEffects": false,
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"main": "./dist/index.js",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./client": {
+			"types": "./dist/client.d.ts",
+			"default": "./dist/client.js"
+		},
+		"./package.json": "./package.json"
+	},
+	"typesVersions": {
+		"*": {
+			"client": [
+				"./dist/client.d.ts"
+			]
+		}
+	},
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"lint:package": "publint --strict && attw --pack . --profile esm-only",
+		"test": "vitest run --project unit",
+		"test:watch": "vitest --project unit",
+		"test:integration": "vitest run --project integration",
+		"prepublishOnly": "pnpm run build"
+	},
+	"dependencies": {
+		"zod": "^4.5.4"
+	},
+	"peerDependencies": {
+		"@mollie/api-client": "^4.6.0",
+		"better-auth": "^1.7.18"
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "0.18.5",
+		"@biomejs/biome": "2.6.6",
+		"@mollie/api-client": "4.6.0",
+		"@types/node": "24.19.2",
+		"better-auth": "1.7.18",
+		"publint": "0.3.25",
+		"tsup": "9.0.0",
+		"typescript": "5.9.3",
+		"vitest": "5.1.0"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"packageManager": "pnpm@12.3.4"
+}
