@@ -2177,13 +2177,85 @@ describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging",
 		};
 		const { coverage } = await import("../../src/billing");
 		const result = await coverage(
-			{ context: { adapter } } as never,
+			{ context: { adapter, runInBackground: () => {}, logger: console } } as never,
 			{ subscription: { enabled: true, plans: PLANS } } as never,
 			{ referenceId: "ref", customerType: null },
 			"new",
 			new Date(),
 		);
-		expect(result.state).toBe("covered");
-		expect(result.events).toHaveLength(100);
+		expect(result).toBe("covered");
+		expect(rows.filter((r) => r.status === "canceled")).toHaveLength(100);
+	});
+});
+
+describe("re-check of 18c1571: activations that stall past their leases", () => {
+	it("never lets a stalled activation complete after another pending row activated", async () => {
+		const env = await setup();
+		const customer = await env.fake.client.customers.create({
+			idempotencyKey: "stalled-activation",
+			entityCustomer: { name: "Stalled" },
+		} as never);
+		const pending = async (key: string) => {
+			const row = await env.context.adapter.create<any, any>({
+				model: "subscription",
+				data: {
+					referenceId: env.user.id,
+					plan: "starter",
+					status: "incomplete",
+					mollieCustomerId: customer.id,
+					customerType: "user",
+					cancelAtPeriodEnd: false,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+			});
+			const payment = await env.fake.client.payments.create({
+				idempotencyKey: key,
+				paymentRequest: {
+					amount: { currency: "EUR", value: "9.95" },
+					description: "starter",
+					sequenceType: "first",
+					customerId: customer.id,
+					redirectUrl: "https://app.example.com/done",
+					metadata: { subscriptionId: row.id, plan: "starter", purpose: "checkout" },
+				},
+			} as never);
+			env.fake.completePayment(payment.id, "paid");
+			return { row, payment };
+		};
+		const a = await pending("a");
+		const b = await pending("b");
+
+		// A's activation is decided, then stalls past every lease.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "subscription" && args.set?.status === "active") {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const deliveryA = env.webhook(`id=${a.payment.id}`);
+		await paused;
+		travel(Date.now() + 3 * 60_000);
+		await env.webhook(`id=${b.payment.id}`);
+		release();
+		await deliveryA;
+		adapter.incrementOne = original;
+		await env.webhook(`id=${a.payment.id}`);
+
+		const billing = (await env.subscriptions()).filter((s) => s.status === "active");
+		expect(billing.map((s) => s.id)).toEqual([b.row.id]);
+		expect(refundedIds(env)).toEqual([a.payment.id]);
 	});
 });

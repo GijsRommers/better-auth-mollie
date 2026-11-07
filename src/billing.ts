@@ -501,25 +501,28 @@ export async function withReferenceLock<T>(
 	}
 }
 
-export type Coverage = {
-	/**
-	 * `covered`: another subscription still covers the identity; `free`: none
-	 * does; `busy`: one may, but is being changed right now (try again later).
-	 */
-	state: "covered" | "free" | "busy";
-	events: BillingEvent[];
-};
+/**
+ * `covered`: another subscription still covers the identity; `free`: none
+ * does; `busy`: one may (or another pending row may be activating), and is
+ * being changed right now: try again shortly.
+ */
+export type Coverage = "covered" | "free" | "busy";
 
 /**
  * Whether a subscription other than `exceptId` still covers this identity,
- * over all of the reference's billing rows (paged by id, so rows that change
- * meanwhile are never skipped). A row with no customer type stands for
- * either identity, on both sides. Call it under `withReferenceLock`.
+ * over all of the reference's rows (paged by id, so rows that change
+ * meanwhile are never skipped). A row with no customer type stands for either
+ * identity, on both sides. Call it under `withReferenceLock`; it also makes
+ * sure nothing decided earlier can still change that answer:
  *
- * Another subscription whose cancellation date has passed is ended here and
- * now (atomically, and only while nobody holds its lock), which also replaces
- * its lock token: whoever was about to undo that cancellation (a restore that
- * stalled) can no longer write it. So the identity never has two.
+ * - another subscription whose cancellation date has passed is ended here;
+ * - another pending row is fenced out (so an activation of it that stalled
+ *   cannot complete afterwards).
+ *
+ * Both happen atomically and only while nobody holds that row's lock, and
+ * replace its lock token and serial: whoever was about to write it (a
+ * restore, an activation) based on an older decision no longer matches.
+ * `subscription.canceled` events of rows ended here are dispatched right away.
  */
 export async function coverage(
 	ctx: Ctx,
@@ -528,7 +531,6 @@ export async function coverage(
 	exceptId: string,
 	now: Date,
 ): Promise<Coverage> {
-	const events: BillingEvent[] = [];
 	let busy = false;
 	let cursor: string | null = null;
 	for (;;) {
@@ -536,7 +538,7 @@ export async function coverage(
 			model: "subscription",
 			where: [
 				{ field: "referenceId", value: identity.referenceId },
-				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+				{ field: "status", operator: "in", value: [...BILLING_STATUSES, "incomplete"] },
 				...(cursor ? [{ field: "id", operator: "gt" as const, value: cursor }] : []),
 			],
 			sortBy: { field: "id", direction: "asc" },
@@ -544,16 +546,34 @@ export async function coverage(
 		});
 		for (const other of page) {
 			if (other.id === exceptId || !billsIdentity(other, identity)) continue;
-			if (stillCovers(other, now)) return { state: "covered", events };
+			if (other.status === "incomplete") {
+				if (!(await fenceOut(ctx, other, now))) busy = true;
+				continue;
+			}
+			if (stillCovers(other, now)) return "covered";
 			const ended = await endDueCancellation(ctx, options, other, now);
-			if (ended === "covers") return { state: "covered", events };
+			if (ended === "covers") return "covered";
 			if (ended === "busy") busy = true;
-			else events.push(...ended);
 		}
 		if (page.length < PAGE_SIZE) break;
 		cursor = (page[page.length - 1] as Subscription).id;
 	}
-	return { state: busy ? "busy" : "free", events };
+	return busy ? "busy" : "free";
+}
+
+/** Atomically replaces an unlocked row's lock token and serial; false if it is locked. */
+async function fenceOut(ctx: Ctx, subscription: Subscription, now: Date): Promise<boolean> {
+	const rotate = (unlocked: Where) =>
+		ctx.context.adapter.incrementOne<Subscription>({
+			model: "subscription",
+			where: [{ field: "id", value: subscription.id }, unlocked],
+			increment: { lockSerial: 1 },
+			set: { lockToken: globalThis.crypto.randomUUID(), lockedUntil: new Date(0) },
+		});
+	const rotated =
+		(await rotate({ field: "lockedUntil", operator: "lt", value: now })) ??
+		(await rotate({ field: "lockedUntil", value: null }));
+	return rotated !== null;
 }
 
 /**
@@ -565,7 +585,7 @@ async function endDueCancellation(
 	options: MollieOptions,
 	subscription: Subscription,
 	now: Date,
-): Promise<BillingEvent[] | "busy" | "covers"> {
+): Promise<"ended" | "busy" | "covers"> {
 	const end = (unlocked: Where) =>
 		ctx.context.adapter.incrementOne<Subscription>({
 			model: "subscription",
@@ -590,11 +610,14 @@ async function endDueCancellation(
 		(await end({ field: "lockedUntil", operator: "lt", value: now })) ??
 		(await end({ field: "lockedUntil", value: null }));
 	if (ended) {
-		const plan = await getPlanByName(options, ended.plan);
-		return [{ type: "subscription.canceled", subscription: ended, plan, reason: "period_ended" }];
+		const plan = await getPlanByName(options, ended.plan).catch(() => undefined);
+		dispatchEvents(ctx, options, [
+			{ type: "subscription.canceled", subscription: ended, plan, reason: "period_ended" },
+		]);
+		return "ended";
 	}
 	const current = await reload(ctx, subscription.id);
-	if (!current || !BILLING_STATUSES.includes(current.status)) return [];
+	if (!current || !BILLING_STATUSES.includes(current.status)) return "ended";
 	return stillCovers(current, now) ? "covers" : "busy";
 }
 
@@ -894,15 +917,16 @@ async function activateSubscription(
 	const identity = { referenceId: initial.referenceId, customerType: initial.customerType ?? null };
 	return withReferenceLock(ctx, options, identity, async (fence): Promise<Application> => {
 		const covered = await coverage(ctx, options, identity, initial.id, new Date());
-		if (covered.state === "covered") return { kind: "covered", events: covered.events };
-		if (covered.state === "busy") return { kind: "unresolved", events: covered.events };
+		if (covered === "covered") return { kind: "covered" };
+		// Another row is being changed right now: come back shortly (409).
+		if (covered === "busy") throw new OperationInProgressError(`activate:${initial.id}`);
 		await fence();
 		const result = await activateRow(ctx, initial, payment, plan, customerId, anchor, lock, {
 			isTrial,
 			trialEnd,
 			periodEnd,
 		});
-		return { ...result, events: [...covered.events, ...(result.events ?? [])] };
+		return result;
 	});
 }
 

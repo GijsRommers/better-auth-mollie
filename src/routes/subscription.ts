@@ -227,11 +227,10 @@ async function whileCancellationHolds<T>(
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PERIOD_ENDED);
 		}
 		const covered = await coverage(ctx, options, identity, subscription.id, now);
-		dispatchEvents(ctx, options, covered.events);
-		if (covered.state === "covered") {
+		if (covered === "covered") {
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ANOTHER_SUBSCRIPTION_ACTIVE);
 		}
-		if (covered.state === "busy") {
+		if (covered === "busy") {
 			throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 		}
 		await fence();
