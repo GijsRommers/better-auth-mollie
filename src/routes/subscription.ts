@@ -142,7 +142,13 @@ async function findOpenCheckout(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
 	subscription: Subscription,
-	match: { plan: string; amount: string; purpose: PaymentPurpose; customerId: string },
+	match: {
+		plan: string;
+		amount: string;
+		currency: string;
+		purpose: PaymentPurpose;
+		customerId: string;
+	},
 	lock: SubscriptionLock,
 ): Promise<{ url?: string; activated?: boolean }> {
 	const gateway = gatewayFor(options);
@@ -162,6 +168,7 @@ async function findOpenCheckout(
 			payment.status === "open" &&
 			url &&
 			payment.amount.value === match.amount &&
+			payment.amount.currency === match.currency &&
 			payment.customerId === match.customerId &&
 			metadataOf(payment).plan === match.plan &&
 			paymentPurpose(payment) === match.purpose
@@ -303,7 +310,11 @@ async function chargeProration(
 	cents: number,
 	fence: Fence,
 ) {
-	const customerId = current.mollieCustomerId as string;
+	const customerId = current.mollieCustomerId;
+	const mandateId = current.mollieMandateId;
+	if (!customerId || !mandateId) {
+		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.MANDATE_NOT_FOUND);
+	}
 	const planName = plan.name.toLowerCase();
 	const net = fromCents(cents);
 	const tax = await resolveTax(
@@ -317,17 +328,7 @@ async function chargeProration(
 	const gateway = gatewayFor(options);
 	// The tax callback may be slow: prove the lock is still ours right before charging.
 	await fence();
-	// Each upgrade attempt charges its own payment, never one made by another
-	// attempt (that attempt may still refund it). An attempt that lost its
-	// lock leaves its charge unapplied, and it is refunded.
-	const attempt = globalThis.crypto.randomUUID().replaceAll("-", "").slice(0, 12);
-	try {
-		return await chargeOnce(`proration:${current.id}:${planName}:${periodEnd}:${attempt}`);
-	} catch (error) {
-		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
-	}
-
-	async function chargeOnce(scope: string) {
+	const chargeOnce = async (scope: string) => {
 		const operation = await runOperation(ctx.context, {
 			kind: "create_proration_payment",
 			referenceId: current.referenceId,
@@ -340,7 +341,7 @@ async function chargeProration(
 						description: `${plan.name}: upgrade for the rest of this period`,
 						sequenceType: "recurring",
 						customerId,
-						mandateId: current.mollieMandateId as string,
+						mandateId,
 						webhookUrl: getWebhookUrl(ctx, options),
 						metadata: {
 							subscriptionId: current.id,
@@ -360,6 +361,15 @@ async function chargeProration(
 		const payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
 		await recordPayment(ctx, payment, current.id);
 		return payment;
+	};
+	// Each upgrade attempt charges its own payment, never one made by another
+	// attempt (that attempt may still refund it). An attempt that lost its
+	// lock leaves its charge unapplied, and it is refunded.
+	const attempt = globalThis.crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+	try {
+		return await chargeOnce(`proration:${current.id}:${planName}:${periodEnd}:${attempt}`);
+	} catch (error) {
+		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
 	}
 }
 
@@ -673,7 +683,13 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							ctx,
 							options,
 							row,
-							{ plan: planName, amount, purpose: input.purpose, customerId: input.customerId },
+							{
+								plan: planName,
+								amount,
+								currency: planCurrency(plan),
+								purpose: input.purpose,
+								customerId: input.customerId,
+							},
 							lock,
 						);
 						if (open.activated) return { response: respond(body.successUrl) };
