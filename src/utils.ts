@@ -32,19 +32,49 @@ export function parseInterval(interval: MollieInterval | string): ParsedInterval
  * Adds a Mollie interval to a date (UTC). Month arithmetic clamps to the last
  * day of the month, matching how Mollie schedules monthly charges.
  */
-export function addInterval(date: Date, interval: MollieInterval | string): Date {
+export function addInterval(date: Date, interval: MollieInterval | string, times = 1): Date {
 	const { count, unit } = parseInterval(interval);
-	if (unit === "day") return new Date(date.getTime() + count * DAY_MS);
-	if (unit === "week") return new Date(date.getTime() + count * 7 * DAY_MS);
+	if (unit === "day") return new Date(date.getTime() + count * times * DAY_MS);
+	if (unit === "week") return new Date(date.getTime() + count * times * 7 * DAY_MS);
+	// Months are always counted from the anchor date, so Jan 31 + 2 months is
+	// Mar 31 (not Feb 28 + 1 month).
 	const result = new Date(date.getTime());
 	const day = result.getUTCDate();
 	result.setUTCDate(1);
-	result.setUTCMonth(result.getUTCMonth() + count);
+	result.setUTCMonth(result.getUTCMonth() + count * times);
 	const daysInMonth = new Date(
 		Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0),
 	).getUTCDate();
 	result.setUTCDate(Math.min(day, daysInMonth));
 	return result;
+}
+
+/**
+ * Mollie creates a scheduled payment on its charge date (Amsterdam time),
+ * which can be the previous evening in UTC; retries come later the same
+ * cycle. Shifting by half a day puts every payment in the right cycle.
+ */
+const CHARGE_DATE_SLACK_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * The billing cycle a subscription payment pays for: the cycle of the Mollie
+ * subscription (anchored on its `startDate`, one `interval` long) in which
+ * the payment was created. Depends only on immutable facts, so processing
+ * the same payment again always yields the same period.
+ */
+export function billingCycle(
+	startDate: Date,
+	interval: string,
+	chargedAt: Date,
+): { start: Date; end: Date } {
+	const at = chargedAt.getTime() + CHARGE_DATE_SLACK_MS;
+	let index = 0;
+	// At most 52 weekly cycles a year; 10 000 covers any realistic lifetime.
+	while (index < 10_000 && addInterval(startDate, interval, index + 1).getTime() <= at) index++;
+	return {
+		start: addInterval(startDate, interval, index),
+		end: addInterval(startDate, interval, index + 1),
+	};
 }
 
 export function addDays(date: Date, days: number): Date {

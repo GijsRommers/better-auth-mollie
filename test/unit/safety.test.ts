@@ -386,3 +386,115 @@ describe("interrupted and racing billing flows", () => {
 		expect((await env.subscription(subscription.id)).status).toBe("past_due");
 	});
 });
+
+describe("re-check findings", () => {
+	it("never stretches a late renewal's coverage when it is processed again", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const mollieId = subscription.mollieSubscriptionId!;
+		// Mollie's charge for cycle 1 only succeeds two days late (a retry).
+		travel(new Date(subscription.periodEnd!).getTime() + 2 * 86_400_000);
+		const late = env.fake.chargeSubscription(mollieId, "paid");
+		await env.webhook(`id=${late.id}`);
+		const covered = await env.subscription(subscription.id);
+		expect(covered.periodStart).toEqual(subscription.periodEnd);
+
+		travel(new Date(covered.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(mollieId, "failed");
+		await env.webhook(`id=${failed.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+
+		await env.webhook(`id=${late.id}`);
+		await syncMollieSubscriptions(env.auth as never);
+		const after = await env.subscription(subscription.id);
+		expect(after.status).toBe("past_due");
+		expect(after.periodEnd).toEqual(covered.periodEnd);
+	});
+
+	it("stops a lock holder that stalled past its lease from charging", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const stalled = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		let stall = false;
+		const env = await setup({
+			subscription: {
+				tax: {
+					calculate: async () => {
+						if (stall) {
+							stall = false;
+							reached();
+							await gate;
+						}
+						return { rate: "21.00" };
+					},
+				},
+			},
+		});
+		const subscription = await subscribe(env, "starter");
+		stall = true;
+		const a = env.api
+			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await stalled;
+		// A is stuck in the tax callback for longer than the lease...
+		travel(Date.now() + 3 * 60_000);
+		const { headers } = await env.signInWithTestUser();
+		await env.api.upgradeSubscription({ body: { plan: "yearly" }, headers });
+		// ...and must not charge when it wakes up.
+		release();
+		expect(await a).toMatchObject({ body: { code: "OPERATION_IN_PROGRESS" } });
+		const prorations = [...env.fake.payments.values()].filter(
+			(p) => (p.metadata as { purpose?: string }).purpose === "proration",
+		);
+		expect(prorations).toHaveLength(0);
+		const row = await env.subscription(subscription.id);
+		expect(row).toMatchObject({ plan: "starter", pendingPlan: "yearly" });
+	});
+
+	it("does not adopt a reused Mollie subscription that was canceled in the meantime", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "business");
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		const scheduled = await env.subscription(subscription.id);
+		// Simulate a crash before adoption, after which the sweep canceled it.
+		await env.context.adapter.update({
+			model: "subscription",
+			where: [{ field: "id", value: subscription.id }],
+			update: { mollieSubscriptionId: subscription.mollieSubscriptionId },
+		});
+		env.fake.setSubscriptionStatus(scheduled.mollieSubscriptionId!, "canceled");
+
+		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		const healed = await env.subscription(subscription.id);
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active.map((s) => s.id)).toEqual([healed.mollieSubscriptionId]);
+		expect(healed.mollieSubscriptionId).not.toBe(scheduled.mollieSubscriptionId);
+		expect(active[0]?.metadata).toMatchObject({ plan: "starter" });
+	});
+
+	it("refunds and stops an orphaned Mollie subscription at its first charge", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const orphan = await env.fake.client.subscriptions.create({
+			customerId: subscription.mollieCustomerId!,
+			idempotencyKey: "lost",
+			subscriptionRequest: {
+				amount: { currency: "EUR", value: "9.95" },
+				interval: "1 month",
+				description: "orphan",
+				metadata: { subscriptionId: subscription.id, plan: "starter" },
+			},
+		} as never);
+		const charge = env.fake.chargeSubscription(orphan.id, "paid");
+		await env.webhook(`id=${charge.id}`);
+		expect([...env.fake.refunds.values()].map((r) => r.paymentId)).toEqual([charge.id]);
+		expect(env.fake.subscriptions.get(orphan.id)?.status).toBe("canceled");
+		expect(env.fake.subscriptions.get(subscription.mollieSubscriptionId!)?.status).toBe("active");
+	});
+});

@@ -5,7 +5,7 @@ import type { CustomerResponse } from "mollie-api-typescript/models";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
 import { toAPIError } from "./errors";
 import { gatewayFor } from "./gateway";
-import { runOperation } from "./operations";
+import { OperationInProgressError, runOperation, withLock } from "./operations";
 import type { CustomerType, MollieOptions, WithMollieCustomerId } from "./types";
 import { mergeMetadata } from "./utils";
 
@@ -153,8 +153,9 @@ export async function claimDelivery(
 
 /**
  * Brings the Mollie customer's name (and, for users, email) in line with the
- * current database row. Reads the latest row and only writes when Mollie
- * differs, so overlapping runs converge on the newest values.
+ * current database row. Serialized per customer; inside the lock it rereads
+ * the row after updating Mollie and repeats if the row changed meanwhile, so
+ * the newest values always win. A busy lock is retried shortly.
  */
 export async function syncCustomerDetails(
 	context: GenericEndpointContext["context"],
@@ -162,15 +163,42 @@ export async function syncCustomerDetails(
 	customerType: CustomerType,
 	referenceId: string,
 ): Promise<void> {
-	const row = await context.adapter.findOne<
-		{ name: string; email?: string | null } & WithMollieCustomerId
-	>({ model: customerType, where: [{ field: "id", value: referenceId }] });
-	if (!row?.mollieCustomerId) return;
-	const desired: { name: string; email?: string } = { name: row.name };
-	if (customerType === "user" && row.email) desired.email = row.email;
+	const read = async () => {
+		const row = await context.adapter.findOne<
+			{ name: string; email?: string | null } & WithMollieCustomerId
+		>({ model: customerType, where: [{ field: "id", value: referenceId }] });
+		if (!row?.mollieCustomerId) return null;
+		const desired: { name: string; email?: string } = { name: row.name };
+		if (customerType === "user" && row.email) desired.email = row.email;
+		return { customerId: row.mollieCustomerId, desired };
+	};
 	const gateway = gatewayFor(options);
-	const remote = await gateway.getCustomer(row.mollieCustomerId);
-	const same =
-		remote.name === desired.name && (desired.email === undefined || remote.email === desired.email);
-	if (!same) await gateway.updateCustomer(row.mollieCustomerId, desired);
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			await withLock(
+				context,
+				{ key: `lock:customer:${customerType}:${referenceId}`, referenceId },
+				async (fence) => {
+					for (let round = 0; round < 3; round++) {
+						const current = await read();
+						if (!current) return;
+						const remote = await gateway.getCustomer(current.customerId);
+						const same =
+							remote.name === current.desired.name &&
+							(current.desired.email === undefined || remote.email === current.desired.email);
+						if (!same) {
+							await fence();
+							await gateway.updateCustomer(current.customerId, current.desired);
+						}
+						const after = await read();
+						if (JSON.stringify(after?.desired) === JSON.stringify(current.desired)) return;
+					}
+				},
+			);
+			return;
+		} catch (error) {
+			if (!(error instanceof OperationInProgressError)) throw error;
+			await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
+		}
+	}
 }

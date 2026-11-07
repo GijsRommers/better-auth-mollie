@@ -97,6 +97,9 @@ export async function createSalesInvoice(
 
 /** How far back the sync looks for paid payments without an invoice. */
 const CATCH_UP_DAYS = 30;
+const PAGE_SIZE = 100;
+/** Bounds one sync run; the rest is picked up by the next run. */
+const MAX_INVOICES_PER_RUN = 100;
 
 /**
  * Creates the sales invoices that were missed, e.g. because the invoice API
@@ -115,28 +118,36 @@ export async function catchUpSalesInvoices(
 ): Promise<number> {
 	if (!options.salesInvoices?.enabled) return 0;
 	const { adapter } = ctx.context;
-	const paid = await adapter.findMany<MolliePaymentRecord>({
-		model: "molliePayment",
-		where: [
-			{ field: "status", value: "paid" },
-			{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
-		],
-		sortBy: { field: "paidAt", direction: "desc" },
-		limit: 200,
-	});
+	const paid: MolliePaymentRecord[] = [];
+	for (let offset = 0; ; offset += PAGE_SIZE) {
+		const page = await adapter.findMany<MolliePaymentRecord>({
+			model: "molliePayment",
+			where: [
+				{ field: "status", value: "paid" },
+				{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
+			],
+			sortBy: { field: "molliePaymentId", direction: "asc" },
+			limit: PAGE_SIZE,
+			offset,
+		});
+		paid.push(...page);
+		if (page.length < PAGE_SIZE) break;
+	}
 	let created = 0;
 	for (const record of paid) {
+		if (created >= MAX_INVOICES_PER_RUN) break;
 		const prefix = `sales-invoice:${record.molliePaymentId}#`;
 		const done = await adapter.findMany<MollieOperation>({
 			model: "mollieOperation",
 			where: [
 				{ field: "kind", value: "create_sales_invoice" },
 				{ field: "idempotencyKey", operator: "starts_with", value: prefix },
-				{ field: "status", value: "succeeded" },
 			],
-			limit: 1,
+			limit: 20,
 		});
-		if (done.some((op) => op.idempotencyKey.startsWith(prefix))) continue;
+		if (done.some((op) => op.idempotencyKey.startsWith(prefix) && op.status === "succeeded")) {
+			continue;
+		}
 		const subscription = await adapter.findOne<Subscription>({
 			model: "subscription",
 			where: [{ field: "id", value: record.subscriptionId }],

@@ -1,4 +1,4 @@
-import type { AuthContext } from "better-auth";
+import type { AuthContext, Where } from "better-auth";
 import type { MollieOperation, MollieOperationKind } from "./types";
 import { isMollieBadRequest, isMollieConflict, isRejectedMollieRequest } from "./utils";
 
@@ -329,22 +329,44 @@ export function findByOperationKey<T extends { id: string; metadata?: unknown }>
 	return null;
 }
 
-/** How long a lifecycle lock is held before others may take it over. */
+/** How long a lifecycle lock is held without renewal before others may take it over. */
 export const LOCK_LEASE_MS = 2 * 60 * 1000;
+
+/** The lock was taken over by someone else after its lease expired. */
+export class LockLostError extends OperationInProgressError {
+	constructor(key: string) {
+		super(key);
+		this.name = "LockLostError";
+	}
+}
+
+/** Renews the lease and proves it is still ours; throws `LockLostError` otherwise. */
+export type Fence = () => Promise<void>;
+
+function newToken(): string {
+	return globalThis.crypto.randomUUID();
+}
 
 /**
  * Runs `fn` while holding a lease lock stored in the journal table (adapter
- * only, no row locks). Throws `OperationInProgressError` when another caller
- * holds it. A crashed holder's lease expires after `LOCK_LEASE_MS`.
+ * only, no row locks). Each holder gets a random token (stored in
+ * `mollieId`); renewal and release only work for that token, so identity
+ * never depends on timestamp equality.
+ *
+ * `fn` receives `fence`: call it right before any charge or write. It renews
+ * the lease and throws if another caller took it over (possible only after a
+ * pause longer than `LOCK_LEASE_MS`), so a stalled holder cannot act on a
+ * stale view.
  */
 export async function withLock<T>(
 	context: AuthContext,
 	input: { key: string; referenceId: string; now?: (() => Date) | undefined },
-	fn: () => Promise<T>,
+	fn: (fence: Fence) => Promise<T>,
 ): Promise<T> {
 	const now = input.now ?? (() => new Date());
-	const lease = now();
+	const token = newToken();
 	const { adapter } = context;
+	const claim = { status: "pending", mollieId: token, createdAt: now() };
 	let claimed = false;
 	try {
 		await adapter.create({
@@ -353,47 +375,57 @@ export async function withLock<T>(
 				idempotencyKey: input.key,
 				kind: "lifecycle_lock",
 				referenceId: input.referenceId,
-				status: "pending",
-				mollieId: null,
-				createdAt: lease,
+				...claim,
 			},
 		});
 		claimed = true;
 	} catch (error) {
 		const existing = await readOperation(context, input.key);
 		if (!existing) throw error;
-		const expired = lease.getTime() - new Date(existing.createdAt).getTime() > LOCK_LEASE_MS;
-		if (existing.status !== "pending" || expired) {
-			const taken = await adapter.incrementOne({
-				model: "mollieOperation",
-				where: [
-					{ field: "idempotencyKey", value: input.key },
-					{ field: "status", value: existing.status },
-					{ field: "createdAt", value: new Date(existing.createdAt) },
-				],
-				increment: {},
-				set: { status: "pending", createdAt: lease },
-			});
-			claimed = taken !== null;
+		const where: Where[] = [
+			{ field: "idempotencyKey", value: input.key },
+			{ field: "mollieId", value: existing.mollieId ?? "" },
+		];
+		if (existing.status === "pending") {
+			// Only an expired lease can be taken over; a renewal moves createdAt
+			// past the cutoff and makes this fail.
+			where.push(
+				{ field: "status", value: "pending" },
+				{ field: "createdAt", operator: "lt", value: new Date(now().getTime() - LOCK_LEASE_MS) },
+			);
+		} else {
+			where.push({ field: "status", value: existing.status });
 		}
+		claimed =
+			(await adapter.incrementOne({
+				model: "mollieOperation",
+				where,
+				increment: {},
+				set: claim,
+			})) !== null;
 	}
 	if (!claimed) throw new OperationInProgressError(input.key);
 
+	const mine: Where[] = [
+		{ field: "idempotencyKey", value: input.key },
+		{ field: "mollieId", value: token },
+		{ field: "status", value: "pending" },
+	];
+	const fence: Fence = async () => {
+		const renewed = await adapter.incrementOne({
+			model: "mollieOperation",
+			where: mine,
+			increment: {},
+			set: { createdAt: now() },
+		});
+		if (!renewed) throw new LockLostError(input.key);
+	};
 	const release = (status: "succeeded" | "failed") =>
 		adapter
-			.incrementOne({
-				model: "mollieOperation",
-				where: [
-					{ field: "idempotencyKey", value: input.key },
-					{ field: "status", value: "pending" },
-					{ field: "createdAt", value: lease },
-				],
-				increment: {},
-				set: { status },
-			})
+			.incrementOne({ model: "mollieOperation", where: mine, increment: {}, set: { status } })
 			.catch(() => null);
 	try {
-		const result = await fn();
+		const result = await fn(fence);
 		await release("succeeded");
 		return result;
 	} catch (error) {

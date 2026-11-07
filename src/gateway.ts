@@ -131,12 +131,21 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			);
 		},
 
-		async listCustomerSubscriptions(customerId: string): Promise<ListSubscriptionResponse[]> {
-			const page = await client.subscriptions.list(
-				{ customerId, limit: 50, sort: "desc" },
+		/** All running (active or pending) Mollie subscriptions of a customer. */
+		async listLiveCustomerSubscriptions(customerId: string): Promise<ListSubscriptionResponse[]> {
+			const live: ListSubscriptionResponse[] = [];
+			const pages = await client.subscriptions.list(
+				{ customerId, limit: PAGE_LIMIT, sort: "desc" },
 				options,
 			);
-			return page.result.embedded?.subscriptions ?? [];
+			for await (const page of pages) {
+				for (const subscription of page.result.embedded?.subscriptions ?? []) {
+					if (subscription.status === "active" || subscription.status === "pending") {
+						live.push(subscription);
+					}
+				}
+			}
+			return live;
 		},
 
 		async listSubscriptionPayments(

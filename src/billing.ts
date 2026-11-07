@@ -1,7 +1,7 @@
 import type { GenericEndpointContext, Where } from "better-auth";
 import type { BillingEvent } from "./events";
 import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } from "./gateway";
-import { OperationInProgressError, runOperation, withLock } from "./operations";
+import { type Fence, OperationInProgressError, runOperation, withLock } from "./operations";
 import { catchUpSalesInvoices } from "./sales-invoices";
 import {
 	ACCESS_STATUSES,
@@ -28,6 +28,7 @@ import type {
 import {
 	addDays,
 	addInterval,
+	billingCycle,
 	ceilToUTCDate,
 	errorMessage,
 	fromMollieDate,
@@ -55,10 +56,6 @@ function gracePeriodDays(options: MollieOptions): number {
 	return options.subscription?.enabled
 		? (options.subscription.gracePeriodDays ?? DEFAULT_GRACE_PERIOD_DAYS)
 		: DEFAULT_GRACE_PERIOD_DAYS;
-}
-
-function startOfUTCDay(date: Date): Date {
-	return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
 }
 
 export async function findSubscription(ctx: Ctx, where: Where[]): Promise<Subscription | null> {
@@ -283,9 +280,16 @@ export async function processPayment(
 				payment.subscriptionId &&
 				payment.subscriptionId !== subscription.mollieSubscriptionId
 			) {
-				// Charged by a Mollie subscription that was replaced, for a period
-				// that is already paid.
+				// Charged by a Mollie subscription this row does not use (replaced,
+				// or an orphan the sweep missed), for a period that is already
+				// paid: refund it, and make sure that Mollie subscription stops.
 				duplicate = true;
+				if (metadataOf(payment).subscriptionId === subscription.id) {
+					await cancelMollieSubscription(ctx, options, {
+						...subscription,
+						mollieSubscriptionId: payment.subscriptionId,
+					});
+				}
 			}
 		}
 		// A paid proration changes nothing: the upgrade was applied when charged.
@@ -424,11 +428,12 @@ async function expireCheckout(ctx: Ctx, subscription: Subscription): Promise<Sub
  * A recurring payment was paid: advance the period (never backwards) and
  * move `trialing`/`past_due`/`unpaid` to `active`.
  *
- * A payment only pays for its own period. The newest payment of the Mollie
- * subscription pays up to Mollie's `nextPaymentDate`, so a late retry does
- * not shift the schedule; an older payment (re-delivered, or re-read by the
- * cron) pays one interval from its own charge date, which never reaches past
- * a period that is already paid. Nothing changes unless the period advances.
+ * A payment pays for exactly one billing cycle of its Mollie subscription:
+ * the cycle (anchored on the Mollie subscription's `startDate`) in which it
+ * was created. That depends only on immutable facts, so re-processing a
+ * payment (re-delivery, the cron) can never stretch what it paid for, and a
+ * late retry still pays for its own cycle. If the Mollie subscription cannot
+ * be read, this throws, so the webhook is retried rather than guessed.
  */
 async function applyRenewal(
 	ctx: Ctx,
@@ -436,52 +441,23 @@ async function applyRenewal(
 	initial: Subscription,
 	payment: MolliePayment,
 ): Promise<Subscription | null> {
-	const createdAt = new Date(payment.createdAt);
-	const billedPlan = metadataOf(payment).plan;
-	const plan = await getPlanByName(
-		options,
-		typeof billedPlan === "string" ? billedPlan : initial.plan,
-	);
-	let interval = plan?.interval as string | undefined;
-	let nextPaymentDate: Date | null = null;
-	let isNewest = false;
 	const customerId = payment.customerId ?? initial.mollieCustomerId;
-	if (payment.subscriptionId && customerId) {
-		const gateway = gatewayFor(options);
-		try {
-			const [mollieSubscription, recent] = await Promise.all([
-				gateway.getSubscription(customerId, payment.subscriptionId),
-				gateway.listSubscriptionPayments(customerId, payment.subscriptionId, 5),
-			]);
-			interval = mollieSubscription.interval ?? interval;
-			if (mollieSubscription.nextPaymentDate) {
-				nextPaymentDate = fromMollieDate(mollieSubscription.nextPaymentDate);
-			}
-			isNewest = recent[0]?.id === payment.id;
-		} catch (error) {
-			ctx.context.logger.warn(
-				`[mollie] Could not load subscription ${payment.subscriptionId}: ${errorMessage(error)}`,
-			);
-		}
-	}
-	const chargedOn = startOfUTCDay(createdAt);
-	const paidUntil =
-		isNewest && nextPaymentDate && nextPaymentDate > createdAt
-			? nextPaymentDate
-			: interval
-				? ceilToUTCDate(addInterval(chargedOn, interval))
-				: null;
-	if (!paidUntil) return null;
+	if (!payment.subscriptionId || !customerId) return null;
+	const remote = await gatewayFor(options).getSubscription(customerId, payment.subscriptionId);
+	const cycle = billingCycle(
+		fromMollieDate(remote.startDate),
+		remote.interval,
+		new Date(payment.createdAt),
+	);
+	const billedPlan = metadataOf(payment).plan;
 
 	let subscription = initial;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const currentEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
-		if (currentEnd && paidUntil <= currentEnd) return null;
-		const periodStart = currentEnd && currentEnd <= createdAt ? currentEnd : chargedOn;
+		if (currentEnd && cycle.end <= currentEnd) return null;
 		// The first charge of a scheduled plan change, by the Mollie
 		// subscription that bills it: that plan is now active.
-		const fromCurrentRemote =
-			!!payment.subscriptionId && payment.subscriptionId === subscription.mollieSubscriptionId;
+		const fromCurrentRemote = payment.subscriptionId === subscription.mollieSubscriptionId;
 		const switchPlan =
 			fromCurrentRemote && !!subscription.pendingPlan && billedPlan === subscription.pendingPlan;
 		const guards: Where[] = currentEnd ? [{ field: "periodEnd", value: currentEnd }] : [];
@@ -497,8 +473,8 @@ async function applyRenewal(
 			["trialing", "active", "past_due", "unpaid"],
 			{
 				status: "active",
-				periodStart,
-				periodEnd: paidUntil,
+				periodStart: cycle.start,
+				periodEnd: cycle.end,
 				...(switchPlan ? { plan: subscription.pendingPlan as string, pendingPlan: null } : {}),
 			},
 			guards,
@@ -606,7 +582,7 @@ export async function createScheduledSubscription(
 		tax: TaxBreakdown | null;
 		scope: string;
 	},
-): Promise<string> {
+): Promise<{ id: string; replayed: boolean }> {
 	const { subscription, plan, mandateId, startAt, tax, scope } = input;
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId) throw new Error(`Subscription ${subscription.id} has no Mollie customer`);
@@ -644,7 +620,7 @@ export async function createScheduledSubscription(
 			await gateway.cancelSubscription(customerId, mollieId, `compensate:${mollieId}`);
 		},
 	});
-	return operation.mollieId;
+	return { id: operation.mollieId, replayed: operation.replayed };
 }
 
 function isEnded(subscription: { status?: string | null }): boolean {
@@ -727,6 +703,7 @@ export async function reconcileRemote(
 	options: MollieOptions,
 	subscription: Subscription,
 	now: Date = new Date(),
+	fence: Fence = async () => {},
 ): Promise<Subscription> {
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId || subscription.status === "incomplete") return subscription;
@@ -748,7 +725,10 @@ export async function reconcileRemote(
 		!subscription.cancelAtPeriodEnd &&
 		!!subscription.mollieMandateId;
 	if (!wantsRemote) {
-		if (isLive(actual)) await cancelMollieSubscription(ctx, options, subscription);
+		if (isLive(actual)) {
+			await fence();
+			await cancelMollieSubscription(ctx, options, subscription);
+		}
 		return subscription;
 	}
 
@@ -775,18 +755,30 @@ export async function reconcileRemote(
 		return subscription;
 	}
 
+	await fence();
 	if (isLive(actual)) await cancelMollieSubscription(ctx, options, subscription);
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	const startAt = periodEnd && periodEnd > now ? periodEnd : ceilToUTCDate(now);
 	const previous = subscription.mollieSubscriptionId ?? null;
-	const mollieSubscriptionId = await createScheduledSubscription(ctx, options, {
-		subscription,
-		plan,
-		mandateId: subscription.mollieMandateId as string,
-		startAt,
-		tax,
-		scope: `remote:${subscription.id}:${plan.name.toLowerCase()}:${toMollieDate(startAt)}:${subscription.mollieMandateId}:${amount}:${previous ?? "none"}`,
-	});
+	const baseScope = `remote:${subscription.id}:${plan.name.toLowerCase()}:${toMollieDate(startAt)}:${subscription.mollieMandateId}:${amount}:${previous ?? "none"}`;
+	let mollieSubscriptionId = "";
+	// A reused earlier creation may have been canceled since (e.g. swept as an
+	// orphan); then start a fresh attempt instead of adopting a dead one.
+	for (let attempt = 0, scope = baseScope; attempt < 3; attempt++) {
+		await fence();
+		const created = await createScheduledSubscription(ctx, options, {
+			subscription,
+			plan,
+			mandateId: subscription.mollieMandateId as string,
+			startAt,
+			tax,
+			scope,
+		});
+		mollieSubscriptionId = created.id;
+		if (!created.replayed || isLive(await gateway.getSubscription(customerId, created.id))) break;
+		scope = `${baseScope}:after:${created.id}`;
+	}
+	await fence();
 	const adopted = await guardedUpdate(
 		ctx,
 		subscription.id,
@@ -814,9 +806,9 @@ export async function ensureRemote(
 	return withLock(
 		ctx.context,
 		{ key: `lock:subscription:${subscriptionId}`, referenceId: initial.referenceId },
-		async () => {
+		async (fence) => {
 			const fresh = await reload(ctx, subscriptionId);
-			return fresh ? reconcileRemote(ctx, options, fresh, now) : null;
+			return fresh ? reconcileRemote(ctx, options, fresh, now, fence) : null;
 		},
 	);
 }
@@ -988,9 +980,8 @@ async function cancelOrphans(
 ): Promise<void> {
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId) return;
-	for (const remote of await gatewayFor(options).listCustomerSubscriptions(customerId)) {
+	for (const remote of await gatewayFor(options).listLiveCustomerSubscriptions(customerId)) {
 		if (remote.id === subscription.mollieSubscriptionId) continue;
-		if (!isLive(remote)) continue;
 		if (metadataOf(remote).subscriptionId !== subscription.id) continue;
 		if (now.getTime() - new Date(remote.createdAt).getTime() < ORPHAN_GRACE_MS) continue;
 		ctx.context.logger.warn(
