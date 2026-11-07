@@ -157,10 +157,7 @@ export function getWebhookUrl(
 export async function getPlans(options: MollieOptions): Promise<MolliePlan[]> {
 	const subscription = options.subscription;
 	if (!subscription?.enabled) return [];
-	if (typeof subscription.plans !== "function") return subscription.plans;
-	const plans = await subscription.plans();
-	validatePlans(plans);
-	return plans;
+	return typeof subscription.plans === "function" ? await subscription.plans() : subscription.plans;
 }
 
 export async function getPlanByName(

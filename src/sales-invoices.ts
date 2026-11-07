@@ -195,7 +195,12 @@ export async function catchUpSalesInvoices(
 			],
 			limit: 20,
 		});
-		if (done.some((op) => op.idempotencyKey.startsWith(prefix) && op.status === "succeeded")) {
+		const invoiced = done.find(
+			(op) => op.idempotencyKey.startsWith(prefix) && op.status === "succeeded",
+		);
+		if (invoiced) {
+			// Created, but marking the payment did not happen: repair it.
+			await markInvoice(ctx, record.molliePaymentId, "created", invoiced.mollieId);
 			continue;
 		}
 		const subscription = await adapter.findOne<Subscription>({

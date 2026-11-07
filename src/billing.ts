@@ -284,7 +284,8 @@ async function applyPayment(
 			subscription = result.subscription;
 			if (result.activated) {
 				activated = true;
-				const plan = await getPlanByName(options, subscription.plan);
+				// Applied already: a plans provider failing now must not lose the rest.
+				const plan = await getPlanByName(options, subscription.plan).catch(() => undefined);
 				events.push({ type: "subscription.activated", subscription, plan, payment });
 			}
 			record =
@@ -337,21 +338,29 @@ async function applyPayment(
 	// due: once per payment, also if an earlier delivery recorded the change
 	// and then stopped or was told to come back.
 	if (status === "paid" || isFailedPaymentStatus(status)) {
-		const delivered = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
-			model: "molliePayment",
-			where: [
-				{ field: "molliePaymentId", value: payment.id },
-				{ field: "hooksDue", value: true },
-				{ field: "status", value: status },
-				{ field: "claimSerial", value: claim },
-			],
-			increment: {},
-			set: { hooksDue: false },
-		});
-		if (delivered) {
+		const due = await findPaymentRecord(ctx, payment.id);
+		if (due?.hooksDue && due.status === status && due.claimSerial === claim) {
+			// Built before the hooks are cleared as due: if this fails (e.g. a
+			// `plans` provider is down), they stay due for the next delivery.
 			const latest = (await reload(ctx, subscription.id)) ?? subscription;
-			const data = await paymentHookData(options, payment, delivered, latest);
-			events.push({ type: status === "paid" ? "payment.paid" : "payment.failed", data });
+			const data = await paymentHookData(options, payment, { ...due, hooksDue: false }, latest);
+			const delivered = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+				model: "molliePayment",
+				where: [
+					{ field: "molliePaymentId", value: payment.id },
+					{ field: "hooksDue", value: true },
+					{ field: "status", value: status },
+					{ field: "claimSerial", value: claim },
+				],
+				increment: {},
+				set: { hooksDue: false },
+			});
+			if (delivered) {
+				events.push({
+					type: status === "paid" ? "payment.paid" : "payment.failed",
+					data: { ...data, record: delivered },
+				});
+			}
 		}
 	}
 	events.push(...duplicateEvents);
@@ -641,6 +650,14 @@ async function settleChargeback(
 		}
 	}
 	if (!record.chargebackDue) return { subscription, events: [] };
+	// Built before the hook is cleared as due, so a failure keeps it due.
+	subscription = (await reload(ctx, subscription.id)) ?? subscription;
+	const data = await paymentHookData(
+		options,
+		payment,
+		{ ...record, chargebackDue: false },
+		subscription,
+	);
 	const delivered = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 		model: "molliePayment",
 		where: [
@@ -652,7 +669,6 @@ async function settleChargeback(
 		set: { chargebackDue: false },
 	});
 	if (!delivered) return { subscription, events: [] };
-	subscription = (await reload(ctx, subscription.id)) ?? subscription;
 	const amount = delivered.amountChargedBack ?? "0.00";
 	return {
 		subscription,
@@ -660,7 +676,8 @@ async function settleChargeback(
 			{
 				type: "payment.chargeback",
 				data: {
-					...(await paymentHookData(options, payment, delivered, subscription)),
+					...data,
+					record: delivered,
 					chargeback: {
 						amount: { currency: payment.amount.currency, value: amount },
 						reversed: toCents(amount) === 0,

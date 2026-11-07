@@ -4,8 +4,8 @@
  * `willBeCharged`.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { willBeCharged } from "../../src";
-import { AUTH_URL, PLANS, settle, setup, subscribe } from "../helpers/setup";
+import { syncMollieSubscriptions, willBeCharged } from "../../src";
+import { AUTH_URL, PLANS, settle, setup, subscribe, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -105,6 +105,100 @@ describe("a plans function", () => {
 		});
 		await expect(env.checkout("broken")).rejects.toBeTruthy();
 		expect(env.fake.callsTo("payments.create")).toEqual([]);
+	});
+});
+
+describe("when the plans provider fails or is invalid", () => {
+	function flaky() {
+		let mode: "ok" | "down" | "invalid" = "ok";
+		return {
+			plans: async () => {
+				if (mode === "down") throw new Error("plans are down");
+				if (mode === "invalid") return PLANS.map((plan) => ({ ...plan, amount: "9.9" }));
+				return PLANS;
+			},
+			set: (to: typeof mode) => {
+				mode = to;
+			},
+		};
+	}
+
+	it("keeps a payment's hooks due until they can be built", async () => {
+		const provider = flaky();
+		const env = await setup({ subscription: { plans: provider.plans } });
+		const { payment } = await env.checkout("starter");
+		provider.set("down");
+		env.fake.completePayment(payment.id, "failed");
+		await env.webhook(`id=${payment.id}`);
+		await settle();
+		expect(env.hooks.onPaymentFailed).not.toHaveBeenCalled();
+
+		provider.set("ok");
+		await env.webhook(`id=${payment.id}`);
+		await settle();
+		expect(env.hooks.onPaymentFailed).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a chargeback's hook due until it can be built", async () => {
+		const provider = flaky();
+		const onChargeback = vi.fn(async (..._args: any[]) => {});
+		const env = await setup({ subscription: { plans: provider.plans, onChargeback } });
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${renewal.id}`);
+		env.fake.chargeBack(renewal.id);
+		provider.set("down");
+		await env.webhook(`id=${renewal.id}`);
+		await settle();
+		expect(onChargeback).not.toHaveBeenCalled();
+
+		provider.set("ok");
+		await env.webhook(`id=${renewal.id}`);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(1);
+	});
+
+	it("still processes payments with invalid plans, and refuses new checkouts", async () => {
+		const provider = flaky();
+		const env = await setup({ subscription: { plans: provider.plans } });
+		const subscription = await subscribe(env);
+		provider.set("invalid");
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(200);
+		const renewed = await env.subscription(subscription.id);
+		expect(new Date(renewed.periodEnd!).getTime()).toBeGreaterThan(
+			new Date(subscription.periodEnd!).getTime(),
+		);
+		await expect(
+			env.api.upgradeSubscription({
+				body: { plan: "business" },
+				headers: (await env.signInWithTestUser()).headers,
+			}),
+		).rejects.toBeTruthy();
+	});
+});
+
+describe("the invoice catch-up", () => {
+	it("repairs a payment whose invoice was created but not recorded", async () => {
+		const env = await setup({
+			subscription: { tax: { calculate: () => ({ rate: "21.00", country: "NL" }) } },
+			options: { salesInvoices: { enabled: true, getRecipient: recipient } },
+		});
+		await subscribe(env);
+		await settle();
+		const [invoice] = [...env.fake.salesInvoices.values()];
+		const [record] = await env.payments();
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: record!.molliePaymentId }],
+			update: { invoice: null, salesInvoiceId: null },
+		});
+		await syncMollieSubscriptions(env.auth as never);
+		const [repaired] = await env.payments();
+		expect(repaired).toMatchObject({ invoice: "created", salesInvoiceId: invoice!.id });
+		expect(env.fake.salesInvoices.size).toBe(1);
 	});
 });
 
