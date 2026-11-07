@@ -12,6 +12,28 @@ export const REPLAY_WINDOW_MS = 50 * 60 * 1000;
 
 const PAGE_SIZE = 100;
 
+/** Mollie rejects longer idempotency keys (verified against the API). */
+export const MOLLIE_MAX_KEY_LENGTH = 100;
+
+/**
+ * The key sent to Mollie (as `Idempotency-Key` and `metadata.operationKey`)
+ * for a journal key. Short keys are used as-is; longer ones keep a readable
+ * prefix and end in a SHA-256 hash of the full key, staying within Mollie's
+ * 100-character limit while remaining unique and deterministic.
+ */
+export async function mollieKey(idempotencyKey: string): Promise<string> {
+	if (idempotencyKey.length <= MOLLIE_MAX_KEY_LENGTH) return idempotencyKey;
+	const digest = await globalThis.crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(idempotencyKey),
+	);
+	const hash = btoa(String.fromCharCode(...new Uint8Array(digest)))
+		.replaceAll("+", "-")
+		.replaceAll("/", "_")
+		.replace(/=+$/, "");
+	return `${idempotencyKey.slice(0, MOLLIE_MAX_KEY_LENGTH - hash.length - 1)}~${hash}`;
+}
+
 export class OperationInProgressError extends Error {
 	readonly idempotencyKey: string;
 	constructor(idempotencyKey: string) {
@@ -56,15 +78,17 @@ export type RunOperationOptions<T> = {
 	 */
 	reuseSucceeded: boolean;
 	/**
-	 * Performs the Mollie call with `idempotencyKey`. A pending attempt is
-	 * re-sent with its key; if the parameters changed meanwhile, Mollie answers
-	 * 400 and the journal falls back to `recover`.
+	 * Performs the Mollie call with `idempotencyKey` (send it as the
+	 * Idempotency-Key and as `metadata.operationKey`). It is derived from the
+	 * journal key and at most 100 characters long. A pending attempt is re-sent
+	 * with its key; if the parameters changed meanwhile, Mollie answers 400
+	 * and the journal falls back to `recover`.
 	 */
 	execute: (idempotencyKey: string) => Promise<T>;
 	getId: (result: T) => string;
 	/**
 	 * Find the resource an attempt may have created, by the `operationKey`
-	 * stored in its Mollie metadata. Must search completely (all resources
+	 * (the same derived key `execute` received) stored in its Mollie metadata. Must search completely (all resources
 	 * created since `attempt.createdAt`, with some slack for clock skew) or
 	 * throw: `null` is taken as proof that nothing was created.
 	 */
@@ -208,7 +232,7 @@ async function runRound<T>(
 	for (const op of attempts) {
 		if (op.status !== "pending") continue;
 		const createdAt = new Date(op.createdAt);
-		const recovered = await options.recover(op.idempotencyKey, { createdAt });
+		const recovered = await options.recover(await mollieKey(op.idempotencyKey), { createdAt });
 		if (recovered) {
 			if (await resolveOperation(context, op.idempotencyKey, "succeeded", recovered)) {
 				context.logger.info(
@@ -268,9 +292,10 @@ async function executeAttempt<T>(
 	idempotencyKey: string,
 	attempt: { resend: boolean; createdAt: Date },
 ): Promise<OperationResult<T> | typeof RELOAD> {
+	const remoteKey = await mollieKey(idempotencyKey);
 	let result: T;
 	try {
-		result = await options.execute(idempotencyKey);
+		result = await options.execute(remoteKey);
 	} catch (error) {
 		if (isMollieConflict(error)) throw new OperationInProgressError(idempotencyKey);
 		if (isMollieBadRequest(error)) {
@@ -282,7 +307,7 @@ async function executeAttempt<T>(
 			// Mollie already holds a response for this key, but for other
 			// parameters. If that response created the resource, the lookup finds
 			// it; otherwise the earlier request failed and a new attempt is safe.
-			const recovered = await options.recover(idempotencyKey, { createdAt: attempt.createdAt });
+			const recovered = await options.recover(remoteKey, { createdAt: attempt.createdAt });
 			if (recovered) {
 				if (await resolveOperation(context, idempotencyKey, "succeeded", recovered)) {
 					return { mollieId: recovered, idempotencyKey, replayed: true };

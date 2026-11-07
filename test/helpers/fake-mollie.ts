@@ -199,6 +199,13 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		await takeHold(method, "arrival");
 		const { idempotencyKey: key, ...rest } = request as { idempotencyKey?: string };
 		const fingerprint = `${method}:${stableStringify(rest)}`;
+		if (key && key.length > 100) {
+			// Verified against the real API.
+			throw mollieError(
+				400,
+				`Invalid idempotency key '${key}'. Please provide a unique string of up to 100 characters.`,
+			);
+		}
 		if (key) {
 			const stored = idempotency.get(key);
 			if (stored) {

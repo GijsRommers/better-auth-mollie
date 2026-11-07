@@ -3,6 +3,8 @@ import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createGateway, type MollieGateway } from "../../src/gateway";
 import {
+	MOLLIE_MAX_KEY_LENGTH,
+	mollieKey,
 	OperationInProgressError,
 	OperationSupersededError,
 	REPLAY_WINDOW_MS,
@@ -491,5 +493,48 @@ describe("runOperation", () => {
 		});
 		expect(result).toMatchObject({ mollieId: "sub_current", replayed: true });
 		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("sends Mollie keys of at most 100 characters, and recovers with the same key", async () => {
+		const scope = `remote:${"a".repeat(32)}:business:2026-12-01:mdt_abcdefghij:49.00:sub_abcdefghij`;
+		fake.afterNextCreate("subscriptions.create", () => {
+			throw new TypeError("socket hang up");
+		});
+		const keys: string[] = [];
+		const operation = createSubscriptionOperation(fake, customerId, {
+			scope,
+			execute: (key) => {
+				keys.push(key);
+				return gateway.createSubscription(
+					customerId,
+					{
+						amount: { currency: "EUR", value: "49.00" },
+						interval: "1 month",
+						description: "Business",
+						metadata: { operationKey: key },
+					},
+					key,
+				);
+			},
+		});
+		await expect(runOperation(context, operation)).rejects.toThrow("socket hang up");
+		const recovered = await runOperation(context, operation);
+		expect(recovered.replayed).toBe(true);
+		expect(keys[0]!.length).toBeLessThanOrEqual(MOLLIE_MAX_KEY_LENGTH);
+		expect(fake.subscriptions.size).toBe(1);
+		// The journal keeps the readable key.
+		expect((await listOps(context))[0]?.idempotencyKey).toBe(`${scope}#1`);
+	});
+});
+
+describe("mollieKey", () => {
+	it("keeps short keys and hashes long ones deterministically", async () => {
+		expect(await mollieKey("customer:user:abc#1")).toBe("customer:user:abc#1");
+		const long = `x:${"y".repeat(150)}#1`;
+		const a = await mollieKey(long);
+		expect(a.length).toBeLessThanOrEqual(MOLLIE_MAX_KEY_LENGTH);
+		expect(a.startsWith("x:yyyy")).toBe(true);
+		expect(await mollieKey(long)).toBe(a);
+		expect(await mollieKey(`x:${"y".repeat(150)}#2`)).not.toBe(a);
 	});
 });
