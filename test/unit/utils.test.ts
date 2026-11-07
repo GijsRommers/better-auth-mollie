@@ -3,6 +3,7 @@ import {
 	addInterval,
 	ceilToUTCDate,
 	fromMollieDate,
+	isPubliclyReachable,
 	isRejectedMollieRequest,
 	isValidAmount,
 	parseInterval,
@@ -113,5 +114,35 @@ describe("isRejectedMollieRequest", () => {
 		expect(isRejectedMollieRequest(apiError(429))).toBe(false);
 		expect(isRejectedMollieRequest(apiError(503))).toBe(false);
 		expect(isRejectedMollieRequest(new TypeError("fetch failed"))).toBe(false);
+	});
+});
+
+describe("isPubliclyReachable", () => {
+	it("rejects hosts Mollie cannot call", () => {
+		for (const url of [
+			"http://localhost:5173/api/auth/mollie/webhook",
+			"http://app.localhost/x",
+			"http://127.0.0.1:3000/x",
+			"http://10.0.0.5/x",
+			"http://172.20.1.1/x",
+			"http://192.168.1.10/x",
+			"http://[::1]:3000/x",
+			"http://[fd00::1]/x",
+			"http://myhost.local/x",
+			"not a url",
+		]) {
+			expect(isPubliclyReachable(url), url).toBe(false);
+		}
+	});
+
+	it("accepts public hosts", () => {
+		for (const url of [
+			"https://example.com/api/auth/mollie/webhook",
+			"https://abc123.ngrok.app/x",
+			"http://172.32.0.1/x",
+			"https://fcbarcelona.com/x",
+		]) {
+			expect(isPubliclyReachable(url), url).toBe(true);
+		}
 	});
 });

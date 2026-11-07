@@ -10,7 +10,7 @@ describe("subscription.upgrade (new subscription)", () => {
 		expect(payment).toMatchObject({
 			sequenceType: "first",
 			amount: { currency: "EUR", value: "9.95" },
-			cancelUrl: "http://localhost:3000/pricing",
+			cancelUrl: "http://app.example.com/pricing",
 			webhookUrl: `${AUTH_URL}/mollie/webhook`,
 		});
 		expect(payment.redirectUrl).toMatch(
@@ -170,7 +170,7 @@ describe("first payment → activation", () => {
 			new Request(payment.redirectUrl!, { headers: env.headers }),
 		);
 		expect(response.status).toBe(302);
-		expect(response.headers.get("location")).toBe("http://localhost:3000/dashboard");
+		expect(response.headers.get("location")).toBe("http://app.example.com/dashboard");
 		const [subscription] = await env.subscriptions();
 		expect(subscription?.status).toBe("active");
 
@@ -314,5 +314,34 @@ describe("webhook endpoint", () => {
 		const { payment } = await env.checkout("starter");
 		env.fake.failNext("payments.get", new TypeError("fetch failed"));
 		expect((await env.webhook(`id=${payment.id}`)).status).toBe(500);
+	});
+});
+
+describe("local development", () => {
+	it("leaves out a webhook URL Mollie cannot reach, and still activates via the redirect", async () => {
+		const env = await setup({ auth: { baseURL: "http://localhost:5173" } });
+		const { payment } = await env.checkout("starter");
+		expect(payment.webhookUrl ?? null).toBeNull();
+		env.fake.completePayment(payment.id, "paid");
+		const [row] = await env.subscriptions();
+		const response = await env.auth.handler(
+			new Request(
+				`http://localhost:5173/api/auth/subscription/success?subscriptionId=${row!.id}&callbackURL=/dashboard`,
+				{ headers: env.headers },
+			),
+		);
+		expect(response.status).toBe(302);
+		expect((await env.subscription(row!.id)).status).toBe("active");
+		const [remote] = env.fake.activeSubscriptionsFor(payment.customerId!);
+		expect(remote?.webhookUrl ?? null).toBeNull();
+	});
+
+	it("uses an explicit webhookUrl as given", async () => {
+		const env = await setup({
+			auth: { baseURL: "http://localhost:5173" },
+			options: { webhookUrl: "https://abc123.ngrok.app/api/auth/mollie/webhook" },
+		});
+		const { payment } = await env.checkout("starter");
+		expect(payment.webhookUrl).toBe("https://abc123.ngrok.app/api/auth/mollie/webhook");
 	});
 });

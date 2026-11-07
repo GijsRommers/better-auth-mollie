@@ -147,7 +147,7 @@ describe("cancel and restore", () => {
 			body: { returnUrl: "/account" },
 			headers: env.headers,
 		});
-		expect(result).toEqual({ url: "http://localhost:3000/account", redirect: true });
+		expect(result).toEqual({ url: "http://app.example.com/account", redirect: true });
 		expect(env.fake.subscriptions.get(mollieSubscription.id)?.status).toBe("canceled");
 		expect(await env.subscription(subscription.id)).toMatchObject({
 			status: "active",

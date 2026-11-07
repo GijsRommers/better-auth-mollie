@@ -13,7 +13,7 @@ import type {
 } from "../../src/types";
 import { createFakeMollie, type FakeMollie } from "./fake-mollie";
 
-export const BASE_URL = "http://localhost:3000";
+export const BASE_URL = "http://app.example.com";
 export const AUTH_URL = `${BASE_URL}/api/auth`;
 
 export const PLANS: MolliePlan[] = [

@@ -105,8 +105,53 @@ export function getUrl(ctx: GenericEndpointContext, url: string): string {
 	return `${ctx.context.options.baseURL}${url.startsWith("/") ? url : `/${url}`}`;
 }
 
-export function getWebhookUrl(ctx: GenericEndpointContext, options: MollieOptions): string {
-	return options.webhookUrl ?? `${ctx.context.baseURL}/mollie/webhook`;
+/**
+ * Whether Mollie can call `url`: not a loopback, private-network or
+ * local-only host. Mollie rejects webhook URLs it cannot reach (422).
+ */
+export function isPubliclyReachable(url: string): boolean {
+	let host: string;
+	try {
+		host = new URL(url).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	} catch {
+		return false;
+	}
+	if (
+		host === "localhost" ||
+		/\.(localhost|local|internal|home\.arpa)$/.test(host) ||
+		/^(127|10|0)\./.test(host) ||
+		/^(192\.168|169\.254)\./.test(host) ||
+		/^172\.(1[6-9]|2\d|3[01])\./.test(host)
+	) {
+		return false;
+	}
+	// IPv6 loopback, unique-local and link-local addresses.
+	return !(host.includes(":") && (host === "::1" || /^(fc|fd|fe80)/.test(host)));
+}
+
+let warnedUnreachableWebhook = false;
+
+/**
+ * The webhook URL to give Mollie: `options.webhookUrl`, or
+ * `${baseURL}/mollie/webhook`. When the latter is not reachable from the
+ * internet (local development), it is left out, since Mollie would reject the
+ * request: the success redirect and `syncMollieSubscriptions` then keep
+ * subscriptions up to date.
+ */
+export function getWebhookUrl(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+): string | undefined {
+	if (options.webhookUrl) return options.webhookUrl;
+	const url = `${ctx.context.baseURL}/mollie/webhook`;
+	if (isPubliclyReachable(url)) return url;
+	if (!warnedUnreachableWebhook) {
+		warnedUnreachableWebhook = true;
+		ctx.context.logger.warn(
+			`[mollie] ${url} cannot be reached by Mollie, so no webhook URL is sent. Payments are still processed by the success redirect and syncMollieSubscriptions; set the webhookUrl option (e.g. a tunnel) to receive webhooks.`,
+		);
+	}
+	return undefined;
 }
 
 export async function getPlans(options: MollieOptions): Promise<MolliePlan[]> {
