@@ -2407,7 +2407,10 @@ async function refundStillDue(ctx: Ctx, molliePaymentId: string): Promise<string
 			op.idempotencyKey.startsWith(prefix) &&
 			Date.now() - new Date(op.createdAt).getTime() < REFUND_IN_FLIGHT_MS,
 	);
-	return inFlight ? null : `${molliePaymentId}: refund of a duplicate payment is still due`;
+	if (inFlight) return null;
+	const message = `${molliePaymentId}: refund of a duplicate payment is still due`;
+	ctx.context.logger.error(`[mollie] ${message}`);
+	return message;
 }
 
 export type SyncResult = {
