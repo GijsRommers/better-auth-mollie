@@ -181,7 +181,11 @@ export async function settlePreviousPayment(
 ): Promise<void> {
 	const previous = subscription.appliedPaymentId;
 	if (previous && previous !== payment.id) {
-		await setOutcome(ctx, previous, ["pending"], "applied");
+		// It paid for the period as it is now (also when the delivery that
+		// applied it stopped before recording that).
+		await setOutcome(ctx, previous, ["pending"], "applied", undefined, {
+			paidThrough: periodEndOf(subscription),
+		});
 	}
 }
 

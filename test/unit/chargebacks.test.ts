@@ -139,6 +139,105 @@ describe("chargebacks", () => {
 		expect(record?.amountChargedBack ?? null).toBeNull();
 	});
 
+	it("judges a charged-back earlier upgrade in the same period like a failed one", async () => {
+		const { env } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const upgrade = async (plan: string) => {
+			await env.api.upgradeSubscription({ body: { plan }, headers: env.headers });
+			const proration = [...env.fake.payments.values()].at(-1)!;
+			env.fake.completePayment(proration.id, "paid");
+			await env.webhook(`id=${proration.id}`);
+			return proration;
+		};
+		const first = await upgrade("pro");
+		await upgrade("business");
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+
+		env.fake.chargeBack(first.id);
+		await env.webhook(`id=${first.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+	});
+
+	it("knows what a payment paid for when the delivery that applied it stopped early", async () => {
+		const { env } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		// The activation was stored, but not the payment's outcome.
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: first!.id }],
+			update: { outcome: "pending", paidThrough: null },
+		});
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		const proration = [...env.fake.payments.values()].at(-1)!;
+		env.fake.completePayment(proration.id, "paid");
+		await env.webhook(`id=${proration.id}`);
+
+		env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		const chargedBack = await env.subscription(subscription.id);
+		expect(chargedBack.status).toBe("past_due");
+		expect(new Date(chargedBack.periodEnd!)).toEqual(new Date(subscription.periodStart!));
+	});
+
+	it("picks up a second partial chargeback of the same amount, from the sync", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const { payment } = await renew(env, subscription);
+		env.fake.chargeBack(payment.id, "4.00");
+		await env.webhook(`id=${payment.id}`);
+		travel(Date.now() + 20 * 24 * 3_600_000);
+		env.fake.chargeBack(payment.id, "4.00");
+
+		await syncMollieSubscriptions(env.auth as never);
+		const [record] = (await env.payments()).filter((r) => r.molliePaymentId === payment.id);
+		expect(record?.amountChargedBack).toBe("8.00");
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(2);
+		expect(onChargeback.mock.calls[1]![0]).toMatchObject({
+			chargeback: { amount: { value: "8.00" } },
+		});
+	});
+
+	it("picks up the reversal of an older chargeback, from the sync", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		await renew(env, subscription);
+		// An earlier period's payment: the subscription stays active, and the
+		// sync has no reason to look at its payments.
+		const chargeback = env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		travel(Date.now() + 20 * 24 * 3_600_000);
+		env.fake.reverseChargeback(chargeback.id);
+
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(2);
+		expect(onChargeback.mock.calls[1]![0]).toMatchObject({ chargeback: { reversed: true } });
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+	});
+
+	it("keeps the grace period of a failed renewal when the period before is charged back", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+		await env.webhook(`id=${failed.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+
+		env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "past_due",
+			periodEnd: subscription.periodEnd,
+		});
+		expect(await hasActiveSubscription(env.auth as never, subscription.referenceId)).toBe(true);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(1);
+	});
+
 	it("does not try to refund a duplicate that was charged back", async () => {
 		const onDuplicatePayment = vi.fn(async () => {});
 		const env = await setup({ subscription: { onDuplicatePayment } });

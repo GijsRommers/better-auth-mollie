@@ -607,12 +607,13 @@ async function settleChargeback(
 }
 
 /**
- * A new chargeback. When it took back the payment for the current period,
- * that period counts as unpaid, as if its charge had failed: `past_due`,
- * paid only up to the period's start, so the grace period counts from
- * there. A charged-back pro-rata charge is judged like a failed one. A
- * chargeback of an earlier period's payment, or of a trial's verification
- * payment, changes nothing (the hook reports it).
+ * A new chargeback. When it took back the payment for the period that is
+ * running, that period counts as unpaid, as if its charge had failed:
+ * `past_due`, paid only up to the period's start, so the grace period counts
+ * from there. A charged-back pro-rata charge is judged like a failed one
+ * (also one of an earlier upgrade in the same period). A chargeback of an
+ * earlier period's payment (also the last paid one, after a failed renewal),
+ * or of a trial's verification payment, changes nothing; the hook reports it.
  */
 async function chargeBackPeriod(
 	ctx: Ctx,
@@ -625,14 +626,12 @@ async function chargeBackPeriod(
 	if (record.outcome !== "applied") return null;
 	const purpose = paymentPurpose(payment);
 	if (purpose === "verification") return null;
-	if (purpose === "proration") {
-		if (subscription.appliedPaymentId !== payment.id) return null;
-		return applyFailedRenewal(ctx, options, subscription, payment, lock);
-	}
+	// Applied, so it paid for an upgrade; one of an earlier period is left alone there.
+	if (purpose === "proration") return applyFailedRenewal(ctx, options, subscription, payment, lock);
 	if (!BILLING_STATUSES.includes(subscription.status)) return null;
 	const periodEnd = periodEndOf(subscription);
 	const periodStart = subscription.periodStart ? new Date(subscription.periodStart) : null;
-	if (!periodEnd || !periodStart) return null;
+	if (!periodEnd || !periodStart || periodEnd.getTime() <= Date.now()) return null;
 	// Recorded when it applied; for older records, the payment applied last.
 	const paidCurrentPeriod = record.paidThrough
 		? new Date(record.paidThrough).getTime() === periodEnd.getTime()
@@ -1066,7 +1065,7 @@ async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
 		if (record.outcome === "pending" || record.outcome === "duplicate") return true;
 		// A chargeback (or its reversal) not processed yet.
 		const reported = payment.amountChargedBack ? toCents(payment.amountChargedBack.value) : 0;
-		return reported > 0 !== !!record.amountChargedBack;
+		return reported !== (record.amountChargedBack ? toCents(record.amountChargedBack) : 0);
 	}
 	return isFinalPaymentStatus(payment.status) && isUnhandled(record);
 }
