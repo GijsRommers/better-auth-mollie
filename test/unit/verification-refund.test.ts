@@ -54,6 +54,51 @@ describe("refundVerificationPayment", () => {
 		expect((await record(env, payment.id)).refundDue).toBe(false);
 	});
 
+	it("describes the refund with refundDescription", async () => {
+		const refundDescription = vi.fn(async ({ reason }: { reason: string }) =>
+			reason === "verification" ? "Terugbetaling van de verificatie" : "Terugbetaling",
+		);
+		const env = await setup({
+			subscription: { refundVerificationPayment: true, refundDescription },
+		});
+		const { payment, subscription } = await startTrial(env);
+		const [refund] = [...env.fake.refunds.values()];
+		expect(refund?.description).toBe("Terugbetaling van de verificatie");
+		expect(refundDescription.mock.calls[0]![0]).toMatchObject({
+			reason: "verification",
+			payment: { id: payment.id },
+			subscription: { id: subscription.id },
+		});
+	});
+
+	it("retries a refund whose refundDescription threw", async () => {
+		let failing = true;
+		const env = await setup({
+			subscription: {
+				refundVerificationPayment: true,
+				refundDescription: () => {
+					if (failing) throw new Error("translations are down");
+					return "Terugbetaling";
+				},
+			},
+		});
+		const { payment, subscription } = await startTrial(env);
+		expect(subscription.status).toBe("trialing");
+		expect(env.fake.refunds.size).toBe(0);
+		expect((await record(env, payment.id)).refundDue).toBe(true);
+
+		failing = false;
+		expect((await syncMollieSubscriptions(env.auth as never)).errors).toEqual([]);
+		expect([...env.fake.refunds.values()].map((r) => r.description)).toEqual(["Terugbetaling"]);
+	});
+
+	it("uses the English default without refundDescription", async () => {
+		const env = await setup({ subscription: { refundVerificationPayment: true } });
+		await startTrial(env);
+		const [refund] = [...env.fake.refunds.values()];
+		expect(refund?.description).toBe("Refund of the payment method verification");
+	});
+
 	it("does not refund by default", async () => {
 		const env = await setup();
 		await startTrial(env);

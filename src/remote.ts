@@ -14,7 +14,13 @@ import {
 } from "./rows";
 import { mapMollieSubscriptionStatus } from "./status";
 import { chargeAmount, fromCents, taxMetadata, toCents } from "./tax";
-import type { MollieOptions, MolliePlan, Subscription, TaxBreakdown } from "./types";
+import type {
+	MollieOptions,
+	MolliePlan,
+	RefundDescriptionData,
+	Subscription,
+	TaxBreakdown,
+} from "./types";
 import {
 	getWebhookUrl,
 	isMollieApiError,
@@ -143,17 +149,27 @@ export async function cancelMollieSubscription(
 	});
 }
 
+const REFUND_DESCRIPTIONS: Record<RefundDescriptionData["reason"], string> = {
+	duplicate: "Refund of a subscription payment that could not be applied",
+	verification: "Refund of the payment method verification",
+};
+
 /**
- * Refunds a payment in full, through the journal (at most once per payment).
+ * Refunds what is left of a payment, through the journal (at most once per
+ * payment).
  */
 export async function refundPayment(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
 	payment: MolliePayment,
-	description = "Refund of a subscription payment that could not be applied",
+	reason: RefundDescriptionData["reason"] = "duplicate",
 ): Promise<void> {
 	const gateway = gatewayFor(options);
+	const custom = options.subscription?.enabled ? options.subscription.refundDescription : undefined;
+	const description = custom
+		? await custom({ reason, payment, subscription })
+		: REFUND_DESCRIPTIONS[reason];
 	await runOperation(ctx.context, {
 		kind: "create_refund",
 		referenceId: subscription.referenceId,

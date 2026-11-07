@@ -297,6 +297,29 @@ describe("interrupted and racing billing flows", () => {
 		expect((await env.subscriptions())[0]).toMatchObject({ status: "active", plan: "starter" });
 	});
 
+	it("describes a duplicate's refund with refundDescription", async () => {
+		const refundDescription = vi.fn(
+			({ reason }: { reason: string }) => `Terugbetaling (${reason})`,
+		);
+		const env = await setup({ subscription: { refundDescription } });
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		await env.webhook(`id=${second.payment.id}`);
+		expect([...env.fake.refunds.values()]).toEqual([
+			expect.objectContaining({
+				paymentId: second.payment.id,
+				description: "Terugbetaling (duplicate)",
+			}),
+		]);
+		expect(refundDescription.mock.calls[0]![0]).toMatchObject({
+			reason: "duplicate",
+			payment: { id: second.payment.id },
+		});
+	});
+
 	it("finishes a plan change whose Mollie response was lost, without a second subscription", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env, "business");

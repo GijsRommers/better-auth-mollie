@@ -277,6 +277,19 @@ export type PaymentHookData = {
 	tax: TaxBreakdown | null;
 };
 
+/**
+ * What `refundDescription` receives. `reason`: `duplicate` for a payment
+ * that paid for something already paid (or a pro-rata charge of an upgrade
+ * that did not go through), `verification` for a trial's verification
+ * payment (`refundVerificationPayment`).
+ */
+export type RefundDescriptionData = {
+	reason: "duplicate" | "verification";
+	/** The payment that is refunded, as fetched from the Mollie API. */
+	payment: MolliePayment;
+	subscription: Subscription;
+};
+
 /** What `onChargeback` receives. */
 export type ChargebackHookData = PaymentHookData & {
 	chargeback: {
@@ -484,6 +497,13 @@ export type SubscriptionOptions = {
 	 * @default false
 	 */
 	refundVerificationPayment?: boolean | undefined;
+	/**
+	 * The description of a refund the plugin makes, e.g. in the customer's
+	 * language: Mollie can show it to the customer, for example on a bank
+	 * statement. Defaults to an English text. A function that throws leaves
+	 * the refund to be retried.
+	 */
+	refundDescription?: ((data: RefundDescriptionData) => string | Promise<string>) | undefined;
 	/**
 	 * Runs once when a payment turns out to pay for something already paid,
 	 * after it was refunded (unless `refundDuplicatePayments` is false).

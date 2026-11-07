@@ -158,7 +158,14 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const salesInvoices = new Map<string, FakeSalesInvoice>();
 	const refunds = new Map<
 		string,
-		{ id: string; paymentId: string; amount: Amount; metadata: unknown; createdAt: string }
+		{
+			id: string;
+			paymentId: string;
+			amount: Amount;
+			description: string;
+			metadata: unknown;
+			createdAt: string;
+		}
 	>();
 	const chargebacks = new Map<string, FakeChargeback>();
 	/** Whether `amountChargedBack` still counts reversed chargebacks (Mollie does not say). */
@@ -515,6 +522,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 						id: id("re"),
 						paymentId: request.paymentId,
 						amount: { ...request.refundRequest.amount },
+						description: request.refundRequest.description ?? "",
 						metadata: request.refundRequest.metadata ?? null,
 						createdAt: iso(),
 					};

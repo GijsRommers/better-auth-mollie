@@ -581,13 +581,7 @@ async function refundVerification(
 	if (!record?.refundDue) return;
 	try {
 		if (toCents(refundableAmount(payment)) > 0) {
-			await refundPayment(
-				ctx,
-				options,
-				subscription,
-				payment,
-				"Refund of the payment method verification",
-			);
+			await refundPayment(ctx, options, subscription, payment, "verification");
 		}
 		await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 			model: "molliePayment",
