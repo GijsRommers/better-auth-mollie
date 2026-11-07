@@ -60,6 +60,28 @@ export const subscriptionSchema = {
 				required: false,
 				defaultValue: false,
 			},
+			customerType: {
+				type: "string",
+				required: false,
+				input: false,
+			},
+			appliedPaymentId: {
+				type: "string",
+				required: false,
+				input: false,
+			},
+			mollieSyncNeeded: {
+				type: "boolean",
+				required: false,
+				defaultValue: false,
+				input: false,
+			},
+			mollieSyncRevision: {
+				type: "number",
+				required: false,
+				defaultValue: 0,
+				input: false,
+			},
 			createdAt: {
 				type: "date",
 				required: true,
@@ -120,6 +142,12 @@ export const molliePaymentSchema = {
 			failedAt: {
 				type: "date",
 				required: false,
+			},
+			outcome: {
+				type: "string",
+				required: true,
+				defaultValue: "pending",
+				input: false,
 			},
 		},
 	},

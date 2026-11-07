@@ -119,9 +119,30 @@ export interface Subscription {
 	 * `periodEnd`. `subscription.restore` undoes this before `periodEnd`.
 	 */
 	cancelAtPeriodEnd?: boolean | null | undefined;
+	/** Who is billed, as chosen when the subscription was started. */
+	customerType?: CustomerType | null | undefined;
+	/** The payment that last activated, recovered or renewed this subscription. */
+	appliedPaymentId?: string | null | undefined;
+	/**
+	 * A change that Mollie still has to follow (new plan, mandate, cancellation,
+	 * …). Cleared once Mollie matches; the sync retries rows that keep it.
+	 */
+	mollieSyncNeeded?: boolean | null | undefined;
+	/** Incremented with every change that sets `mollieSyncNeeded`. */
+	mollieSyncRevision?: number | null | undefined;
 	createdAt: Date;
 	updatedAt: Date;
 }
+
+/**
+ * What a paid payment did for its subscription:
+ * - `pending`: not decided yet (or the payment is not paid);
+ * - `applied`: it paid for the subscription;
+ * - `duplicate`: it paid for something already paid; a refund is due;
+ * - `refunded`: such a duplicate, refunded;
+ * - `kept`: such a duplicate, kept (`refundDuplicatePayments: false`).
+ */
+export type PaymentOutcome = "pending" | "applied" | "duplicate" | "refunded" | "kept";
 
 export interface MolliePaymentRecord {
 	id: string;
@@ -134,6 +155,7 @@ export interface MolliePaymentRecord {
 	sequenceType: "oneoff" | "first" | "recurring";
 	paidAt?: Date | null | undefined;
 	failedAt?: Date | null | undefined;
+	outcome: PaymentOutcome;
 }
 
 export type MollieOperationStatus = "pending" | "succeeded" | "failed";

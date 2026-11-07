@@ -4,7 +4,6 @@ import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
 	applyTimeTransitions,
-	cancelMollieSubscription,
 	findSubscription,
 	guardedUpdate,
 	hasPaymentInProgress,
@@ -12,7 +11,7 @@ import {
 	processPayment,
 	reconcileRemote,
 	recordPayment,
-	refundPayment,
+	refundUnappliedPayment,
 } from "../billing";
 import { getOrCreateCustomer } from "../customer";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
@@ -313,6 +312,7 @@ async function changePlan(
 			ACCESS_STATUSES,
 			{ pendingPlan: planName, cancelAtPeriodEnd: false },
 			sameRemote(current),
+			{ mollieSync: true },
 		);
 		if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 		return applyToMollie(ctx, options, updated, fence);
@@ -325,7 +325,7 @@ async function changePlan(
 			? await chargeProration(ctx, options, current, plan, customerType, cents, fence)
 			: null;
 	await fence().catch(async (error: unknown) => {
-		if (proration) await refundPayment(ctx, options, current, proration);
+		if (proration) await refundUnappliedPayment(ctx, options, current, proration);
 		throw error;
 	});
 	const updated = await guardedUpdate(
@@ -334,13 +334,14 @@ async function changePlan(
 		ACCESS_STATUSES,
 		{ plan: planName, pendingPlan: null, cancelAtPeriodEnd: false },
 		sameRemote(current),
+		{ mollieSync: true },
 	);
 	if (proration) {
 		const result = await processPayment(ctx, options, proration);
 		dispatchEvents(ctx, options, result.events);
 	}
 	if (!updated) {
-		if (proration) await refundPayment(ctx, options, current, proration);
+		if (proration) await refundUnappliedPayment(ctx, options, current, proration);
 		throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 	}
 	return applyToMollie(ctx, options, updated, fence);
@@ -360,6 +361,7 @@ async function cancelPendingChange(
 		ACCESS_STATUSES,
 		{ pendingPlan: null, cancelAtPeriodEnd: false },
 		sameRemote(current),
+		{ mollieSync: true },
 	);
 	if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 	return applyToMollie(ctx, options, updated, fence);
@@ -396,6 +398,7 @@ async function restore(
 		ACCESS_STATUSES,
 		{ cancelAtPeriodEnd: false, pendingPlan: null },
 		[{ field: "cancelAtPeriodEnd", value: true }, ...sameRemote(subscription)],
+		{ mollieSync: true },
 	);
 	if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 	return applyToMollie(ctx, options, updated, fence);
@@ -515,6 +518,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							plan: planName,
 							status: "incomplete",
 							mollieCustomerId: input.customerId,
+							customerType,
 							cancelAtPeriodEnd: false,
 							createdAt: new Date(),
 							updatedAt: new Date(),
@@ -574,12 +578,21 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					? target
 					: subscriptions.find((s) => s.status === "incomplete");
 			if (row) {
-				if (row.plan !== planName || row.mollieCustomerId !== customerId) {
+				if (
+					row.plan !== planName ||
+					row.mollieCustomerId !== customerId ||
+					row.customerType !== customerType
+				) {
 					row =
 						(await adapter.update<Subscription>({
 							model: "subscription",
 							where: [{ field: "id", value: row.id }],
-							update: { plan: planName, mollieCustomerId: customerId, updatedAt: new Date() },
+							update: {
+								plan: planName,
+								mollieCustomerId: customerId,
+								customerType,
+								updatedAt: new Date(),
+							},
 						})) ?? row;
 				}
 			} else {
@@ -590,6 +603,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						plan: planName,
 						status: "incomplete",
 						mollieCustomerId: customerId,
+						customerType,
 						cancelAtPeriodEnd: false,
 						createdAt: new Date(),
 						updatedAt: new Date(),
@@ -757,22 +771,20 @@ export const cancelSubscription = (options: MollieOptions) =>
 			if (!subscription.cancelAtPeriodEnd) {
 				await lockSubscription(ctx, subscription, async (fresh, fence) => {
 					if (fresh.cancelAtPeriodEnd || !BILLING_STATUSES.includes(fresh.status)) return;
+					// The cancellation is recorded first, so it can never be lost: if
+					// stopping the Mollie subscription fails or is interrupted, the
+					// next webhook or sync finishes it.
 					await fence();
-					try {
-						await cancelMollieSubscription(ctx, options, fresh);
-					} catch (error) {
-						throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
-					}
-					await fence();
-					await guardedUpdate(
+					const updated = await guardedUpdate(
 						ctx,
 						fresh.id,
 						BILLING_STATUSES,
 						{ cancelAtPeriodEnd: true, pendingPlan: null },
-						fresh.mollieSubscriptionId
-							? [{ field: "mollieSubscriptionId", value: fresh.mollieSubscriptionId }]
-							: [],
+						sameRemote(fresh),
+						{ mollieSync: true },
 					);
+					if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+					await applyToMollie(ctx, options, updated, fence);
 				});
 			}
 			return ctx.json({

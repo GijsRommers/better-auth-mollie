@@ -7,6 +7,7 @@ import type {
 	MollieOptions,
 	MolliePaymentRecord,
 	PaymentHookData,
+	PaymentOutcome,
 	Subscription,
 } from "./types";
 import { addDays, errorMessage, mergeMetadata } from "./utils";
@@ -47,6 +48,8 @@ export function defaultInvoiceRequest(
 	};
 }
 
+const INVOICED_OUTCOMES: readonly PaymentOutcome[] = ["applied", "kept"];
+
 /**
  * Creates a Mollie sales invoice with status `paid` for a paid payment.
  * Journaled per payment (`sales-invoice:<paymentId>`), so a payment is
@@ -60,6 +63,9 @@ export async function createSalesInvoice(
 	const config = options.salesInvoices;
 	if (!config?.enabled) return null;
 	if (data.isVerification && !config.invoiceVerificationPayments) return null;
+	// Only payments that paid for something: not one still being decided, and
+	// not a duplicate that is (being) refunded.
+	if (!INVOICED_OUTCOMES.includes(data.record.outcome)) return null;
 	const recipient = await config.getRecipient(data, ctx);
 	if (!recipient) return null;
 
@@ -124,6 +130,7 @@ export async function catchUpSalesInvoices(
 			model: "molliePayment",
 			where: [
 				{ field: "status", value: "paid" },
+				{ field: "outcome", operator: "in", value: [...INVOICED_OUTCOMES] },
 				{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
 			],
 			sortBy: { field: "molliePaymentId", direction: "asc" },
