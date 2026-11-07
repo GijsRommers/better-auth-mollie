@@ -88,6 +88,20 @@ The plugin adds three tables (`subscription`, `molliePayment`, `mollieOperation`
 npx @better-auth/cli generate   # or: npx @better-auth/cli migrate
 ```
 
+**Indexes.** Every run of the sync looks for payments that still need work. Better Auth's schema cannot declare these, so on a large `molliePayment` table add them yourself. For PostgreSQL (partial indexes stay small, since few rows match):
+
+```sql
+CREATE INDEX mollie_payment_unsettled_idx ON "molliePayment" ("status", "outcome");
+CREATE INDEX mollie_payment_hooks_due_idx ON "molliePayment" ("molliePaymentId") WHERE "hooksDue";
+CREATE INDEX mollie_payment_refund_due_idx ON "molliePayment" ("molliePaymentId") WHERE "refundDue";
+CREATE INDEX mollie_payment_chargeback_due_idx ON "molliePayment" ("molliePaymentId") WHERE "chargebackDue";
+CREATE INDEX mollie_payment_charged_back_idx ON "molliePayment" ("molliePaymentId") WHERE "amountChargedBack" IS NOT NULL;
+-- With sales invoices:
+CREATE INDEX mollie_payment_uninvoiced_idx ON "molliePayment" ("paidAt") WHERE "invoice" IS NULL;
+```
+
+Use your table and column names (e.g. `mollie_payment` and `hooks_due` with snake_case naming).
+
 ### Webhooks and the cron
 
 Mollie calls `${baseURL}/mollie/webhook` (for example `https://example.com/api/auth/mollie/webhook`). The plugin sends this URL with every payment and subscription, so there is nothing to configure in the Mollie dashboard. On `localhost`, see [local development](#webhooks). Then schedule the [sync](#the-sync-cron), for example hourly:
@@ -396,6 +410,8 @@ mollie({
 
 Invoice lines use the VAT that was actually charged, including reverse charge. Each payment is invoiced at most once, and invoices that failed are retried by the sync for 30 days. Duplicates that were refunded are not invoiced. When `getRecipient` returns `null`, that payment is never invoiced; throw instead to have the sync try again later.
 
+The plugin does not issue credit notes. A payment that is charged back (or refunded by hand) keeps its paid invoice; credit it in your accounting if you need to. `onChargeback` receives the payment's `record.salesInvoiceId`.
+
 ## Hooks
 
 ```ts
@@ -440,7 +456,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `createdAt` (when Mollie created it), `purpose` (see [Hooks](#hooks)), `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced) and `salesInvoiceId`, `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue`, `chargebackCheckedAt` and `refundDue`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `createdAt` (when Mollie created it), `purpose` (see [Hooks](#hooks); once set, it decides how the payment is handled, over its Mollie metadata, so payments imported from earlier billing can carry it), `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced) and `salesInvoiceId`, `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue`, `chargebackCheckedAt` and `refundDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 
@@ -471,6 +487,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `subscription.tax`                                                      |                             | See [VAT](#vat)                                                                                                                                                      |
 | `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                                                                                                                      |
 | `subscription.refundVerificationPayment`                                | `false`                     | Refund a trial's verification payment once the mandate exists                                                                                                        |
+| `subscription.refundDescription`                                        | English text                | `({ reason, payment, subscription }) => string`: the description of a refund, e.g. translated                                                                        |
 | `subscription.getTrialEnd`                                              |                             | When a new subscription's trial ends, decided by your app (see [Subscribe](#subscribe))                                                                              |
 | `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                                                                                                                  |
 | `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                                                            |
