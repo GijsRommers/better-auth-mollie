@@ -159,6 +159,16 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		}
 	}
 
+	/** Waits until Mollie reports a final status for the payment. */
+	async function settled(paymentId: string) {
+		for (let attempt = 0; attempt < 30; attempt++) {
+			const { status } = await env.real.payments.get({ paymentId });
+			if (status !== "open" && status !== "pending" && status !== "authorized") return;
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
+		throw new Error(`Payment ${paymentId} did not reach a final status`);
+	}
+
 	/** Starts a checkout for a new user and completes it with `state`. */
 	async function subscribe(state: "paid" | "failed") {
 		const { headers, userId } = await env.newUser();
@@ -170,6 +180,8 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		await completeCheckout(url, state);
 		const pending = await env.subscriptionOf(userId);
 		const record = await env.firstPaymentOf(pending.id);
+		// Mollie calls the webhook once the status changed; wait for that too.
+		await settled(record.molliePaymentId);
 		const response = await env.webhook(record.molliePaymentId);
 		expect(response.status).toBe(200);
 		const subscription = await env.subscriptionOf(userId);
