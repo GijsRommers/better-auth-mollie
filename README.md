@@ -271,6 +271,8 @@ await authClient.subscription.upgrade({ plan: "pro", successUrl: "/dashboard" })
 
 This starts a checkout for the full price with a new mandate. Once it is paid, the subscription is `active` again with a fresh period, and Mollie bills the new mandate from then on. The plugin refuses (`PAYMENT_IN_PROGRESS`) while Mollie is still collecting a charge. If a charge pays for a period that was already paid, it is refunded and `onDuplicatePayment` runs.
 
+**Chargebacks.** A customer can take a payment back: a disputed card payment, or a reversed SEPA Direct Debit (consumers can reverse any debit within 8 weeks). When that payment paid for the current period, the period counts as unpaid, as if its charge had failed: the subscription becomes `past_due`, `periodEnd` moves back to the start of that period, and the grace period counts from there. The next successful charge or a recovery checkout makes it `active` again. A chargeback of an earlier period's payment, or of a trial's verification payment, changes nothing. In each case `onChargeback` runs, also when a chargeback is reversed (`chargeback.reversed`). A reversal does not restore the subscription: the customer pays again through `upgrade`, and you can refund them yourself. Mollie calls the payment's webhook for chargebacks; the sync also lists the profile's chargebacks of the last 14 days, in case one never arrived.
+
 If Mollie itself cancels a subscription, for example after repeated SEPA failures:
 
 - an `active` or `trialing` subscription ends at `periodEnd`;
@@ -374,6 +376,7 @@ subscription: {
 	onPaymentPaid: async (data) => {},       // every paid payment
 	onPaymentFailed: async (data) => {},     // failed or expired
 	onDuplicatePayment: async (data) => {},  // `data.refunded` tells whether it was refunded
+	onChargeback: async (data) => {},        // `data.chargeback`: { amount, reversed }
 	onSubscriptionCanceled: async ({ subscription, plan, reason }) => {},
 },
 onCustomerCreate: async ({ mollieCustomer, user }) => {},
@@ -409,7 +412,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), and internally `claimSerial` and `hooksDue`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue` and `chargebackDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 

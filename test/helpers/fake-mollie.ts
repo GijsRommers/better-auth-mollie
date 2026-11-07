@@ -37,7 +37,18 @@ export type FakePayment = {
 	failedAt?: string | null | undefined;
 	expiredAt?: string | null | undefined;
 	canceledAt?: string | null | undefined;
+	/** Charged back and not reversed (absent when nothing is). */
+	amountChargedBack?: Amount | undefined;
 	links: { self: Link; dashboard: Link; checkout?: Link; changePaymentState?: Link | null };
+};
+
+export type FakeChargeback = {
+	resource: "chargeback";
+	id: string;
+	amount: Amount;
+	paymentId: string;
+	createdAt: string;
+	reversedAt?: string | null | undefined;
 };
 
 export type FakeSubscription = {
@@ -147,6 +158,21 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		string,
 		{ id: string; paymentId: string; amount: Amount; metadata: unknown; createdAt: string }
 	>();
+	const chargebacks = new Map<string, FakeChargeback>();
+	/** What Mollie reports on the payment: charged back and not reversed. */
+	const updateChargedBack = (paymentId: string) => {
+		const payment = payments.get(paymentId);
+		if (!payment) return;
+		const cents = [...chargebacks.values()]
+			.filter((c) => c.paymentId === paymentId && !c.reversedAt)
+			.reduce((sum, c) => sum + Math.round(Number(c.amount.value) * 100), 0);
+		if (cents > 0) {
+			payment.amountChargedBack = {
+				currency: payment.amount.currency,
+				value: (cents / 100).toFixed(2),
+			};
+		} else delete payment.amountChargedBack;
+	};
 	/** Mollie's stored responses per idempotency key (kept for one hour in reality). */
 	const idempotency = new Map<string, { fingerprint: string; value?: unknown; error?: unknown }>();
 	const inFlight = new Set<string>();
@@ -427,6 +453,27 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				);
 			},
 		},
+		chargebacks: {
+			async list(request: { paymentId: string; limit?: number }) {
+				record("chargebacks.list", [request]);
+				return paginate(
+					"chargebacks",
+					[...chargebacks.values()]
+						.filter((c) => c.paymentId === request.paymentId)
+						.reverse()
+						.map(clone),
+					request.limit,
+				);
+			},
+			async all(request: { limit?: number } = {}) {
+				record("chargebacks.all", [request]);
+				return paginate(
+					"chargebacks",
+					[...chargebacks.values()].reverse().map(clone),
+					request.limit,
+				);
+			},
+		},
 		refunds: {
 			create: (request: any) =>
 				idempotent("refunds.create", request, () => {
@@ -563,6 +610,28 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			if (status === "expired") payment.expiredAt = iso();
 			if (status === "canceled") payment.canceledAt = iso();
 			return clone(payment);
+		},
+		/** A chargeback of (part of) a paid payment, as a bank or card scheme reports it. */
+		chargeBack(paymentId: string, value?: string) {
+			const payment = payments.get(paymentId);
+			if (payment?.status !== "paid") throw new Error(`Payment ${paymentId} is not paid`);
+			const chargeback: FakeChargeback = {
+				resource: "chargeback",
+				id: id("chb"),
+				amount: { currency: payment.amount.currency, value: value ?? payment.amount.value },
+				paymentId,
+				createdAt: iso(),
+				reversedAt: null,
+			};
+			chargebacks.set(chargeback.id, chargeback);
+			updateChargedBack(paymentId);
+			return clone(chargeback);
+		},
+		reverseChargeback(chargebackId: string) {
+			const chargeback = chargebacks.get(chargebackId);
+			if (!chargeback) throw new Error(`Unknown chargeback ${chargebackId}`);
+			chargeback.reversedAt = iso();
+			updateChargedBack(chargeback.paymentId);
 		},
 		/**
 		 * Simulates Mollie's scheduler charging a subscription: creates a

@@ -170,6 +170,15 @@ export interface MolliePaymentRecord {
 	/** Internal: its `payment.paid` / `payment.failed` hooks are still to be dispatched. */
 	hooksDue?: boolean | null | undefined;
 	/**
+	 * The end of the period this payment paid for, set when it applied (an
+	 * activation, recovery or renewal; not a pro-rata charge).
+	 */
+	paidThrough?: Date | null | undefined;
+	/** The amount charged back and not reversed, as last processed (`null`: none). */
+	amountChargedBack?: string | null | undefined;
+	/** Internal: its `onChargeback` hook is still to be dispatched. */
+	chargebackDue?: boolean | null | undefined;
+	/**
 	 * Its Mollie sales invoice: `created`, or `skipped` (not to be invoiced:
 	 * a verification payment, a duplicate, or `getRecipient` returned `null`).
 	 */
@@ -246,6 +255,16 @@ export type PaymentHookData = {
 	 * (`null` otherwise, and for verification payments).
 	 */
 	tax: TaxBreakdown | null;
+};
+
+/** What `onChargeback` receives. */
+export type ChargebackHookData = PaymentHookData & {
+	chargeback: {
+		/** Charged back and not reversed, now (`"0.00"` after a reversal). */
+		amount: { currency: string; value: string };
+		/** Whether this change is a reversal: nothing is charged back anymore. */
+		reversed: boolean;
+	};
 };
 
 /**
@@ -419,6 +438,20 @@ export type SubscriptionOptions = {
 				data: PaymentHookData & { refunded: boolean },
 				ctx: GenericEndpointContext,
 		  ) => Promise<void>)
+		| undefined;
+	/**
+	 * Runs once each time the amount charged back on a payment changes: a
+	 * chargeback (a disputed card payment, or a reversed SEPA Direct Debit),
+	 * or its reversal (`reversed: true`, nothing left charged back).
+	 *
+	 * A chargeback of the payment that paid for the current period makes the
+	 * subscription `past_due`, as if that charge had failed: it is paid only
+	 * up to the start of that period, and the grace period counts from there.
+	 * A reversal does not restore it; the customer can pay again through
+	 * `upgrade`.
+	 */
+	onChargeback?:
+		| ((data: ChargebackHookData, ctx: GenericEndpointContext) => Promise<void>)
 		| undefined;
 	/**
 	 * Runs once when a subscription becomes `canceled`: at the end of the

@@ -1,7 +1,13 @@
 import type { GenericEndpointContext } from "better-auth";
 import type { MolliePayment } from "./gateway";
 import { createSalesInvoice } from "./sales-invoices";
-import type { MollieOptions, MolliePlan, PaymentHookData, Subscription } from "./types";
+import type {
+	ChargebackHookData,
+	MollieOptions,
+	MolliePlan,
+	PaymentHookData,
+	Subscription,
+} from "./types";
 import { errorMessage } from "./utils";
 
 export type BillingEvent =
@@ -14,6 +20,7 @@ export type BillingEvent =
 	| { type: "payment.paid"; data: PaymentHookData }
 	| { type: "payment.failed"; data: PaymentHookData }
 	| { type: "payment.duplicate"; data: PaymentHookData; refunded: boolean }
+	| { type: "payment.chargeback"; data: ChargebackHookData }
 	| {
 			type: "subscription.canceled";
 			subscription: Subscription;
@@ -70,6 +77,11 @@ function tasksFor(
 				"onDuplicatePayment",
 				fn && (() => fn({ ...event.data, refunded: event.refunded }, ctx)),
 			);
+			break;
+		}
+		case "payment.chargeback": {
+			const fn = hooks?.onChargeback;
+			hook("onChargeback", fn && (() => fn(event.data, ctx)));
 			break;
 		}
 		case "subscription.canceled": {

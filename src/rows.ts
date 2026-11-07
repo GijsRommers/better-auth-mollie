@@ -127,6 +127,7 @@ export async function setOutcome(
 	from: readonly PaymentOutcome[],
 	to: PaymentOutcome,
 	claim?: number,
+	extra: Partial<Pick<MolliePaymentRecord, "paidThrough">> = {},
 ): Promise<MolliePaymentRecord | null> {
 	return ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 		model: "molliePayment",
@@ -137,7 +138,7 @@ export async function setOutcome(
 			...(claim === undefined ? [] : [{ field: "claimSerial", value: claim }]),
 		],
 		increment: {},
-		set: { outcome: to },
+		set: { ...extra, outcome: to },
 	});
 }
 

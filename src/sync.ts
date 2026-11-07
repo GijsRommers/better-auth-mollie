@@ -32,6 +32,7 @@ import {
 } from "./rows";
 import { catchUpSalesInvoices } from "./sales-invoices";
 import { BILLING_STATUSES, SYNCABLE_STATUSES } from "./status";
+import { toCents } from "./tax";
 import type { MollieOptions, MolliePaymentRecord, Subscription } from "./types";
 import { addDays, DAY_MS, errorMessage, getPlanByName } from "./utils";
 
@@ -206,6 +207,7 @@ async function outstandingPayments(
 		],
 		// Hooks still due (the delivery that recorded the change stopped).
 		[...scope, { field: "hooksDue", value: true }],
+		[...scope, { field: "chargebackDue", value: true }],
 		// Not paid, consequence not applied yet (e.g. a failed renewal recorded
 		// right before the process stopped). Across all subscriptions only
 		// charges: failed checkouts matter for incomplete rows, synced anyway.
@@ -440,6 +442,57 @@ function unprocessed(payment: MolliePayment): MolliePayment {
 }
 
 /**
+ * How far back the sync looks for chargebacks. Mollie calls the payment's
+ * webhook for each one; this is the fallback for a webhook that never
+ * arrived.
+ */
+const CHARGEBACK_DISCOVERY_DAYS = 14;
+
+/**
+ * Chargebacks whose webhook was never processed: the profile's recent
+ * chargebacks are listed (one request per page), and each of our payments
+ * whose recorded chargeback differs is processed again.
+ */
+async function settleRecentChargebacks(
+	ctx: Ctx,
+	options: MollieOptions,
+	now: Date,
+	onEvents: (events: BillingEvent[]) => void,
+	errors: SyncResult["errors"],
+): Promise<void> {
+	const gateway = gatewayFor(options);
+	const charged = new Map<string, number>();
+	try {
+		const since = addDays(now, -CHARGEBACK_DISCOVERY_DAYS);
+		for (const chargeback of await gateway.listRecentChargebacks(since)) {
+			const cents = chargeback.reversedAt ? 0 : toCents(chargeback.amount.value);
+			charged.set(chargeback.paymentId, (charged.get(chargeback.paymentId) ?? 0) + cents);
+		}
+	} catch (error) {
+		errors.push({ subscriptionId: "", message: `chargebacks: ${errorMessage(error)}` });
+		ctx.context.logger.error(`[mollie] Listing chargebacks failed: ${errorMessage(error)}`);
+		return;
+	}
+	for (const [paymentId, cents] of charged) {
+		const record = await findPaymentRecord(ctx, paymentId);
+		// Not one of ours, or already processed.
+		if (!record) continue;
+		const recorded = record.amountChargedBack ? toCents(record.amountChargedBack) : 0;
+		if (cents === recorded) continue;
+		try {
+			const payment = await gateway.getPayment(paymentId);
+			onEvents((await processPayment(ctx, options, payment)).events);
+		} catch (error) {
+			if (error instanceof OperationInProgressError) continue;
+			errors.push({ subscriptionId: record.subscriptionId, message: errorMessage(error) });
+			ctx.context.logger.error(
+				`[mollie] Processing the chargeback of ${paymentId} failed: ${errorMessage(error)}`,
+			);
+		}
+	}
+}
+
+/**
  * Pro-rata charges whose creation was interrupted before they were recorded
  * (the response was lost, or the process stopped): each upgrade attempt has
  * its own journal entry, which nothing else revisits. Once its lock lease is
@@ -572,6 +625,7 @@ export async function syncAllSubscriptions(
 	}
 	const result: SyncResult = { checked: 0, remoteChecked: 0, invoicesCreated: 0, errors: [] };
 	await recoverAbandonedCharges(ctx, options, now, input.onEvents, result.errors);
+	await settleRecentChargebacks(ctx, options, now, input.onEvents, result.errors);
 	for (const id of ids) {
 		const subscription = await reload(ctx, id);
 		if (!subscription) continue;

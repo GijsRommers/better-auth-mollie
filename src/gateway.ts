@@ -1,6 +1,7 @@
 import type { Client } from "mollie-api-typescript";
 import type {
 	EntityCustomer,
+	ListEntityChargeback,
 	ListPaymentResponse,
 	ListSubscriptionResponse,
 	PaymentRequest,
@@ -10,6 +11,8 @@ import type {
 	SubscriptionRequest,
 	SubscriptionResponse,
 } from "mollie-api-typescript/models";
+
+import { toCents } from "./tax";
 
 /** A Mollie payment as returned by `payments.get` or a list endpoint. */
 export type MolliePayment = PaymentResponse | ListPaymentResponse;
@@ -179,6 +182,37 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 				for (const payment of page.result.embedded?.payments ?? []) {
 					if (new Date(payment.createdAt).getTime() < cutoff) return found;
 					found.push(payment);
+				}
+			}
+			return found;
+		},
+
+		/**
+		 * The amount charged back on a payment and not reversed, in cents (one
+		 * request per page of its chargebacks).
+		 */
+		async chargedBackCents(paymentId: string): Promise<number> {
+			const pages = await client.chargebacks.list({ paymentId, limit: PAGE_LIMIT }, options);
+			let cents = 0;
+			for await (const page of pages) {
+				for (const chargeback of page.result.embedded?.chargebacks ?? []) {
+					if (!chargeback.reversedAt) cents += toCents(chargeback.amount.value);
+				}
+			}
+			return cents;
+		},
+
+		/**
+		 * The profile's chargebacks created since `since`, newest first (paging
+		 * back to then). An error while paging propagates.
+		 */
+		async listRecentChargebacks(since: Date) {
+			const pages = await client.chargebacks.all({ limit: PAGE_LIMIT, sort: "desc" }, options);
+			const found: ListEntityChargeback[] = [];
+			for await (const page of pages) {
+				for (const chargeback of page.result.embedded?.chargebacks ?? []) {
+					if (new Date(chargeback.createdAt).getTime() < since.getTime()) return found;
+					found.push(chargeback);
 				}
 			}
 			return found;

@@ -11,6 +11,8 @@ import { type Browser, chromium, type Page } from "playwright";
  * Selectors are language-independent (the page may render in Dutch).
  */
 export type FinalState = "paid" | "failed" | "expired" | "canceled" | "open";
+/** What the test-mode page offers for a payment that is paid already. */
+export type PaidState = "chargeback";
 
 const TEST_CARD = {
 	number: "4543474002249996",
@@ -28,9 +30,15 @@ async function open(url: string): Promise<Page> {
 	return page;
 }
 
-async function chooseFinalState(page: Page, state: FinalState) {
+async function chooseFinalState(page: Page, state: FinalState | PaidState) {
 	await page.waitForURL(/\/checkout\/test-mode/, { timeout: 60_000 });
-	await page.locator(`input[name="final_state"][value="${state}"]`).check();
+
+	// A paid payment offers actions instead of states.
+	const choice =
+		state === "chargeback"
+			? 'input[name="action"][value="create-chargeback"]'
+			: `input[name="final_state"][value="${state}"]`;
+	await page.locator(choice).check();
 	// Submitting sets the state; the page then reloads (or redirects, for a
 	// payment with a redirect URL).
 	await Promise.all([
@@ -83,7 +91,10 @@ export async function completeCheckout(
 }
 
 /** Opens a `changePaymentState` link and sets the payment's final state. */
-export async function changePaymentState(url: string, state: FinalState): Promise<void> {
+export async function changePaymentState(
+	url: string,
+	state: FinalState | PaidState,
+): Promise<void> {
 	const page = await open(url);
 	try {
 		await chooseFinalState(page, state);

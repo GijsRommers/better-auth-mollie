@@ -183,6 +183,22 @@ export const molliePaymentSchema = {
 				defaultValue: false,
 				input: false,
 			},
+			paidThrough: {
+				type: "date",
+				required: false,
+				input: false,
+			},
+			amountChargedBack: {
+				type: "string",
+				required: false,
+				input: false,
+			},
+			chargebackDue: {
+				type: "boolean",
+				required: false,
+				defaultValue: false,
+				input: false,
+			},
 			invoice: {
 				type: "string",
 				required: false,

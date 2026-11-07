@@ -299,6 +299,35 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		},
 	);
 
+	it("makes the subscription past due when a real renewal is charged back", async () => {
+		const { subscription } = await subscribe("paid");
+		const payment = await chargeMandate(subscription, "better-auth-mollie integration chargeback");
+		if (payment.status !== "paid") {
+			await changePaymentState(payment.links.changePaymentState?.href as string, "paid");
+		}
+		await settled(payment.id);
+		env.links.set(payment.id, subscription.mollieSubscriptionId as string);
+		await env.webhook(payment.id);
+		const renewed = await env.subscriptionOf(subscription.referenceId);
+		expect(renewed.status).toBe("active");
+
+		const paid = await env.real.payments.get({ paymentId: payment.id });
+		await changePaymentState(paid.links.changePaymentState?.href as string, "chargeback");
+		for (let attempt = 0; attempt < 30; attempt++) {
+			const current = await env.real.payments.get({ paymentId: payment.id });
+			if (current.amountChargedBack) break;
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+		}
+		expect((await env.webhook(payment.id)).status).toBe(200);
+		const chargedBack = await env.subscriptionOf(subscription.referenceId);
+		expect(chargedBack.status).toBe("past_due");
+		expect(new Date(chargedBack.periodEnd as Date)).toEqual(new Date(renewed.periodStart as Date));
+		// The sync lists the chargeback too, and finds nothing left to do.
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors).toEqual([]);
+		expect((await env.subscriptionOf(subscription.referenceId)).status).toBe("past_due");
+	});
+
 	it("cancels the Mollie subscription at period end, and the cron leaves it consistent", async () => {
 		const { subscription, headers } = await subscribe("paid");
 		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers });

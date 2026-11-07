@@ -40,11 +40,12 @@ describe("efficient sync", () => {
 		await syncMollieSubscriptions(env.auth as never);
 		expect((await env.subscription(subscription.id)).status).toBe("unpaid");
 
+		// Calls about this subscription (not the profile-wide chargeback list).
 		const callsDuring = async (at: number) => {
 			travel(at);
 			const before = env.fake.calls.length;
 			await syncMollieSubscriptions(env.auth as never);
-			return env.fake.calls.length - before;
+			return env.fake.calls.slice(before).filter((c) => c.method !== "chargebacks.all").length;
 		};
 		const checked = Date.now();
 		expect(await callsDuring(checked + 3_600_000)).toBe(0);

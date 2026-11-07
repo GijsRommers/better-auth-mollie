@@ -35,7 +35,7 @@ import {
 	isFailedPaymentStatus,
 	isFinalPaymentStatus,
 } from "./status";
-import { chargeAmount, resolveTax, trustedTax } from "./tax";
+import { chargeAmount, fromCents, resolveTax, toCents, trustedTax } from "./tax";
 import type {
 	MollieOperation,
 	MollieOptions,
@@ -287,12 +287,18 @@ async function applyPayment(
 				const plan = await getPlanByName(options, subscription.plan);
 				events.push({ type: "subscription.activated", subscription, plan, payment });
 			}
-			record = (await setOutcome(ctx, payment.id, ["pending"], "applied", claim)) ?? record;
+			record =
+				(await setOutcome(ctx, payment.id, ["pending"], "applied", claim, {
+					paidThrough: paidThroughOf(purpose, subscription),
+				})) ?? record;
 		} else {
 			subscription = (await reload(ctx, subscription.id)) ?? subscription;
 			if (subscription.appliedPaymentId === payment.id) {
 				// Applied by a concurrent delivery of this same payment.
-				record = (await setOutcome(ctx, payment.id, ["pending"], "applied", claim)) ?? record;
+				record =
+					(await setOutcome(ctx, payment.id, ["pending"], "applied", claim, {
+						paidThrough: paidThroughOf(purpose, subscription),
+					})) ?? record;
 			} else if (result.kind === "covered") {
 				const classified = await classifyDuplicate(ctx, options, payment, subscription, claim);
 				record = classified.record ?? record;
@@ -364,6 +370,11 @@ async function applyPayment(
 				}
 			}
 		}
+	}
+	if (status === "paid") {
+		const chargeback = await settleChargeback(ctx, options, payment, subscription, lock, claim);
+		subscription = chargeback.subscription;
+		events.push(...chargeback.events);
 	}
 	// A new mandate, a new start or a postponed change: bring Mollie in line.
 	if (reconcile && (activated || subscription.mollieSyncNeeded || needsRemote(subscription))) {
@@ -481,7 +492,11 @@ async function refundDuplicate(
 	subscription: Subscription,
 	claim?: number,
 ): Promise<BillingEvent[]> {
-	await refundPayment(ctx, options, subscription, payment);
+	// Nothing left to refund (e.g. charged back): the money is back already.
+	const remaining = payment.amountRemaining;
+	if (!remaining || toCents(remaining.value) > 0) {
+		await refundPayment(ctx, options, subscription, payment);
+	}
 	const refunded = await setOutcome(ctx, payment.id, ["duplicate"], "refunded", claim);
 	if (!refunded) return [];
 	return [
@@ -510,6 +525,135 @@ export async function refundUnappliedPayment(
 	const marked = await setOutcome(ctx, payment.id, ["pending"], "duplicate");
 	if (!marked || payment.status !== "paid") return [];
 	return refundDuplicate(ctx, options, payment, subscription);
+}
+
+/** The end of the period a payment paid for, recorded when it applies. */
+function paidThroughOf(purpose: PaymentPurpose, subscription: Subscription): Date | null {
+	return purpose === "proration" ? null : periodEndOf(subscription);
+}
+
+/**
+ * Follows the amount charged back on a paid payment (a card dispute, or a
+ * reversed SEPA Direct Debit). When it changes, the consequence is applied
+ * first and the new amount recorded after, by the current claimant only;
+ * whoever then clears the hook as due dispatches `onChargeback`, once per
+ * change. A stop in between is repaired by the next delivery or sync.
+ */
+async function settleChargeback(
+	ctx: Ctx,
+	options: MollieOptions,
+	payment: MolliePayment,
+	initial: Subscription,
+	lock: SubscriptionLock,
+	claim: number,
+): Promise<{ subscription: Subscription; events: BillingEvent[] }> {
+	let subscription = initial;
+	let record = await findPaymentRecord(ctx, payment.id);
+	if (!record) return { subscription, events: [] };
+	const recorded = record.amountChargedBack ? toCents(record.amountChargedBack) : 0;
+	const reported = payment.amountChargedBack ? toCents(payment.amountChargedBack.value) : 0;
+	if (reported > 0 || recorded > 0) {
+		// Mollie's total may still count reversed chargebacks; these do not.
+		const cents = await gatewayFor(options).chargedBackCents(payment.id);
+		if (cents !== recorded) {
+			if (recorded === 0) {
+				subscription =
+					(await chargeBackPeriod(ctx, options, subscription, payment, record, lock)) ??
+					subscription;
+			}
+			await lock.fence();
+			record =
+				(await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+					model: "molliePayment",
+					where: [
+						{ field: "molliePaymentId", value: payment.id },
+						{ field: "amountChargedBack", value: record.amountChargedBack ?? null },
+						{ field: "claimSerial", value: claim },
+					],
+					increment: {},
+					set: { amountChargedBack: cents > 0 ? fromCents(cents) : null, chargebackDue: true },
+				})) ?? record;
+		}
+	}
+	if (!record.chargebackDue) return { subscription, events: [] };
+	const delivered = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+		model: "molliePayment",
+		where: [
+			{ field: "molliePaymentId", value: payment.id },
+			{ field: "chargebackDue", value: true },
+			{ field: "claimSerial", value: claim },
+		],
+		increment: {},
+		set: { chargebackDue: false },
+	});
+	if (!delivered) return { subscription, events: [] };
+	subscription = (await reload(ctx, subscription.id)) ?? subscription;
+	const amount = delivered.amountChargedBack ?? "0.00";
+	return {
+		subscription,
+		events: [
+			{
+				type: "payment.chargeback",
+				data: {
+					...(await paymentHookData(options, payment, delivered, subscription)),
+					chargeback: {
+						amount: { currency: payment.amount.currency, value: amount },
+						reversed: toCents(amount) === 0,
+					},
+				},
+			},
+		],
+	};
+}
+
+/**
+ * A new chargeback. When it took back the payment for the current period,
+ * that period counts as unpaid, as if its charge had failed: `past_due`,
+ * paid only up to the period's start, so the grace period counts from
+ * there. A charged-back pro-rata charge is judged like a failed one. A
+ * chargeback of an earlier period's payment, or of a trial's verification
+ * payment, changes nothing (the hook reports it).
+ */
+async function chargeBackPeriod(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscription: Subscription,
+	payment: MolliePayment,
+	record: MolliePaymentRecord,
+	lock: SubscriptionLock,
+): Promise<Subscription | null> {
+	if (record.outcome !== "applied") return null;
+	const purpose = paymentPurpose(payment);
+	if (purpose === "verification") return null;
+	if (purpose === "proration") {
+		if (subscription.appliedPaymentId !== payment.id) return null;
+		return applyFailedRenewal(ctx, options, subscription, payment, lock);
+	}
+	if (!BILLING_STATUSES.includes(subscription.status)) return null;
+	const periodEnd = periodEndOf(subscription);
+	const periodStart = subscription.periodStart ? new Date(subscription.periodStart) : null;
+	if (!periodEnd || !periodStart) return null;
+	// Recorded when it applied; for older records, the payment applied last.
+	const paidCurrentPeriod = record.paidThrough
+		? new Date(record.paidThrough).getTime() === periodEnd.getTime()
+		: subscription.appliedPaymentId === payment.id;
+	if (!paidCurrentPeriod) return null;
+	// A pending cancellation then ends it right away; unpaid stays unpaid.
+	const status =
+		subscription.cancelAtPeriodEnd || subscription.status === "unpaid"
+			? subscription.status
+			: "past_due";
+	return guardedUpdate(
+		ctx,
+		subscription.id,
+		BILLING_STATUSES,
+		{ status, periodEnd: periodStart },
+		[
+			{ field: "periodEnd", value: periodEnd },
+			{ field: "periodStart", value: periodStart },
+		],
+		{ lock },
+	);
 }
 
 /**
@@ -917,9 +1061,13 @@ export type SettleOptions = {
 async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
 	const record = await findPaymentRecord(ctx, payment.id);
 	if (record?.status !== payment.status) return true;
-	if (record.hooksDue) return true;
-	if (payment.status === "paid")
-		return record.outcome === "pending" || record.outcome === "duplicate";
+	if (record.hooksDue || record.chargebackDue) return true;
+	if (payment.status === "paid") {
+		if (record.outcome === "pending" || record.outcome === "duplicate") return true;
+		// A chargeback (or its reversal) not processed yet.
+		const reported = payment.amountChargedBack ? toCents(payment.amountChargedBack.value) : 0;
+		return reported > 0 !== !!record.amountChargedBack;
+	}
 	return isFinalPaymentStatus(payment.status) && isUnhandled(record);
 }
 
