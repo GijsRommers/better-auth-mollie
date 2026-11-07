@@ -2006,3 +2006,184 @@ describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows"
 		expect((await env.subscription(pending.id)).status).toBe("incomplete");
 	});
 });
+
+describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging", () => {
+	async function row(env: TestEnv, data: Record<string, unknown>) {
+		return env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				plan: "starter",
+				cancelAtPeriodEnd: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				...data,
+			},
+		});
+	}
+
+	async function paidCheckout(
+		env: TestEnv,
+		pending: { id: string; mollieCustomerId: string },
+		key: string,
+	) {
+		const payment = await env.fake.client.payments.create({
+			idempotencyKey: key,
+			paymentRequest: {
+				amount: { currency: "EUR", value: "9.95" },
+				description: "starter",
+				sequenceType: "first",
+				customerId: pending.mollieCustomerId,
+				redirectUrl: "https://app.example.com/done",
+				metadata: { subscriptionId: pending.id, plan: "starter", purpose: "checkout" },
+			},
+		} as never);
+		env.fake.completePayment(payment.id, "paid");
+		return payment;
+	}
+
+	function pauseNext(env: TestEnv, when: (args: any) => boolean) {
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (when(args)) {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		return { paused, release, restore: () => (adapter.incrementOne = original) };
+	}
+
+	const billing = async (env: TestEnv) =>
+		(await env.subscriptions()).filter(
+			(s) => (s.status === "active" || s.status === "trialing") && !s.cancelAtPeriodEnd,
+		);
+
+	it("never lets a restore that stalled past its lease undo a cancellation after another checkout took over", async () => {
+		const env = await setup();
+		const first = await subscribe(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		const pending = await row(env, {
+			referenceId: first.referenceId,
+			status: "incomplete",
+			mollieCustomerId: first.mollieCustomerId,
+			customerType: "user",
+		});
+		const payment = await paidCheckout(env, pending, "takeover");
+		const periodEnd = new Date(first.periodEnd!).getTime();
+		travel(periodEnd - 60_000);
+		const { headers } = await env.signInWithTestUser();
+
+		const stall = pauseNext(
+			env,
+			(args) => args.model === "subscription" && args.set?.cancelAtPeriodEnd === false,
+		);
+		const restoring = env.api
+			.restoreSubscription({ body: { subscriptionId: first.id }, headers })
+			.catch((error: unknown) => error);
+		await stall.paused;
+		// Well past the period end and every lease, the other checkout is paid.
+		travel(periodEnd + 3 * 60_000);
+		await env.webhook(`id=${payment.id}`);
+		stall.release();
+		await restoring;
+		stall.restore();
+		await env.webhook(`id=${payment.id}`);
+
+		expect((await billing(env)).map((s) => s.id)).toEqual([pending.id]);
+		expect((await env.subscription(first.id)).status).toBe("canceled");
+	});
+
+	it("serializes legacy and typed rows whichever activates first", async () => {
+		const env = await setup();
+		const customer = await env.fake.client.customers.create({
+			idempotencyKey: "both-ways",
+			entityCustomer: { name: "Both" },
+		} as never);
+		const typed = await row(env, {
+			referenceId: env.user.id,
+			status: "incomplete",
+			mollieCustomerId: customer.id,
+			customerType: "organization",
+		});
+		const legacy = await row(env, {
+			referenceId: env.user.id,
+			status: "incomplete",
+			mollieCustomerId: customer.id,
+		});
+		const typedPayment = await paidCheckout(env, typed, "typed-first");
+		const legacyPayment = await paidCheckout(env, legacy, "legacy-second");
+
+		await env.webhook(`id=${typedPayment.id}`);
+		await env.webhook(`id=${legacyPayment.id}`);
+		expect(await billing(env)).toHaveLength(1);
+		expect(refundedIds(env)).toEqual([legacyPayment.id]);
+	});
+
+	it("finds a covering subscription behind rows that end while they are read", async () => {
+		const past = new Date(Date.now() - 86_400_000);
+		const rows: any[] = [];
+		for (let i = 0; i < 100; i++) {
+			rows.push({
+				id: `r${String(i).padStart(3, "0")}`,
+				referenceId: "ref",
+				status: "active",
+				cancelAtPeriodEnd: true,
+				periodEnd: past,
+				lockedUntil: new Date(0),
+				plan: "starter",
+			});
+		}
+		rows.push({
+			id: "z",
+			referenceId: "ref",
+			status: "active",
+			periodEnd: new Date(Date.now() + 86_400_000),
+			plan: "starter",
+		});
+		const matches = (r: any, where: any[]) =>
+			where.every((w) => {
+				const value = r[w.field];
+				if (w.operator === "in") return w.value.includes(value);
+				if (w.operator === "gt") return value > w.value;
+				if (w.operator === "lt") return value < w.value;
+				if (w.value === null) return value == null;
+				return value instanceof Date
+					? value.getTime() === new Date(w.value).getTime()
+					: value === w.value;
+			});
+		const adapter = {
+			findMany: async ({ where, limit, offset = 0 }: any) =>
+				rows
+					.filter((r) => matches(r, where))
+					.sort((a, b) => (a.id < b.id ? -1 : 1))
+					.slice(offset, offset + limit),
+			findOne: async ({ where }: any) => rows.find((r) => matches(r, where)) ?? null,
+			incrementOne: async ({ where, set }: any) => {
+				const target = rows.find((r) => matches(r, where));
+				if (!target) return null;
+				Object.assign(target, set);
+				return target;
+			},
+		};
+		const { coverage } = await import("../../src/billing");
+		const result = await coverage(
+			{ context: { adapter } } as never,
+			{ subscription: { enabled: true, plans: PLANS } } as never,
+			{ referenceId: "ref", customerType: null },
+			"new",
+			new Date(),
+		);
+		expect(result.state).toBe("covered");
+		expect(result.events).toHaveLength(100);
+	});
+});

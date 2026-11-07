@@ -6,11 +6,10 @@ import {
 	applyDueTransitions,
 	beforeCancellationTakesEffect,
 	billsIdentity,
-	customerTypeOf,
+	coverage,
 	findSubscription,
 	guardedUpdate,
 	lockWaitMs,
-	otherSubscriptionCovers,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
@@ -219,17 +218,23 @@ async function whileCancellationHolds<T>(
 	if (!subscription.cancelAtPeriodEnd) return op();
 	const identity = {
 		referenceId: subscription.referenceId,
-		customerType: await customerTypeOf(ctx, subscription),
+		customerType: subscription.customerType ?? null,
 	};
-	return withReferenceLock(ctx, options, identity, async () => {
+	return withReferenceLock(ctx, options, identity, async (fence) => {
 		const now = new Date();
 		const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 		if (!periodEnd || periodEnd <= now) {
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PERIOD_ENDED);
 		}
-		if (await otherSubscriptionCovers(ctx, identity, subscription.id, now)) {
+		const covered = await coverage(ctx, options, identity, subscription.id, now);
+		dispatchEvents(ctx, options, covered.events);
+		if (covered.state === "covered") {
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ANOTHER_SUBSCRIPTION_ACTIVE);
 		}
+		if (covered.state === "busy") {
+			throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+		}
+		await fence();
 		return op();
 	});
 }

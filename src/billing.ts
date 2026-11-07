@@ -394,12 +394,16 @@ export async function paymentHookData(
 }
 
 /** What applying a paid payment did. */
-type Application =
+type Application = (
 	| { kind: "applied"; subscription: Subscription; activated: boolean }
 	/** It cannot apply: what it would pay for is already paid for, or over. */
 	| { kind: "covered" }
 	/** It cannot apply now (e.g. a plan that is not configured); try again later. */
-	| { kind: "unresolved" };
+	| { kind: "unresolved" }
+) & {
+	/** Events of other changes made on the way (e.g. ending a due cancellation). */
+	events?: BillingEvent[];
+};
 
 const APPLY_ATTEMPTS = 3;
 
@@ -457,11 +461,13 @@ export async function processPayment(
  */
 export function billsIdentity(
 	subscription: Subscription,
-	identity: { referenceId: string; customerType: CustomerType },
+	identity: { referenceId: string; customerType: CustomerType | null },
 ): boolean {
 	return (
 		subscription.referenceId === identity.referenceId &&
-		(!subscription.customerType || subscription.customerType === identity.customerType)
+		(!identity.customerType ||
+			!subscription.customerType ||
+			subscription.customerType === identity.customerType)
 	);
 }
 
@@ -474,7 +480,7 @@ export function billsIdentity(
 export async function withReferenceLock<T>(
 	ctx: Ctx,
 	options: MollieOptions,
-	identity: { referenceId: string; customerType: CustomerType },
+	identity: { referenceId: string; customerType: CustomerType | null },
 	fn: (fence: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
 	// Per reference, not per type: rows without a customer type match either
@@ -495,34 +501,101 @@ export async function withReferenceLock<T>(
 	}
 }
 
+export type Coverage = {
+	/**
+	 * `covered`: another subscription still covers the identity; `free`: none
+	 * does; `busy`: one may, but is being changed right now (try again later).
+	 */
+	state: "covered" | "free" | "busy";
+	events: BillingEvent[];
+};
+
 /**
- * Whether a subscription other than `exceptId` still covers this identity
- * (looked at over all of the reference's billing rows). Call it under
- * `withReferenceLock`.
+ * Whether a subscription other than `exceptId` still covers this identity,
+ * over all of the reference's billing rows (paged by id, so rows that change
+ * meanwhile are never skipped). A row with no customer type stands for
+ * either identity, on both sides. Call it under `withReferenceLock`.
+ *
+ * Another subscription whose cancellation date has passed is ended here and
+ * now (atomically, and only while nobody holds its lock), which also replaces
+ * its lock token: whoever was about to undo that cancellation (a restore that
+ * stalled) can no longer write it. So the identity never has two.
  */
-export async function otherSubscriptionCovers(
+export async function coverage(
 	ctx: Ctx,
-	identity: { referenceId: string; customerType: CustomerType },
+	options: MollieOptions,
+	identity: { referenceId: string; customerType: CustomerType | null },
 	exceptId: string,
 	now: Date,
-): Promise<boolean> {
-	for (let offset = 0; ; offset += PAGE_SIZE) {
-		const page = await ctx.context.adapter.findMany<Subscription>({
+): Promise<Coverage> {
+	const events: BillingEvent[] = [];
+	let busy = false;
+	let cursor: string | null = null;
+	for (;;) {
+		const page: Subscription[] = await ctx.context.adapter.findMany<Subscription>({
 			model: "subscription",
 			where: [
 				{ field: "referenceId", value: identity.referenceId },
 				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+				...(cursor ? [{ field: "id", operator: "gt" as const, value: cursor }] : []),
 			],
 			sortBy: { field: "id", direction: "asc" },
 			limit: PAGE_SIZE,
-			offset,
 		});
-		const covers = page.some(
-			(other) => other.id !== exceptId && billsIdentity(other, identity) && stillCovers(other, now),
-		);
-		if (covers) return true;
-		if (page.length < PAGE_SIZE) return false;
+		for (const other of page) {
+			if (other.id === exceptId || !billsIdentity(other, identity)) continue;
+			if (stillCovers(other, now)) return { state: "covered", events };
+			const ended = await endDueCancellation(ctx, options, other, now);
+			if (ended === "covers") return { state: "covered", events };
+			if (ended === "busy") busy = true;
+			else events.push(...ended);
+		}
+		if (page.length < PAGE_SIZE) break;
+		cursor = (page[page.length - 1] as Subscription).id;
 	}
+	return { state: busy ? "busy" : "free", events };
+}
+
+/**
+ * Ends a subscription whose cancellation date has passed, unless someone
+ * holds its lock (`busy`) or it was restored meanwhile (`covers`).
+ */
+async function endDueCancellation(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscription: Subscription,
+	now: Date,
+): Promise<BillingEvent[] | "busy" | "covers"> {
+	const end = (unlocked: Where) =>
+		ctx.context.adapter.incrementOne<Subscription>({
+			model: "subscription",
+			where: [
+				{ field: "id", value: subscription.id },
+				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+				{ field: "cancelAtPeriodEnd", value: true },
+				{ field: "periodEnd", value: new Date(subscription.periodEnd as Date) },
+				unlocked,
+			],
+			increment: { mollieSyncRevision: 1, lockSerial: 1 },
+			set: {
+				status: "canceled",
+				pendingPlan: null,
+				mollieSyncNeeded: true,
+				lockToken: globalThis.crypto.randomUUID(),
+				lockedUntil: new Date(0),
+				updatedAt: new Date(),
+			},
+		});
+	const ended =
+		(await end({ field: "lockedUntil", operator: "lt", value: now })) ??
+		(await end({ field: "lockedUntil", value: null }));
+	if (ended) {
+		const plan = await getPlanByName(options, ended.plan);
+		return [{ type: "subscription.canceled", subscription: ended, plan, reason: "period_ended" }];
+	}
+	const current = await reload(ctx, subscription.id);
+	if (!current || !BILLING_STATUSES.includes(current.status)) return [];
+	return stillCovers(current, now) ? "covers" : "busy";
 }
 
 /**
@@ -569,6 +642,7 @@ async function applyPayment(
 
 	if (status === "paid" && record.outcome === "pending") {
 		const result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
+		events.push(...(result.events ?? []));
 		if (result.kind === "applied") {
 			subscription = result.subscription;
 			if (result.activated) {
@@ -817,20 +891,18 @@ async function activateSubscription(
 	// nothing, so it is refunded rather than starting a second subscription.
 	// Checked and applied under the identity's lock, so two pending rows
 	// activated at the same time cannot both pass.
-	const identity = {
-		referenceId: initial.referenceId,
-		customerType: await customerTypeOf(ctx, initial),
-	};
-	return withReferenceLock(ctx, options, identity, async (fence) => {
-		if (await otherSubscriptionCovers(ctx, identity, initial.id, new Date())) {
-			return { kind: "covered" };
-		}
+	const identity = { referenceId: initial.referenceId, customerType: initial.customerType ?? null };
+	return withReferenceLock(ctx, options, identity, async (fence): Promise<Application> => {
+		const covered = await coverage(ctx, options, identity, initial.id, new Date());
+		if (covered.state === "covered") return { kind: "covered", events: covered.events };
+		if (covered.state === "busy") return { kind: "unresolved", events: covered.events };
 		await fence();
-		return activateRow(ctx, initial, payment, plan, customerId, anchor, lock, {
+		const result = await activateRow(ctx, initial, payment, plan, customerId, anchor, lock, {
 			isTrial,
 			trialEnd,
 			periodEnd,
 		});
+		return { ...result, events: [...covered.events, ...(result.events ?? [])] };
 	});
 }
 
