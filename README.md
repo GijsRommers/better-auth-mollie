@@ -133,6 +133,8 @@ A new subscription starts with a **first payment** at Mollie's hosted checkout. 
 - **No trial:** the customer pays the first period. Once paid, the subscription is `active`, and a Mollie subscription is scheduled from the end of that period.
 - **Trial:** the first payment only verifies the payment method (`verificationAmount`, default `"0.02"`). The subscription is `trialing`, and Mollie starts charging when the trial ends. A reference gets one trial.
 
+A reference has one billing subscription at a time. Concurrent checkouts share one pending subscription, and a checkout that is paid while another subscription is already running is refunded instead of starting a second one.
+
 After checkout, Mollie sends the customer to `${baseURL}/subscription/success`. That endpoint syncs the payment, so the subscription is up to date before your `successUrl` loads, without waiting for the webhook.
 
 The customer needs a payment method that can create a mandate: cards, PayPal, or iDEAL, Bancontact, Belfius, KBC, EPS and others when SEPA Direct Debit is enabled on your Mollie profile. Restrict the methods with `getFirstPaymentParams: () => ({ method: "creditcard" })`.

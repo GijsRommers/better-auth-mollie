@@ -23,11 +23,12 @@ import { dispatchEvents } from "../events";
 import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
 import { type SubscriptionLock, withSubscriptionLock } from "../lock";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
-import { type Fence, runOperation } from "../operations";
+import { type Fence, OperationInProgressError, runOperation, withLock } from "../operations";
 import {
 	ACCESS_STATUSES,
 	BILLING_STATUSES,
 	DEFAULT_VERIFICATION_AMOUNT,
+	hasSubscriptionAccess,
 	isFinalPaymentStatus,
 } from "../status";
 import { chargeAmount, fromCents, resolveTax, taxMetadata, toCents } from "../tax";
@@ -69,6 +70,44 @@ async function referenceSubscriptions(ctx: GenericEndpointContext, referenceId: 
 		sortBy: { field: "createdAt", direction: "desc" },
 		limit: 100,
 	});
+}
+
+/**
+ * The reference's pending (`incomplete`) subscription row, or a new one:
+ * under a lock per reference, so concurrent checkouts (also ones replacing an
+ * expired row) share one row instead of each starting a subscription.
+ */
+async function pendingRow(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	data: Omit<Subscription, "id" | "status" | "createdAt" | "updatedAt">,
+): Promise<Subscription> {
+	const create = async () => {
+		const existing = (await referenceSubscriptions(ctx, data.referenceId)).find(
+			(s) => s.status === "incomplete",
+		);
+		if (existing) return existing;
+		return ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
+			model: "subscription",
+			data: { ...data, status: "incomplete", createdAt: new Date(), updatedAt: new Date() },
+		});
+	};
+	const key = `lock:checkout:${data.referenceId}`;
+	for (let attempt = 0; ; attempt++) {
+		let entered = false;
+		try {
+			return await withLock(ctx.context, { key, referenceId: data.referenceId }, () => {
+				entered = true;
+				return create();
+			});
+		} catch (error) {
+			const busy = !entered && error instanceof OperationInProgressError;
+			if (!busy || attempt * 100 >= lockWaitMs(options)) {
+				throw toAPIError(error, MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
 }
 
 /** `subscriptionId` may be the local id or the Mollie subscription id. */
@@ -308,13 +347,7 @@ async function changePlan(
 ) {
 	// Charges Mollie finished but whose webhook is late (a renewal) change
 	// the period this change is priced and scheduled from: apply them first.
-	const charges = await settleRecentCharges(
-		ctx,
-		options,
-		initial,
-		initial.mollieSubscriptionId,
-		lock,
-	);
+	const charges = await settleRecentCharges(ctx, options, initial, { lock });
 	if (charges.inProgress) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.PAYMENT_IN_PROGRESS);
 	}
@@ -608,18 +641,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						// The checkout expired meanwhile: start over on a new row, under
 						// that row's own lock.
 						return {
-							restart: await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
-								model: "subscription",
-								data: {
-									referenceId,
-									plan: planName,
-									status: "incomplete",
-									mollieCustomerId: input.customerId,
-									customerType,
-									cancelAtPeriodEnd: false,
-									createdAt: new Date(),
-									updatedAt: new Date(),
-								},
+							restart: await pendingRow(ctx, options, {
+								referenceId,
+								plan: planName,
+								mollieCustomerId: input.customerId,
+								customerType,
+								cancelAtPeriodEnd: false,
 							}),
 						};
 					}
@@ -686,25 +713,18 @@ export const upgradeSubscription = (options: MollieOptions) =>
 
 			// New subscription: checkout for the first (mandate) payment.
 			const customerId = await getOrCreateCustomer(ctx, options, { customerType, referenceId });
-			const { adapter } = ctx.context;
 			// Reuse the pending row (updated under its lock in `checkout`), or start one.
 			let row =
 				target?.status === "incomplete"
 					? target
 					: subscriptions.find((s) => s.status === "incomplete");
 			if (!row) {
-				row = await adapter.create<Omit<Subscription, "id">, Subscription>({
-					model: "subscription",
-					data: {
-						referenceId,
-						plan: planName,
-						status: "incomplete",
-						mollieCustomerId: customerId,
-						customerType,
-						cancelAtPeriodEnd: false,
-						createdAt: new Date(),
-						updatedAt: new Date(),
-					},
+				row = await pendingRow(ctx, options, {
+					referenceId,
+					plan: planName,
+					mollieCustomerId: customerId,
+					customerType,
+					cancelAtPeriodEnd: false,
 				});
 			}
 			const hadTrial = subscriptions.some((s) => s.trialEnd || s.status === "trialing");
@@ -983,7 +1003,14 @@ export const listActiveSubscriptions = (options: MollieOptions) =>
 			const plans = await getPlans(options);
 			return ctx.json(
 				subscriptions
-					.filter((s) => ACCESS_STATUSES.includes(s.status))
+					// Date-aware: a past-due subscription beyond its grace period (not
+					// marked unpaid yet by the sync) is not listed as having access.
+					.filter((s) =>
+						hasSubscriptionAccess(s, {
+							now,
+							gracePeriodDays: subscriptionOptions(options).gracePeriodDays,
+						}),
+					)
 					.map((s) => withLimits(s, plans)),
 			);
 		},

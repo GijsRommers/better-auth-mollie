@@ -43,7 +43,7 @@ describe("subscription.upgrade (new subscription)", () => {
 	it("journals every Mollie call it makes", async () => {
 		const env = await setup();
 		await env.checkout("starter");
-		const operations = await env.operations();
+		const operations = (await env.operations()).filter((op) => op.kind !== "lifecycle_lock");
 		expect(operations.map((op) => [op.kind, op.status]).sort()).toEqual([
 			["create_customer", "succeeded"],
 			["create_first_payment", "succeeded"],

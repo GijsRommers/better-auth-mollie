@@ -103,11 +103,24 @@ describe("renewals", () => {
 });
 
 describe("Mollie subscription status", () => {
-	it("maps suspended to past_due", async () => {
+	it("does not treat a suspended Mollie subscription as delinquent while the period is paid", async () => {
 		const env = await setup();
 		const { subscription } = await subscribe(env);
 		env.fake.setSubscriptionStatus(subscription.mollieSubscriptionId!, "suspended");
 		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		const row = await env.subscription(subscription.id);
+		expect(row.status).toBe("active");
+		// Billing is brought back in line for the next period.
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active.map((s) => s.id)).toEqual([row.mollieSubscriptionId]);
+	});
+
+	it("maps suspended to past_due once the paid period has run out", async () => {
+		const env = await setup();
+		const { subscription } = await subscribe(env);
+		env.fake.setSubscriptionStatus(subscription.mollieSubscriptionId!, "suspended");
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
 		await syncMollieSubscriptions(env.auth as never);
 		expect((await env.subscription(subscription.id)).status).toBe("past_due");
 	});

@@ -1564,3 +1564,141 @@ describe("re-check of bfe76d6: uncertain discovery, replacement rows, unlocked w
 		expect((await env.subscription(subscription.id)).cancelAtPeriodEnd).toBe(true);
 	});
 });
+
+describe("re-check of 313584a: stale Mollie status, concurrent replacements, listing", () => {
+	it("never lets a suspended status read before a paid renewal make it past due", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		env.fake.setSubscriptionStatus(subscription.mollieSubscriptionId!, "suspended");
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+
+		// The renewal is being applied when Mollie's subscription webhook arrives.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "molliePayment" && args.set?.outcome === "applied") {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const deliveryR = env.webhook(`id=${renewal.id}`);
+		await paused;
+		const deliveryW = env.webhook(`id=${subscription.mollieSubscriptionId}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		release();
+		await deliveryR;
+		await deliveryW;
+		adapter.incrementOne = original;
+
+		const row = await env.subscription(subscription.id);
+		expect(row.status).toBe("active");
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+	});
+
+	it("shares one new row between checkouts that both replace an expired one", async () => {
+		let stall: { reached: () => void; gate: Promise<void> } | null = null;
+		const env = await setup({
+			subscription: {
+				tax: {
+					calculate: async () => {
+						const current = stall;
+						stall = null;
+						if (current) {
+							current.reached();
+							await current.gate;
+						}
+						return { rate: "21.00" };
+					},
+				},
+			},
+		});
+		const { payment: abandoned } = await env.checkout("starter");
+		env.fake.completePayment(abandoned.id, "failed");
+
+		// B picks the pending row, then stalls before locking it...
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const paused = new Promise<void>((resolve) => {
+			stall = { reached: resolve, gate };
+		});
+		const requestB = env.api
+			.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await paused;
+		// ...while A finds it expired and replaces it.
+		const requestA = await env.api.upgradeSubscription({
+			body: { plan: "starter" },
+			headers: env.headers,
+		});
+		release();
+		const resultB = (await requestB) as { url?: string };
+
+		const pending = (await env.subscriptions()).filter((s) => s.status === "incomplete");
+		expect(pending).toHaveLength(1);
+		expect(resultB.url).toBe(requestA.url);
+	});
+
+	it("refunds a checkout for a second subscription instead of starting it", async () => {
+		const env = await setup();
+		const first = await subscribe(env, "starter");
+		// A second pending row for the same reference (e.g. left by an older version).
+		const second = await env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				referenceId: first.referenceId,
+				plan: "business",
+				status: "incomplete",
+				mollieCustomerId: first.mollieCustomerId,
+				customerType: "user",
+				cancelAtPeriodEnd: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const payment = await env.fake.client.payments.create({
+			idempotencyKey: "second-row",
+			paymentRequest: {
+				amount: { currency: "EUR", value: "49.00" },
+				description: "business",
+				sequenceType: "first",
+				customerId: first.mollieCustomerId!,
+				redirectUrl: "https://app.example.com/done",
+				metadata: { subscriptionId: second.id, plan: "business", purpose: "checkout" },
+			},
+		} as never);
+		env.fake.completePayment(payment.id, "paid");
+		await env.webhook(`id=${payment.id}`);
+
+		expect(refundedIds(env)).toEqual([payment.id]);
+		expect((await env.subscription(second.id)).status).toBe("incomplete");
+		expect(env.fake.activeSubscriptionsFor(first.mollieCustomerId!)).toHaveLength(1);
+	});
+
+	it("does not list a past-due subscription whose grace period has run out", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+		await env.webhook(`id=${failed.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+
+		travel(addDays(periodEnd, 15));
+		const { headers } = await env.signInWithTestUser();
+		expect(await env.api.listActiveSubscriptions({ headers })).toEqual([]);
+	});
+});

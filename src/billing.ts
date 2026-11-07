@@ -716,6 +716,18 @@ async function activateSubscription(
 	const isTrial = metadata.trial === true && trialDays > 0;
 	const trialEnd = isTrial ? ceilToUTCDate(addDays(anchor, trialDays)) : null;
 	const periodEnd = trialEnd ?? ceilToUTCDate(addInterval(anchor, plan.interval));
+	// A reference has one billing subscription: a checkout paid while another
+	// one is already running (e.g. two tabs, or a second pending row) pays for
+	// nothing, so it is refunded rather than starting a second subscription.
+	const others = await ctx.context.adapter.findMany<Subscription>({
+		model: "subscription",
+		where: [
+			{ field: "referenceId", value: initial.referenceId },
+			{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+		],
+		limit: 10,
+	});
+	if (others.some((other) => other.id !== initial.id)) return { kind: "covered" };
 	let subscription: Subscription | null = initial;
 	for (let attempt = 0; attempt < APPLY_ATTEMPTS && subscription; attempt++) {
 		if (subscription.status !== "incomplete") return { kind: "covered" };
@@ -1133,9 +1145,9 @@ export async function settleRecentCharges(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
-	remoteId: string | null | undefined = subscription.mollieSubscriptionId,
-	lock?: SubscriptionLock,
+	how: SettleOptions = {},
 ): Promise<Settlement> {
+	const remoteId = how.remoteId === undefined ? subscription.mollieSubscriptionId : how.remoteId;
 	const customerId = subscription.mollieCustomerId;
 	const nothing: Settlement = { inProgress: false, processed: false, errors: [] };
 	if (!customerId || !remoteId) return nothing;
@@ -1149,8 +1161,19 @@ export async function settleRecentCharges(
 	if (recent.some((p) => !isFinalPaymentStatus(p.status as string))) {
 		return { ...nothing, inProgress: true };
 	}
-	return processUnsettled(ctx, options, recent, lock);
+	return processUnsettled(ctx, options, recent, how);
 }
+
+/**
+ * How charges are settled: of which Mollie subscription (default: the
+ * row's), under a lock the caller holds, and whether processing a payment
+ * may also bring Mollie in line (default: when no lock is held).
+ */
+export type SettleOptions = {
+	remoteId?: string | null | undefined;
+	lock?: SubscriptionLock | undefined;
+	reconcile?: boolean | undefined;
+};
 
 /**
  * Outcomes of a payment that is not paid whose consequence was not applied
@@ -1175,15 +1198,17 @@ async function processUnsettled(
 	ctx: Ctx,
 	options: MollieOptions,
 	payments: MolliePayment[],
-	lock: SubscriptionLock | undefined,
+	how: SettleOptions,
 ): Promise<Settlement> {
+	const { lock } = how;
+	const reconcile = how.reconcile ?? !lock;
 	const settlement: Settlement = { inProgress: false, processed: false, errors: [] };
 	for (const payment of payments) {
 		if (!(await isUnsettled(ctx, payment))) continue;
 		// Each payment on its own: one that cannot be processed now does not
 		// stop the others. It stays outstanding (and counts as in progress).
 		try {
-			const result = await processPayment(ctx, options, payment, { lock, reconcile: !lock });
+			const result = await processPayment(ctx, options, payment, { lock, reconcile });
 			dispatchEvents(ctx, options, result.events);
 			settlement.processed = true;
 		} catch (error) {
@@ -1218,7 +1243,7 @@ export async function settleCustomerCharges(
 	options: MollieOptions,
 	subscription: Subscription,
 	now: Date,
-	lock?: SubscriptionLock,
+	how: SettleOptions = {},
 ): Promise<Settlement> {
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId) return { inProgress: false, processed: false, errors: [] };
@@ -1231,7 +1256,7 @@ export async function settleCustomerCharges(
 	);
 	const inProgress = ours.some((payment) => !isFinalPaymentStatus(payment.status as string));
 	const final = ours.filter((payment) => isFinalPaymentStatus(payment.status as string));
-	const settlement = await processUnsettled(ctx, options, final, lock);
+	const settlement = await processUnsettled(ctx, options, final, how);
 	return { ...settlement, inProgress: settlement.inProgress || inProgress };
 }
 
@@ -1310,9 +1335,10 @@ export async function reconcileRemote(
 	subscription: Subscription,
 	now: Date,
 	lock: SubscriptionLock,
-	attempt = 0,
+	extra: { attempt?: number; charges?: Settlement | undefined } = {},
 ): Promise<Subscription> {
 	const fence = lock.fence;
+	const attempt = extra.attempt ?? 0;
 	const settled = (result: Subscription = subscription) =>
 		markMollieSynced(ctx, subscription, result, lock);
 	const postpone = async () => {
@@ -1321,7 +1347,7 @@ export async function reconcileRemote(
 	};
 	const again = async (latest: Subscription | null) => {
 		if (!latest || attempt >= 2) return postpone();
-		return reconcileRemote(ctx, options, latest, now, lock, attempt + 1);
+		return reconcileRemote(ctx, options, latest, now, lock, { attempt: attempt + 1 });
 	};
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId || subscription.status === "incomplete") return settled();
@@ -1355,15 +1381,16 @@ export async function reconcileRemote(
 		let pending = false;
 		for (const remoteId of new Set([subscription.mollieSubscriptionId, ...stopped])) {
 			if (!remoteId) continue;
-			if ((await settleRecentCharges(ctx, options, subscription, remoteId, lock)).inProgress) {
+			if ((await settleRecentCharges(ctx, options, subscription, { remoteId, lock })).inProgress) {
 				pending = true;
 			}
 		}
 		// Also charges of Mollie subscriptions canceled earlier (no longer listed
-		// as running) and other charges for this row.
-		if ((await settleCustomerCharges(ctx, options, subscription, now, lock)).inProgress) {
-			pending = true;
-		}
+		// as running) and other charges for this row, unless the caller just
+		// looked them up (the sync does, before taking the lock).
+		const charges =
+			extra.charges ?? (await settleCustomerCharges(ctx, options, subscription, now, { lock }));
+		if (charges.inProgress) pending = true;
 		if (pending || (await creationInFlight(ctx, subscription, now))) return postpone();
 		return settled();
 	}
@@ -1402,13 +1429,7 @@ export async function reconcileRemote(
 	if (actual && matches(actual)) return settled();
 
 	if (actual) {
-		const charges = await settleRecentCharges(
-			ctx,
-			options,
-			subscription,
-			subscription.mollieSubscriptionId,
-			lock,
-		);
+		const charges = await settleRecentCharges(ctx, options, subscription, { lock });
 		if (charges.inProgress) {
 			ctx.context.logger.info(
 				`[mollie] ${subscription.id}: waiting for a charge in progress before updating Mollie`,
@@ -1566,6 +1587,11 @@ export async function reconcileMollieSubscription(
 	const implied = mapMollieSubscriptionStatus(mollieSubscription.status as string);
 	const sameRemote: Where[] = [{ field: "mollieSubscriptionId", value: mollieSubscription.id }];
 	if (implied === "past_due") {
+		// Suspended at Mollie: it will not charge again. That only makes the
+		// subscription delinquent once what was paid for has run out (until then
+		// the overdue fallback of the sync would catch a missing renewal).
+		const paidThrough = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+		if (paidThrough && paidThrough > new Date()) return [];
 		await guardedUpdate(
 			ctx,
 			subscription.id,
@@ -1744,24 +1770,23 @@ export async function processMollieSubscription(
 	const initial = await findSubscription(ctx, [
 		{ field: "mollieSubscriptionId", value: mollieSubscriptionId },
 	]);
-	const customerId = initial?.mollieCustomerId;
-	if (!initial || !customerId) return [];
-	let mollieSubscription: MollieSubscription;
-	try {
-		mollieSubscription = await gatewayFor(options).getSubscription(
-			customerId,
-			mollieSubscriptionId,
-		);
-	} catch (error) {
-		if (isMollieNotFound(error)) return [];
-		throw error;
-	}
+	if (!initial?.mollieCustomerId) return [];
 	return withSubscriptionLock(
 		ctx,
 		initial.id,
 		async (lock) => {
+			// Mollie's status is read under the lock, so it is never older than
+			// the row it is applied to.
 			const fresh = await reload(ctx, initial.id);
-			return fresh
+			const customerId = fresh?.mollieCustomerId;
+			if (!fresh || !customerId) return [];
+			const mollieSubscription = await gatewayFor(options)
+				.getSubscription(customerId, mollieSubscriptionId)
+				.catch((error: unknown) => {
+					if (isMollieNotFound(error)) return null;
+					throw error;
+				});
+			return mollieSubscription
 				? reconcileMollieSubscription(ctx, options, fresh, mollieSubscription, lock)
 				: [];
 		},
@@ -1921,23 +1946,22 @@ export async function syncSubscription(
 		});
 	}
 	const seen = (await reload(ctx, initial.id)) ?? initial;
-	let mollieSubscription: MollieSubscription | null = null;
-	const customerId = seen.mollieCustomerId;
-	if (customerId && needsRemoteCheck(seen, now)) {
+	// Customer charges found here; handed to reconciling below so it does not
+	// look them up again while holding the subscription.
+	let charges: Settlement | undefined;
+	if (seen.mollieCustomerId && needsRemoteCheck(seen, now)) {
 		checkedRemote = true;
 		const remoteId = seen.mollieSubscriptionId;
+		// Processing only: Mollie is brought in line below, under the lock.
 		if (remoteId) {
-			await step("mollie subscription", async () => {
-				mollieSubscription = await gateway
-					.getSubscription(customerId, remoteId)
-					.catch((error: unknown) => {
-						if (isMollieNotFound(error)) return null;
-						throw error;
-					});
-			});
-			await settle("recent charges", () => settleRecentCharges(ctx, options, seen, remoteId));
+			await settle("recent charges", () =>
+				settleRecentCharges(ctx, options, seen, { remoteId, reconcile: false }),
+			);
 		}
-		await settle("charges", () => settleCustomerCharges(ctx, options, seen, now));
+		await settle("charges", async () => {
+			charges = await settleCustomerCharges(ctx, options, seen, now, { reconcile: false });
+			return charges;
+		});
 	}
 
 	// 2. Decisions, under the lock on the row as it is now.
@@ -1963,13 +1987,23 @@ export async function syncSubscription(
 				}
 				return;
 			}
-			if (!current.mollieCustomerId || !needsRemoteCheck(current, now)) return;
+			const customerId = current.mollieCustomerId;
+			if (!customerId || !needsRemoteCheck(current, now)) return;
 			checkedRemote = true;
-			const remote = mollieSubscription as MollieSubscription | null;
-			if (remote) {
+			const remoteId = current.mollieSubscriptionId;
+			if (remoteId) {
 				const before = current;
+				// Read under the lock, so it is never older than the row it is applied to.
 				await step("mollie status", async () => {
-					events.push(...(await reconcileMollieSubscription(ctx, options, before, remote, lock)));
+					const remote = await gateway
+						.getSubscription(customerId, remoteId)
+						.catch((error: unknown) => {
+							if (isMollieNotFound(error)) return null;
+							throw error;
+						});
+					if (remote) {
+						events.push(...(await reconcileMollieSubscription(ctx, options, before, remote, lock)));
+					}
 				});
 			}
 			// First adopt or create the right Mollie subscription (this also finishes
@@ -1977,7 +2011,8 @@ export async function syncSubscription(
 			// each on the row as it is after the previous step.
 			await step("mollie", async () => {
 				const fresh = await reload(ctx, initial.id);
-				if (fresh) await reconcileRemote(ctx, options, fresh, now, lock);
+				const known = certain ? charges : undefined;
+				if (fresh) await reconcileRemote(ctx, options, fresh, now, lock, { charges: known });
 			});
 			await step("orphans", async () => {
 				const fresh = await reload(ctx, initial.id);
