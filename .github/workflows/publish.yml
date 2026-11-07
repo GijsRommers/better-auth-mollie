@@ -74,7 +74,8 @@ jobs:
             [ "$attempt" = 3 ] && exit 1
             sleep 10
           done
-          case "$version" in
+          # Build metadata (+...) does not count.
+          case "${version%%+*}" in
             *-alpha*) tag=alpha ;;
             *-beta*) tag=beta ;;
             *-rc*) tag=rc ;;
