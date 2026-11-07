@@ -1402,3 +1402,165 @@ describe("re-check of ff9b5be: vanished subscriptions, checkout races", () => {
 		expect(active).toHaveLength(1);
 	});
 });
+
+describe("re-check of bfe76d6: uncertain discovery, replacement rows, unlocked writers, contention", () => {
+	async function until(condition: () => boolean) {
+		for (let i = 0; i < 500 && !condition(); i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	}
+
+	it("never makes a subscription delinquent while its charges could not be checked", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(addDays(periodEnd, 15));
+		// The renewal was paid at Mollie; its webhook never came, and looking it up fails.
+		env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		env.fake.failNext("subscriptions.listPayments", new TypeError("fetch failed"));
+		env.fake.failNext("customers.listPayments", new TypeError("fetch failed"));
+
+		const first = await syncMollieSubscriptions(env.auth as never);
+		expect(first.errors.length).toBeGreaterThan(0);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+
+		await syncMollieSubscriptions(env.auth as never);
+		const row = await env.subscription(subscription.id);
+		expect(row.status).toBe("active");
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+	});
+
+	it("issues a checkout for a replacement row under that row's own lock", async () => {
+		const env = await setup();
+		const { payment: abandoned } = await env.checkout("starter");
+		env.fake.completePayment(abandoned.id, "failed");
+
+		// Request A finds the row expired and creates a replacement, then stalls.
+		const adapter = env.context.adapter as any;
+		const original = adapter.create.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.create = async (args: any) => {
+			const result = await original(args);
+			if (args.model === "subscription") {
+				adapter.create = original;
+				reached();
+				await gate;
+			}
+			return result;
+		};
+		const requestA = env.api
+			.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await paused;
+		// Meanwhile B checks out on the replacement, and that attempt fails.
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		const attemptB = [...env.fake.payments.values()].at(-1)!;
+		env.fake.completePayment(attemptB.id, "failed");
+		await env.webhook(`id=${attemptB.id}`);
+		release();
+		await requestA;
+		adapter.create = original;
+
+		const issuedA = [...env.fake.payments.values()].at(-1)!;
+		expect(issuedA.id).not.toBe(attemptB.id);
+		env.fake.completePayment(issuedA.id, "paid");
+		await env.webhook(`id=${issuedA.id}`);
+		expect(refundedIds(env)).toEqual([]);
+		expect((await env.subscriptions()).filter((s) => s.status === "active")).toHaveLength(1);
+	});
+
+	it("never lets a stale Mollie subscription webhook undo a newer plan change", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "business");
+		// The merchant canceled the Mollie subscription; its webhook is being processed.
+		env.fake.setSubscriptionStatus(subscription.mollieSubscriptionId!, "canceled");
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "subscription" && args.set?.cancelAtPeriodEnd === true) {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const webhook = env.webhook(`id=${subscription.mollieSubscriptionId}`);
+		await paused;
+		// Meanwhile the customer schedules a downgrade (creating its Mollie
+		// subscription fails for now).
+		env.fake.failNext("subscriptions.create", new TypeError("fetch failed"));
+		const during = await env.api
+			.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		release();
+		await webhook;
+		adapter.incrementOne = original;
+		if (during instanceof Error) {
+			await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		}
+
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			pendingPlan: "starter",
+			cancelAtPeriodEnd: false,
+		});
+	});
+
+	it("does not cancel a Mollie subscription it just adopted when finishing the sync fails", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "business");
+		env.fake.afterNextCreate("subscriptions.create", () => {
+			throw new TypeError("socket hang up");
+		});
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		const [adoptable] = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		travel(Date.now() + 15 * 60_000);
+
+		// Adopting succeeds, recording that Mollie is in line fails.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "subscription" && args.set?.mollieSyncNeeded === false) {
+				adapter.incrementOne = original;
+				throw new Error("database unavailable");
+			}
+			return original(args);
+		};
+		await syncMollieSubscriptions(env.auth as never);
+		adapter.incrementOne = original;
+
+		expect((await env.subscription(subscription.id)).mollieSubscriptionId).toBe(adoptable!.id);
+		expect(env.fake.subscriptions.get(adoptable!.id)?.status).toBe("active");
+	});
+
+	it("does not hold the subscription while the sync looks up charges at Mollie", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
+		const { headers } = await env.signInWithTestUser();
+		const lookups = env.fake.callsTo("customers.listPayments").length;
+		const releaseLookup = env.fake.hold("customers.listPayments", "arrival");
+		const sync = syncMollieSubscriptions(env.auth as never);
+		await until(() => env.fake.callsTo("customers.listPayments").length > lookups);
+
+		// A slow lookup does not block the customer.
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers });
+		releaseLookup();
+		await sync;
+		expect((await env.subscription(subscription.id)).cancelAtPeriodEnd).toBe(true);
+	});
+});

@@ -313,6 +313,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			},
 			async listPayments(request: { customerId: string; limit?: number }) {
 				record("customers.listPayments", [request]);
+				await takeHold("customers.listPayments", "arrival");
 				return paginate(
 					"payments",
 					[...payments.values()]

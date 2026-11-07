@@ -50,6 +50,8 @@ export async function setup(input: SetupOptions = {}) {
 	const authorizeReference = vi.fn(async (..._args: any[]) => true);
 	const pluginOptions = {
 		mollieClient: fake.client,
+		// Short, so tests of a busy subscription (409, OPERATION_IN_PROGRESS) stay fast.
+		lockWaitMs: 300,
 		subscription: {
 			enabled: true as const,
 			plans: PLANS,

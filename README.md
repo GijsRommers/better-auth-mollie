@@ -226,7 +226,7 @@ For user billing, `authorizeReference` is only needed to let a user act on a `re
 
 Mollie's webhook only carries an id (`id=tr_…`). The plugin ignores everything else in the request and fetches the payment or subscription from the Mollie API, so a forged webhook cannot change anything. Processing is idempotent: a payment's status only moves forward, hooks run at most once per change, and repeated or out-of-order deliveries are harmless.
 
-Your hooks run in the background, after the response, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. The webhook itself makes a few Mollie requests, each limited by `requestTimeoutMs` (10 seconds by default). Mollie waits 15 seconds for an answer, so keep that timeout low; a webhook that times out or fails is retried by Mollie, and the sync catches up on anything left over. If something fails (Mollie unreachable), the endpoint answers with an error so that Mollie retries. Payments and changes to the same subscription are processed one at a time; a webhook that finds its subscription busy for more than two seconds gets `409`, and Mollie retries it.
+Your hooks run in the background, after the response, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. The webhook itself makes a few Mollie requests, each limited by `requestTimeoutMs` (10 seconds by default). Mollie waits 15 seconds for an answer, so keep that timeout low; a webhook that times out or fails is retried by Mollie, and the sync catches up on anything left over. If something fails (Mollie unreachable), the endpoint answers with an error so that Mollie retries. Payments and changes to the same subscription are processed one at a time; a webhook that finds its subscription busy for longer than `lockWaitMs` gets `409`, and Mollie retries it.
 
 **Local development:** Mollie rejects webhook URLs it cannot reach, such as `localhost`. When `baseURL` is local, the plugin sends no webhook URL and logs a warning. The success redirect then syncs the first payment, and the cron syncs everything else. To receive webhooks locally, use a tunnel and point `webhookUrl` at it:
 
@@ -415,27 +415,28 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 
 ## Options
 
-| Option                                                                  | Default                     |                                                                     |
-| ----------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------- |
-| `mollieClient`                                                          | required                    | `new Client({ security: { apiKey } })` from `mollie-api-typescript` |
-| `webhookUrl`                                                            | `${baseURL}/mollie/webhook` | Override, for example for a tunnel                                  |
-| `requestTimeoutMs`                                                      | `10000`                     | Per Mollie request; the SDK has no timeout of its own               |
-| `createCustomerOnSignUp`                                                | `false`                     | Otherwise customers are created at the first checkout               |
-| `getCustomerCreateParams`, `onCustomerCreate`                           |                             | Customize the Mollie customer for users                             |
-| `organization.getCustomerCreateParams`, `organization.onCustomerCreate` |                             | The same, for organizations                                         |
-| `subscription.enabled`                                                  |                             |                                                                     |
-| `subscription.plans`                                                    | required                    | Array or (async) function                                           |
-| `subscription.customerType`                                             | `"organization"`            | Default billed party                                                |
-| `subscription.authorizeReference`                                       |                             | Required for organization billing                                   |
-| `subscription.requireEmailVerification`                                 | `false`                     |                                                                     |
-| `subscription.verificationAmount`                                       | `"0.02"`                    | First payment of a trial; `"0.00"` works for cards and PayPal       |
-| `subscription.gracePeriodDays`                                          | `14`                        | `past_due` keeps access this long                                   |
-| `subscription.getFirstPaymentParams`                                    |                             | For example `{ method: "creditcard" }`                              |
-| `subscription.tax`                                                      |                             | See [VAT](#vat)                                                     |
-| `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                     |
-| `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                 |
-| `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                           |
-| `schema`                                                                |                             | Rename tables and fields                                            |
+| Option                                                                  | Default                     |                                                                                                                                 |
+| ----------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `mollieClient`                                                          | required                    | `new Client({ security: { apiKey } })` from `mollie-api-typescript`                                                             |
+| `webhookUrl`                                                            | `${baseURL}/mollie/webhook` | Override, for example for a tunnel                                                                                              |
+| `requestTimeoutMs`                                                      | `10000`                     | Per Mollie request; the SDK has no timeout of its own                                                                           |
+| `lockWaitMs`                                                            | `5000`                      | How long a request or webhook waits for a busy subscription before `OPERATION_IN_PROGRESS` (webhooks: `409`, retried by Mollie) |
+| `createCustomerOnSignUp`                                                | `false`                     | Otherwise customers are created at the first checkout                                                                           |
+| `getCustomerCreateParams`, `onCustomerCreate`                           |                             | Customize the Mollie customer for users                                                                                         |
+| `organization.getCustomerCreateParams`, `organization.onCustomerCreate` |                             | The same, for organizations                                                                                                     |
+| `subscription.enabled`                                                  |                             |                                                                                                                                 |
+| `subscription.plans`                                                    | required                    | Array or (async) function                                                                                                       |
+| `subscription.customerType`                                             | `"organization"`            | Default billed party                                                                                                            |
+| `subscription.authorizeReference`                                       |                             | Required for organization billing                                                                                               |
+| `subscription.requireEmailVerification`                                 | `false`                     |                                                                                                                                 |
+| `subscription.verificationAmount`                                       | `"0.02"`                    | First payment of a trial; `"0.00"` works for cards and PayPal                                                                   |
+| `subscription.gracePeriodDays`                                          | `14`                        | `past_due` keeps access this long                                                                                               |
+| `subscription.getFirstPaymentParams`                                    |                             | For example `{ method: "creditcard" }`                                                                                          |
+| `subscription.tax`                                                      |                             | See [VAT](#vat)                                                                                                                 |
+| `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                                                                                 |
+| `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                                                                             |
+| `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                       |
+| `schema`                                                                |                             | Rename tables and fields                                                                                                        |
 
 Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND` and `SUBSCRIPTION_PERIOD_ENDED`.
 

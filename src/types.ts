@@ -484,6 +484,13 @@ export interface MollieOptions {
 	 */
 	requestTimeoutMs?: number | undefined;
 	/**
+	 * How long a request or webhook waits for a subscription that is busy
+	 * (another payment, a plan change, the sync) before giving up with
+	 * `OPERATION_IN_PROGRESS` (a webhook then gets 409 and Mollie retries).
+	 * @default 5000
+	 */
+	lockWaitMs?: number | undefined;
+	/**
 	 * Create a Mollie customer when a user signs up.
 	 * @default false
 	 */

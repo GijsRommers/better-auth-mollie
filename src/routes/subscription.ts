@@ -3,10 +3,10 @@ import { APIError, createAuthEndpoint, originCheck } from "better-auth/api";
 import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
-	applyTimeTransitions,
+	applyDueTransitions,
 	findSubscription,
 	guardedUpdate,
-	LOCK_WAIT_MS,
+	lockWaitMs,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
@@ -144,6 +144,7 @@ async function findOpenCheckout(
  */
 function lockSubscription<T>(
 	ctx: GenericEndpointContext,
+	options: MollieOptions,
 	subscription: Subscription,
 	fn: (fresh: Subscription, lock: SubscriptionLock) => Promise<T>,
 ): Promise<T> {
@@ -155,7 +156,7 @@ function lockSubscription<T>(
 			if (!fresh) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			return fn(fresh, lock);
 		},
-		{ waitMs: LOCK_WAIT_MS },
+		{ waitMs: lockWaitMs(options) },
 	).catch((error: unknown) => {
 		throw toAPIError(error, MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 	});
@@ -533,7 +534,13 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			if (current) {
 				// A period that ended (e.g. after a cancellation) ends the subscription
 				// first; then this request starts a new one.
-				const timed = await applyTimeTransitions(ctx, options, current, new Date());
+				const timed = await applyDueTransitions(
+					ctx,
+					options,
+					current,
+					new Date(),
+					lockWaitMs(options),
+				);
 				dispatchEvents(ctx, options, timed.events);
 				current = BILLING_STATUSES.includes(timed.subscription.status)
 					? timed.subscription
@@ -559,7 +566,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					recovery
 						? (row.status !== "past_due" && row.status !== "unpaid") || !!row.cancelAtPeriodEnd
 						: row.status === "active" || row.status === "trialing";
-				return lockSubscription(ctx, candidate, async (fresh, lock) => {
+				const issued = await lockSubscription(ctx, options, candidate, async (fresh, lock) => {
 					let row = fresh;
 					// Activated (another tab, the webhook) or recovered meanwhile.
 					if (settled(row)) return respond(body.successUrl);
@@ -597,26 +604,28 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						row = (await findSubscription(ctx, [{ field: "id", value: row.id }])) ?? row;
 						if (settled(row)) return respond(body.successUrl);
 					}
-					let target = row;
 					if (!recovery && row.status !== "incomplete") {
-						// The checkout expired meanwhile: start over on a new row.
-						target = await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
-							model: "subscription",
-							data: {
-								referenceId,
-								plan: planName,
-								status: "incomplete",
-								mollieCustomerId: input.customerId,
-								customerType,
-								cancelAtPeriodEnd: false,
-								createdAt: new Date(),
-								updatedAt: new Date(),
-							},
-						});
+						// The checkout expired meanwhile: start over on a new row, under
+						// that row's own lock.
+						return {
+							restart: await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
+								model: "subscription",
+								data: {
+									referenceId,
+									plan: planName,
+									status: "incomplete",
+									mollieCustomerId: input.customerId,
+									customerType,
+									cancelAtPeriodEnd: false,
+									createdAt: new Date(),
+									updatedAt: new Date(),
+								},
+							}),
+						};
 					}
 					await lock.fence();
 					const url = await createCheckout(ctx, options, {
-						row: target,
+						row,
 						plan,
 						amount,
 						tax,
@@ -630,6 +639,10 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					});
 					return ctx.json({ url, redirect: !body.disableRedirect });
 				});
+				if (issued && typeof issued === "object" && "restart" in issued) {
+					return checkout(issued.restart as Subscription, input);
+				}
+				return issued;
 			};
 
 			if (current) {
@@ -656,7 +669,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						(await getOrCreateCustomer(ctx, options, { customerType, referenceId }));
 					return checkout(current, { purpose: "recovery", trialDays: 0, customerId });
 				}
-				await lockSubscription(ctx, current, async (fresh, lock) => {
+				await lockSubscription(ctx, options, current, async (fresh, lock) => {
 					if (!ACCESS_STATUSES.includes(fresh.status)) {
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
 					}
@@ -853,7 +866,7 @@ export const cancelSubscription = (options: MollieOptions) =>
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
 			if (!subscription.cancelAtPeriodEnd) {
-				await lockSubscription(ctx, subscription, async (fresh, lock) => {
+				await lockSubscription(ctx, options, subscription, async (fresh, lock) => {
 					if (fresh.cancelAtPeriodEnd || !BILLING_STATUSES.includes(fresh.status)) return;
 					// The cancellation is recorded first, so it can never be lost: if
 					// stopping the Mollie subscription fails or is interrupted, the
@@ -919,7 +932,7 @@ export const restoreSubscription = (options: MollieOptions) =>
 			if (!subscription) {
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
-			const restored = await lockSubscription(ctx, subscription, (fresh, lock) =>
+			const restored = await lockSubscription(ctx, options, subscription, (fresh, lock) =>
 				restore(ctx, options, fresh, lock),
 			);
 			return ctx.json(withLimits(restored, await getPlans(options)));
@@ -962,7 +975,8 @@ export const listActiveSubscriptions = (options: MollieOptions) =>
 			// Apply clock-based changes (period ended, scheduled plan change) so
 			// the answer is right even before the app's cron has run.
 			for (const subscription of await referenceSubscriptions(ctx, referenceId)) {
-				const timed = await applyTimeTransitions(ctx, options, subscription, now);
+				// Without waiting: a busy subscription is listed as it is.
+				const timed = await applyDueTransitions(ctx, options, subscription, now, 0);
 				dispatchEvents(ctx, options, timed.events);
 				subscriptions.push(timed.subscription);
 			}

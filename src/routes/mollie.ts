@@ -4,8 +4,8 @@ import { APIError, createAuthEndpoint, getSessionFromCtx, originCheck } from "be
 import * as z from "zod";
 import {
 	findSubscription,
+	processMollieSubscription,
 	processPayment,
-	reconcileMollieSubscription,
 	syncAllSubscriptions,
 	syncSubscription,
 } from "../billing";
@@ -58,16 +58,7 @@ async function handleWebhookResource(
 		if (result.ignored) ctx.context.logger.info(`[mollie] Webhook for ${id}: ${result.ignored}`);
 		return result.events;
 	}
-	const subscription = await findSubscription(ctx, [{ field: "mollieSubscriptionId", value: id }]);
-	if (!subscription?.mollieCustomerId) return [];
-	let mollieSubscription: Awaited<ReturnType<typeof gateway.getSubscription>>;
-	try {
-		mollieSubscription = await gateway.getSubscription(subscription.mollieCustomerId, id);
-	} catch (error) {
-		if (isMollieNotFound(error)) return [];
-		throw error;
-	}
-	return reconcileMollieSubscription(ctx, options, subscription, mollieSubscription);
+	return processMollieSubscription(ctx, options, id);
 }
 
 /**

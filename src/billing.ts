@@ -116,10 +116,10 @@ export async function guardedUpdate(
 }
 
 /** Flags the row for another reconcile (e.g. one that had to be postponed). */
-async function flagMollieSync(ctx: Ctx, id: string): Promise<void> {
+async function flagMollieSync(ctx: Ctx, id: string, lock: SubscriptionLock): Promise<void> {
 	await ctx.context.adapter.incrementOne<Subscription>({
 		model: "subscription",
-		where: [{ field: "id", value: id }],
+		where: [{ field: "id", value: id }, ...lock.held()],
 		increment: {},
 		set: { mollieSyncNeeded: true },
 	});
@@ -133,6 +133,7 @@ async function markMollieSynced(
 	ctx: Ctx,
 	seen: Subscription,
 	result: Subscription,
+	lock: SubscriptionLock,
 ): Promise<Subscription> {
 	if (!seen.mollieSyncNeeded) return result;
 	const cleared = await ctx.context.adapter.incrementOne<Subscription>({
@@ -140,6 +141,7 @@ async function markMollieSynced(
 		where: [
 			{ field: "id", value: seen.id },
 			{ field: "mollieSyncRevision", value: seen.mollieSyncRevision ?? 0 },
+			...lock.held(),
 		],
 		increment: {},
 		set: { mollieSyncNeeded: false },
@@ -442,12 +444,14 @@ export async function processPayment(
 			const fresh = (await reload(ctx, target.id)) ?? target;
 			return applyPayment(ctx, options, payment, fresh, lock, opts.reconcile ?? true);
 		},
-		{ waitMs: LOCK_WAIT_MS },
+		{ waitMs: lockWaitMs(options) },
 	);
 }
 
 /** How long a payment (or a request) waits for a subscription that is busy. */
-export const LOCK_WAIT_MS = 2000;
+export function lockWaitMs(options: MollieOptions): number {
+	return options.lockWaitMs ?? 5000;
+}
 
 async function applyPayment(
 	ctx: Ctx,
@@ -1310,9 +1314,9 @@ export async function reconcileRemote(
 ): Promise<Subscription> {
 	const fence = lock.fence;
 	const settled = (result: Subscription = subscription) =>
-		markMollieSynced(ctx, subscription, result);
+		markMollieSynced(ctx, subscription, result, lock);
 	const postpone = async () => {
-		await flagMollieSync(ctx, subscription.id);
+		await flagMollieSync(ctx, subscription.id, lock);
 		return subscription;
 	};
 	const again = async (latest: Subscription | null) => {
@@ -1626,6 +1630,7 @@ export async function applyTimeTransitions(
 	subscription: Subscription,
 	now: Date,
 	lock?: SubscriptionLock,
+	delinquency = true,
 ): Promise<{ subscription: Subscription; events: BillingEvent[] }> {
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	if (!periodEnd || !BILLING_STATUSES.includes(subscription.status)) {
@@ -1668,9 +1673,13 @@ export async function applyTimeTransitions(
 			],
 			{ lock },
 		);
-		if (switched) return applyTimeTransitions(ctx, options, switched, now, lock);
+		if (switched) return applyTimeTransitions(ctx, options, switched, now, lock, delinquency);
 	}
-	if (subscription.status === "past_due" && now >= addDays(periodEnd, gracePeriodDays(options))) {
+	if (
+		delinquency &&
+		subscription.status === "past_due" &&
+		now >= addDays(periodEnd, gracePeriodDays(options))
+	) {
 		const unpaid = await guardedUpdate(
 			ctx,
 			subscription.id,
@@ -1682,6 +1691,82 @@ export async function applyTimeTransitions(
 		return { subscription: unpaid ?? subscription, events: [] };
 	}
 	return { subscription, events: [] };
+}
+
+/**
+ * Applies due clock transitions (end at period end, scheduled plan change)
+ * under the subscription's lock on a fresh read, for requests that need the
+ * current state. Being past due long enough (`unpaid`) is left to the sync,
+ * which first makes sure no paid charge is still unprocessed. Returns the
+ * row unchanged if nothing is due, or if the subscription stays busy for
+ * longer than `waitMs`.
+ */
+export async function applyDueTransitions(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscription: Subscription,
+	now: Date,
+	waitMs: number,
+): Promise<{ subscription: Subscription; events: BillingEvent[] }> {
+	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	const due =
+		!!periodEnd &&
+		now >= periodEnd &&
+		BILLING_STATUSES.includes(subscription.status) &&
+		(!!subscription.cancelAtPeriodEnd || !!subscription.pendingPlan);
+	if (!due) return { subscription, events: [] };
+	try {
+		return await withSubscriptionLock(
+			ctx,
+			subscription.id,
+			async (lock) => {
+				const fresh = (await reload(ctx, subscription.id)) ?? subscription;
+				return applyTimeTransitions(ctx, options, fresh, now, lock, false);
+			},
+			{ waitMs },
+		);
+	} catch (error) {
+		if (error instanceof OperationInProgressError) return { subscription, events: [] };
+		throw error;
+	}
+}
+
+/**
+ * A webhook for a Mollie subscription (e.g. Mollie suspended or canceled it):
+ * its status is read from Mollie, then applied under the subscription's lock
+ * to the row as it is now.
+ */
+export async function processMollieSubscription(
+	ctx: Ctx,
+	options: MollieOptions,
+	mollieSubscriptionId: string,
+): Promise<BillingEvent[]> {
+	const initial = await findSubscription(ctx, [
+		{ field: "mollieSubscriptionId", value: mollieSubscriptionId },
+	]);
+	const customerId = initial?.mollieCustomerId;
+	if (!initial || !customerId) return [];
+	let mollieSubscription: MollieSubscription;
+	try {
+		mollieSubscription = await gatewayFor(options).getSubscription(
+			customerId,
+			mollieSubscriptionId,
+		);
+	} catch (error) {
+		if (isMollieNotFound(error)) return [];
+		throw error;
+	}
+	return withSubscriptionLock(
+		ctx,
+		initial.id,
+		async (lock) => {
+			const fresh = await reload(ctx, initial.id);
+			return fresh
+				? reconcileMollieSubscription(ctx, options, fresh, mollieSubscription, lock)
+				: [];
+		},
+		{ waitMs: lockWaitMs(options) },
+	);
 }
 
 /** Mollie subscriptions younger than this may still be adopted by a running change. */
@@ -1770,17 +1855,34 @@ async function outstandingPayments(
 }
 
 /**
- * Brings one subscription up to date with Mollie and the clock:
+ * Whether the sync looks at Mollie for this subscription: around its next
+ * payment date (from one day before `periodEnd`), when delinquent, or when a
+ * change still has to reach Mollie. Other subscriptions are not fetched.
+ */
+function needsRemoteCheck(subscription: Subscription, now: Date): boolean {
+	if (!BILLING_STATUSES.includes(subscription.status)) return false;
+	const stable =
+		(subscription.status === "active" || subscription.status === "trialing") &&
+		!subscription.mollieSyncNeeded;
+	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	return !(stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS);
+}
+
+/**
+ * Brings one subscription up to date with Mollie and the clock, in two parts:
  *
- * - payments that are not final yet (open checkouts, a pro-rata charge
- *   whose webhook was missed), and paid payments whose outcome is not
- *   settled (not applied yet, or a refund still due) are (re)processed;
- * - clock-based transitions are applied;
- * - from one day before `periodEnd` (Mollie's next payment date), always
- *   for delinquent subscriptions, and whenever a change still has to reach
- *   Mollie (`mollieSyncNeeded`), Mollie is checked: subscription status,
- *   recent payments, orphans, and `ensureRemote` (plan, mandate, VAT).
- *   Other subscriptions are not fetched.
+ * 1. Without holding the subscription (each payment takes its lock briefly):
+ *    payments that are outstanding locally are processed; and when Mollie is
+ *    checked (see `needsRemoteCheck`), its subscription status is read and
+ *    charges whose webhook never arrived are found and processed.
+ * 2. Under the subscription's lock, on the row as it is now: clock-based
+ *    transitions, Mollie's status, bringing Mollie in line (`reconcileRemote`)
+ *    and stray Mollie subscriptions. Being past due (or unpaid) is only
+ *    decided when part 1 established every charge: a renewal that was paid
+ *    but could not be processed must never cost the customer access.
+ *
+ * Each step runs on its own: one that fails is reported and retried by the
+ * next sync without holding up the others.
  */
 export async function syncSubscription(
 	ctx: Ctx,
@@ -1792,19 +1894,25 @@ export async function syncSubscription(
 	const events: BillingEvent[] = [];
 	const errors: string[] = [];
 	let checkedRemote = false;
-	// Each step on its own: one that cannot be done now (a payment that fails
-	// to process, Mollie unreachable) is reported and retried by the next
-	// sync, and does not hold up the others. A busy subscription is skipped.
+	let certain = true;
 	const step = async (label: string, fn: () => Promise<void>) => {
 		try {
 			await fn();
 		} catch (error) {
-			if (error instanceof OperationInProgressError) return;
-			errors.push(`${label}: ${errorMessage(error)}`);
+			certain = false;
+			if (!(error instanceof OperationInProgressError)) {
+				errors.push(`${label}: ${errorMessage(error)}`);
+			}
 		}
 	};
-	const collect = (settlement: Settlement) => errors.push(...settlement.errors);
+	const settle = (label: string, fn: () => Promise<Settlement>) =>
+		step(label, async () => {
+			const settlement = await fn();
+			errors.push(...settlement.errors);
+			if (settlement.inProgress || settlement.errors.length > 0) certain = false;
+		});
 
+	// 1. Payments, without holding the subscription.
 	for (const record of await outstandingPayments(ctx, initial.id)) {
 		checkedRemote = true;
 		await step(record.molliePaymentId, async () => {
@@ -1812,78 +1920,70 @@ export async function syncSubscription(
 			events.push(...(await processPayment(ctx, options, payment)).events);
 		});
 	}
+	const seen = (await reload(ctx, initial.id)) ?? initial;
+	let mollieSubscription: MollieSubscription | null = null;
+	const customerId = seen.mollieCustomerId;
+	if (customerId && needsRemoteCheck(seen, now)) {
+		checkedRemote = true;
+		const remoteId = seen.mollieSubscriptionId;
+		if (remoteId) {
+			await step("mollie subscription", async () => {
+				mollieSubscription = await gateway
+					.getSubscription(customerId, remoteId)
+					.catch((error: unknown) => {
+						if (isMollieNotFound(error)) return null;
+						throw error;
+					});
+			});
+			await settle("recent charges", () => settleRecentCharges(ctx, options, seen, remoteId));
+		}
+		await settle("charges", () => settleCustomerCharges(ctx, options, seen, now));
+	}
 
-	// Everything else under the subscription's lock, on the row as it is now,
-	// so no decision below acts on a stale read.
+	// 2. Decisions, under the lock on the row as it is now.
 	await step(initial.id, () =>
 		withSubscriptionLock(ctx, initial.id, async (lock) => {
-			let subscription = await reload(ctx, initial.id);
-			if (!subscription) return;
-			if (subscription.status === "incomplete") {
-				await expireCheckout(ctx, subscription, lock);
+			let current = await reload(ctx, initial.id);
+			if (!current) return;
+			if (current.status === "incomplete") {
+				await expireCheckout(ctx, current, lock);
 				return;
 			}
-			if (BILLING_STATUSES.includes(subscription.status)) {
-				const timed = await applyTimeTransitions(ctx, options, subscription, now, lock);
+			if (BILLING_STATUSES.includes(current.status)) {
+				const timed = await applyTimeTransitions(ctx, options, current, now, lock, false);
 				events.push(...timed.events);
-				subscription = timed.subscription;
+				current = timed.subscription;
 			}
-			if (!BILLING_STATUSES.includes(subscription.status)) {
+			if (!BILLING_STATUSES.includes(current.status)) {
 				// Ended: make sure nothing at Mollie still bills it (e.g. a cancellation
 				// that failed at Mollie, or a replacement whose creation was lost).
-				if (subscription.mollieSyncNeeded) {
+				if (current.mollieSyncNeeded) {
 					checkedRemote = true;
-					await reconcileRemote(ctx, options, subscription, now, lock);
+					await reconcileRemote(ctx, options, current, now, lock);
 				}
 				return;
 			}
-			const customerId = subscription.mollieCustomerId;
-			if (!customerId) return;
-
-			const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
-			const stable =
-				(subscription.status === "active" || subscription.status === "trialing") &&
-				!subscription.mollieSyncNeeded;
-			if (stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS) return;
-
+			if (!current.mollieCustomerId || !needsRemoteCheck(current, now)) return;
 			checkedRemote = true;
-			const current = subscription;
-			if (current.mollieSubscriptionId) {
-				const remoteId = current.mollieSubscriptionId;
-				await step("mollie subscription", async () => {
-					try {
-						const mollieSubscription = await gateway.getSubscription(customerId, remoteId);
-						events.push(
-							...(await reconcileMollieSubscription(
-								ctx,
-								options,
-								current,
-								mollieSubscription,
-								lock,
-							)),
-						);
-					} catch (error) {
-						if (!isMollieNotFound(error)) throw error;
-					}
-				});
-				await step("recent charges", async () => {
-					collect(await settleRecentCharges(ctx, options, current, remoteId, lock));
+			const remote = mollieSubscription as MollieSubscription | null;
+			if (remote) {
+				const before = current;
+				await step("mollie status", async () => {
+					events.push(...(await reconcileMollieSubscription(ctx, options, before, remote, lock)));
 				});
 			}
-			// Charges for this row by a stray or replaced Mollie subscription, or
-			// pro-rata charges, whose webhook never arrived.
-			await step("charges", async () => {
-				collect(await settleCustomerCharges(ctx, options, current, now, lock));
-			});
 			// First adopt or create the right Mollie subscription (this also finishes
-			// an interrupted change), then cancel anything else tagged for this row.
+			// an interrupted change), then cancel anything else tagged for this row,
+			// each on the row as it is after the previous step.
 			await step("mollie", async () => {
-				const fresh = (await reload(ctx, initial.id)) ?? current;
-				subscription = await reconcileRemote(ctx, options, fresh, now, lock);
+				const fresh = await reload(ctx, initial.id);
+				if (fresh) await reconcileRemote(ctx, options, fresh, now, lock);
 			});
 			await step("orphans", async () => {
-				await cancelOrphans(ctx, options, subscription ?? current, now, lock);
+				const fresh = await reload(ctx, initial.id);
+				if (fresh) await cancelOrphans(ctx, options, fresh, now, lock);
 			});
+			if (!certain) return;
 
 			let latest = (await reload(ctx, initial.id)) ?? current;
 			const grace = gracePeriodDays(options);
