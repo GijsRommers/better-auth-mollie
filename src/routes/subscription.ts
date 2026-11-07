@@ -56,7 +56,6 @@ import {
 	errorMessage,
 	findPlan,
 	getCheckedPlans,
-	getPlanByName,
 	getPlans,
 	getUrl,
 	getWebhookUrl,
@@ -397,6 +396,8 @@ async function changePlan(
 	plan: MolliePlan,
 	customerType: CustomerType,
 	lock: SubscriptionLock,
+	/** The checked plans `plan` comes from: the old plan is priced from them too. */
+	plans: MolliePlan[],
 ) {
 	// Charges Mollie finished but whose webhook is late (a renewal) change
 	// the period this change is priced and scheduled from: apply them first.
@@ -410,7 +411,7 @@ async function changePlan(
 	}
 	const now = new Date();
 	const planName = plan.name.toLowerCase();
-	const oldPlan = await getPlanByName(options, current.plan);
+	const oldPlan = findPlan(plans, current.plan);
 	const sameTerms =
 		!!oldPlan &&
 		planCurrency(oldPlan) === planCurrency(plan) &&
@@ -618,7 +619,8 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			}
 			// Loaded once and checked where money is asked for; payments already
 			// made are processed with the plans as they are.
-			const plan = findPlan(await getCheckedPlans(options), body.plan);
+			const plans = await getCheckedPlans(options);
+			const plan = findPlan(plans, body.plan);
 			if (!plan) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
 			const planName = plan.name.toLowerCase();
 			// An archived plan stays for the subscriptions already on it.
@@ -810,7 +812,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					if (fresh.pendingPlan === planName && !fresh.cancelAtPeriodEnd) return fresh;
 					refuseArchived();
 					return whileCancellationHolds(ctx, options, fresh, () =>
-						changePlan(ctx, options, fresh, plan, customerType, lock),
+						changePlan(ctx, options, fresh, plan, customerType, lock, plans),
 					);
 				});
 				return respond(body.returnUrl ?? body.successUrl);

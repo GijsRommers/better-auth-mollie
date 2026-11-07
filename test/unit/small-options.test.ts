@@ -195,6 +195,32 @@ describe("plans that change or break", () => {
 		expect(payment.amount.value).toBe("9.95");
 	});
 
+	it("prices an upgrade's old and new plan from the same checked plans", async () => {
+		let armed = false;
+		let calls = 0;
+		const env = await setup({
+			subscription: {
+				// During the upgrade, a second lookup would price the old plan at 0.00.
+				plans: async () =>
+					!armed || ++calls === 1
+						? PLANS
+						: PLANS.map((plan) => (plan.name === "starter" ? { ...plan, amount: "0.00" } : plan)),
+			},
+		});
+		const subscription = await subscribe(env);
+		const start = new Date(subscription.periodStart!).getTime();
+		const end = new Date(subscription.periodEnd!).getTime();
+		travel(start + (end - start) / 2);
+		const { headers } = await env.signInWithTestUser();
+		armed = true;
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers });
+		const proration = [...env.fake.payments.values()].find(
+			(p) => (p.metadata as { purpose?: string }).purpose === "proration",
+		);
+		// Half of (49.00 - 9.95), as in the regular upgrade test.
+		expect(proration?.amount.value).toBe("19.53");
+	});
+
 	it("does not schedule billing from invalid plans when restoring", async () => {
 		let invalid = false;
 		const env = await setup({
