@@ -26,7 +26,7 @@ import { toMollieDate } from "../../src/utils";
 import { changePaymentState, closeBrowser, completeCheckout } from "./checkout-driver";
 
 const apiKey = process.env.MOLLIE_TEST_API_KEY;
-const method = process.env.MOLLIE_TEST_METHOD ?? "creditcard";
+const method = process.env.MOLLIE_TEST_METHOD || "creditcard";
 const BASE_URL = "https://example.com";
 
 /** Mollie test client, plus a way to link a payment to a Mollie subscription. */

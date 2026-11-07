@@ -1,0 +1,43 @@
+name: Publish
+
+# Publishes to npm when a GitHub release is published (tag `v<version>`).
+# Needs the NPM_TOKEN secret, or npm trusted publishing for this workflow.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment to approve each release.
+    environment: npm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - name: The release tag matches package.json
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          if [ "$version" != "$TAG" ]; then
+            echo "Release tag $TAG does not match package.json ($version)"
+            exit 1
+          fi
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm lint:package
+      - run: pnpm publish --provenance --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
