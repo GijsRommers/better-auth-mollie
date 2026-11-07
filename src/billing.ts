@@ -1093,10 +1093,11 @@ async function processUnsettled(
 	const reconcile = how.reconcile ?? !lock;
 	const settlement: Settlement = { inProgress: false, processed: false, errors: [] };
 	for (const payment of payments) {
-		if (!(await isUnsettled(ctx, options, payment))) continue;
-		// Each payment on its own: one that cannot be processed now does not
-		// stop the others. It stays outstanding (and counts as in progress).
+		// Each payment on its own: one that cannot be looked at or processed
+		// now does not stop the others. It stays outstanding (and counts as in
+		// progress).
 		try {
+			if (!(await isUnsettled(ctx, options, payment))) continue;
 			const result = await processPayment(ctx, options, payment, { lock, reconcile });
 			dispatchEvents(ctx, options, result.events);
 			settlement.processed = true;

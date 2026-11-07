@@ -487,19 +487,25 @@ async function settleRecentChargebacks(
 		errors.push({ subscriptionId: "", message: `chargebacks: ${errorMessage(error)}` });
 		ctx.context.logger.error(`[mollie] Listing chargebacks failed: ${errorMessage(error)}`);
 	}
-	// Collected first: checking moves a row out of this selection.
+	// Each recorded chargeback, once a day. Few rows: the time is filtered
+	// here (a null one, from before this column existed, counts as due).
+	// `>= "0"` selects every recorded amount, as amounts are digit strings.
+	const due = addDays(now, -1).getTime();
 	for (let offset = 0; ; offset += PAGE_SIZE) {
 		const page = await ctx.context.adapter.findMany<MolliePaymentRecord>({
 			model: "molliePayment",
 			where: [
-				{ field: "chargebackCheckedAt", operator: "lt", value: addDays(now, -1) },
+				{ field: "amountChargedBack", operator: "gte", value: "0" },
 				{ field: "paidAt", operator: "gte", value: addDays(now, -CHARGEBACK_RECHECK_DAYS) },
 			],
 			sortBy: { field: "molliePaymentId", direction: "asc" },
 			limit: PAGE_SIZE,
 			offset,
 		});
-		for (const record of page) candidates.add(record.molliePaymentId);
+		for (const record of page) {
+			const checkedAt = record.chargebackCheckedAt;
+			if (!checkedAt || new Date(checkedAt).getTime() < due) candidates.add(record.molliePaymentId);
+		}
 		if (page.length < PAGE_SIZE) break;
 	}
 	for (const paymentId of candidates) {
@@ -509,11 +515,16 @@ async function settleRecentChargebacks(
 		try {
 			const recorded = record.amountChargedBack ? toCents(record.amountChargedBack) : 0;
 			if ((await gateway.chargedBackCents(paymentId)) === recorded) {
+				// Only while it is as read: a reversal processed meanwhile wins.
 				if (recorded > 0) {
-					await ctx.context.adapter.update({
+					await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 						model: "molliePayment",
-						where: [{ field: "molliePaymentId", value: paymentId }],
-						update: { chargebackCheckedAt: now },
+						where: [
+							{ field: "molliePaymentId", value: paymentId },
+							{ field: "amountChargedBack", value: record.amountChargedBack ?? null },
+						],
+						increment: {},
+						set: { chargebackCheckedAt: now },
 					});
 				}
 				continue;

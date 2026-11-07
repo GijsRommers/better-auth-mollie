@@ -458,7 +458,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		chargebacks: {
 			async list(request: { paymentId: string; limit?: number }) {
 				record("chargebacks.list", [request]);
-				return paginate(
+				const result = paginate(
 					"chargebacks",
 					[...chargebacks.values()]
 						.filter((c) => c.paymentId === request.paymentId)
@@ -466,6 +466,9 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 						.map(clone),
 					request.limit,
 				);
+				// The response, as it was, on its way back.
+				await takeHold("chargebacks.list", "processing");
+				return result;
 			},
 			async all(request: { limit?: number } = {}) {
 				record("chargebacks.all", [request]);

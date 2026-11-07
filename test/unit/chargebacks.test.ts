@@ -4,6 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { hasActiveSubscription, syncMollieSubscriptions } from "../../src";
+import { settleCustomerCharges } from "../../src/billing";
 import type { Subscription } from "../../src/types";
 import { addDays } from "../../src/utils";
 import { settle, setup, subscribe, type TestEnv, travel } from "../helpers/setup";
@@ -279,6 +280,88 @@ describe("chargebacks", () => {
 		expect((await record()).claimSerial).toBe(claimed);
 		await settle();
 		expect(onChargeback).toHaveBeenCalledTimes(3);
+	});
+
+	it("rechecks a chargeback recorded without a check time", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		await renew(env, subscription);
+		const chargeback = env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		// As recorded before the column existed.
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: first!.id }],
+			update: { chargebackCheckedAt: null },
+		});
+		travel(Date.now() + 130 * 24 * 3_600_000);
+		env.fake.reverseChargeback(chargeback.id);
+
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(2);
+	});
+
+	it("stops checking a chargeback whose reversal arrived while the sync looked at it", async () => {
+		const { env } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		await renew(env, subscription);
+		const chargeback = env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		// Only the daily check still looks at it.
+		travel(Date.now() + 130 * 24 * 3_600_000);
+		const listings = () => env.fake.callsTo("chargebacks.list").length;
+		const before = listings();
+		const release = env.fake.hold("chargebacks.list", "processing");
+		const sync = syncMollieSubscriptions(env.auth as never);
+		await vi.waitFor(() => expect(listings()).toBe(before + 1));
+		env.fake.reverseChargeback(chargeback.id);
+		await env.webhook(`id=${first!.id}`);
+		release();
+		await sync;
+
+		const record = (await env.payments()).find((r) => r.molliePaymentId === first!.id)!;
+		expect(record.amountChargedBack ?? null).toBeNull();
+		expect(record.chargebackCheckedAt ?? null).toBeNull();
+		travel(Date.now() + 25 * 3_600_000);
+		const settled = listings();
+		await syncMollieSubscriptions(env.auth as never);
+		expect(listings()).toBe(settled);
+	});
+
+	it("keeps settling a customer's other charges when looking at one fails", async () => {
+		const { env } = await withChargebackHook();
+		env.fake.reportReversedChargebacks();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		const { payment } = await renew(env, subscription);
+		const one = env.fake.chargeBack(payment.id, "4.00");
+		await env.webhook(`id=${payment.id}`);
+		env.fake.chargeBack(payment.id, "4.00");
+		await env.webhook(`id=${payment.id}`);
+		env.fake.reverseChargeback(one.id);
+		await env.webhook(`id=${payment.id}`);
+		// The first payment's hooks are still due (its delivery stopped).
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: first!.id }],
+			update: { hooksDue: true },
+		});
+
+		// Confirming the renewal's chargeback (listed first, newest) fails.
+		env.fake.failNext("chargebacks.list", new TypeError("fetch failed"));
+		const options = (env.auth.options.plugins as any[]).find((p) => p.id === "mollie").options;
+		const settlement = await settleCustomerCharges(
+			{ context: env.context } as never,
+			options,
+			await env.subscription(subscription.id),
+			new Date(),
+		);
+		expect(settlement.errors).toHaveLength(1);
+		const record = (await env.payments()).find((r) => r.molliePaymentId === first!.id)!;
+		expect(record.hooksDue).toBe(false);
 	});
 
 	it("keeps the grace period of a failed renewal when the period before is charged back", async () => {
