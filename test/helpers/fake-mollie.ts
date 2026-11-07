@@ -143,6 +143,10 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const subscriptions = new Map<string, FakeSubscription>();
 	const mandates = new Map<string, FakeMandate>();
 	const salesInvoices = new Map<string, FakeSalesInvoice>();
+	const refunds = new Map<
+		string,
+		{ id: string; paymentId: string; amount: Amount; metadata: unknown; createdAt: string }
+	>();
 	/** Mollie's stored responses per idempotency key (kept for one hour in reality). */
 	const idempotency = new Map<string, { fingerprint: string; value?: unknown; error?: unknown }>();
 	const inFlight = new Set<string>();
@@ -409,6 +413,30 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				);
 			},
 		},
+		refunds: {
+			create: (request: any) =>
+				idempotent("refunds.create", request, () => {
+					const payment = payments.get(request.paymentId);
+					if (payment?.status !== "paid") throw mollieError(422, "Not refundable");
+					const refund = {
+						id: id("re"),
+						paymentId: request.paymentId,
+						amount: { ...request.refundRequest.amount },
+						metadata: request.refundRequest.metadata ?? null,
+						createdAt: iso(),
+					};
+					refunds.set(refund.id, refund);
+					return refund;
+				}),
+			async list(request: { paymentId: string; limit?: number }) {
+				record("refunds.list", [request]);
+				return paginate(
+					"refunds",
+					[...refunds.values()].filter((r) => r.paymentId === request.paymentId).reverse(),
+					request.limit,
+				);
+			},
+		},
 		salesInvoices: {
 			create: (request: any) =>
 				idempotent("salesInvoices.create", request, () => {
@@ -445,6 +473,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		subscriptions,
 		mandates,
 		salesInvoices,
+		refunds,
 		setNow(now: () => Date) {
 			clock = now;
 		},

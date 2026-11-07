@@ -48,12 +48,13 @@ async function scanForOperationKey<P>(
 	items: (page: P) => Listed[] | undefined,
 	operationKey: string,
 	since: Date,
+	usable: (item: Listed) => boolean = () => true,
 ): Promise<string | null> {
 	const cutoff = since.getTime() - RECOVERY_SLACK_MS;
 	for await (const page of pages) {
 		const list = items(page) ?? [];
 		for (const item of list) {
-			if (metadataOf(item).operationKey === operationKey) return item.id;
+			if (metadataOf(item).operationKey === operationKey && usable(item)) return item.id;
 		}
 		const oldest = list.at(-1);
 		if (!oldest) return null;
@@ -117,11 +118,16 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			client.subscriptions.cancel({ customerId, subscriptionId, idempotencyKey }, options),
 
 		async findSubscriptionByOperationKey(customerId: string, operationKey: string, since: Date) {
+			// A created subscription that has since ended is not a usable result.
 			return scanForOperationKey(
 				await client.subscriptions.list({ customerId, limit: PAGE_LIMIT, sort: "desc" }, options),
 				(page) => page.result.embedded?.subscriptions,
 				operationKey,
 				since,
+				(item) => {
+					const status = (item as { status?: string }).status;
+					return status !== "canceled" && status !== "completed";
+				},
 			);
 		},
 
@@ -151,12 +157,32 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 		): Promise<SalesInvoiceResponse> =>
 			client.salesInvoices.create({ idempotencyKey, salesInvoiceRequest: body }, options),
 
-		async findSalesInvoiceByOperationKey(operationKey: string, since: Date) {
+		async findSalesInvoiceByOperationKey(operationKey: string) {
+			// Mollie does not document this list's order, so scan it completely.
 			return scanForOperationKey(
 				await client.salesInvoices.list({ limit: PAGE_LIMIT }, options),
 				(page) => page.result.embedded?.invoices as Listed[] | undefined,
 				operationKey,
-				since,
+				new Date(0),
+			);
+		},
+
+		createRefund: (
+			paymentId: string,
+			body: {
+				amount: { currency: string; value: string };
+				description: string;
+				metadata: Record<string, unknown>;
+			},
+			idempotencyKey: string,
+		) => client.refunds.create({ paymentId, idempotencyKey, refundRequest: body }, options),
+
+		async findRefundByOperationKey(paymentId: string, operationKey: string) {
+			return scanForOperationKey(
+				await client.refunds.list({ paymentId, limit: PAGE_LIMIT }, options),
+				(page) => page.result.embedded?.refunds as Listed[] | undefined,
+				operationKey,
+				new Date(0),
 			);
 		},
 	};

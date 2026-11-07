@@ -13,6 +13,7 @@ export type BillingEvent =
 	  }
 	| { type: "payment.paid"; data: PaymentHookData }
 	| { type: "payment.failed"; data: PaymentHookData }
+	| { type: "payment.duplicate"; data: PaymentHookData; refunded: boolean }
 	| {
 			type: "subscription.canceled";
 			subscription: Subscription;
@@ -61,6 +62,14 @@ function tasksFor(
 		case "payment.failed": {
 			const fn = hooks?.onPaymentFailed;
 			hook("onPaymentFailed", fn && (() => fn(event.data, ctx)));
+			break;
+		}
+		case "payment.duplicate": {
+			const fn = hooks?.onDuplicatePayment;
+			hook(
+				"onDuplicatePayment",
+				fn && (() => fn({ ...event.data, refunded: event.refunded }, ctx)),
+			);
 			break;
 		}
 		case "subscription.canceled": {

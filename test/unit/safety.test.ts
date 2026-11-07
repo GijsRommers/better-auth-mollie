@@ -239,3 +239,150 @@ describe("customer details", () => {
 		expect(env.fake.customers.get(payment.customerId!)?.name).toBe("Renamed User");
 	});
 });
+
+describe("interrupted and racing billing flows", () => {
+	/** past_due after a failed renewal; returns fresh sign-in headers (sessions expire). */
+	async function delinquent(env: TestEnv) {
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+		await env.webhook(`id=${failed.id}`);
+		const { headers } = await env.signInWithTestUser();
+		return { subscription, headers };
+	}
+
+	async function recover(env: TestEnv, headers: Headers) {
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers });
+		return [...env.fake.payments.values()].at(-1)!;
+	}
+
+	it("never re-applies an old recovery payment to a later delinquency", async () => {
+		const env = await setup();
+		const { subscription, headers } = await delinquent(env);
+		const recovery = await recover(env, headers);
+		env.fake.completePayment(recovery.id, "paid");
+		await env.webhook(`id=${recovery.id}`);
+		const recovered = await env.subscription(subscription.id);
+		expect(recovered.status).toBe("active");
+
+		travel(new Date(recovered.periodEnd!).getTime() + 3_600_000);
+		const failedAgain = env.fake.chargeSubscription(recovered.mollieSubscriptionId!, "failed");
+		await env.webhook(`id=${failedAgain.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+
+		const remotesBefore = env.fake.subscriptions.size;
+		await env.webhook(`id=${recovery.id}`);
+		const after = await env.subscription(subscription.id);
+		expect(after.status).toBe("past_due");
+		expect(after.periodEnd).toEqual(recovered.periodEnd);
+		expect(env.fake.subscriptions.size).toBe(remotesBefore);
+	});
+
+	it("refuses a recovery checkout while Mollie is still retrying the charge", async () => {
+		const env = await setup();
+		const { subscription, headers } = await delinquent(env);
+		env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "open");
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers }),
+		).rejects.toMatchObject({ body: { code: "PAYMENT_IN_PROGRESS" } });
+	});
+
+	it("refunds a recovery payment when Mollie's own retry already paid", async () => {
+		const onDuplicatePayment = vi.fn(async () => {});
+		const env = await setup({ subscription: { onDuplicatePayment } });
+		const { subscription, headers } = await delinquent(env);
+		const recovery = await recover(env, headers);
+		const retry = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${retry.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+
+		env.fake.completePayment(recovery.id, "paid");
+		await env.webhook(`id=${recovery.id}`);
+		await env.webhook(`id=${recovery.id}`);
+		expect([...env.fake.refunds.values()].map((r) => r.paymentId)).toEqual([recovery.id]);
+		await settle();
+		expect(onDuplicatePayment).toHaveBeenCalledTimes(1);
+		expect(onDuplicatePayment.mock.calls[0]).toMatchObject([
+			{ refunded: true, purpose: "recovery" },
+			expect.anything(),
+		]);
+	});
+
+	it("refunds the second of two paid checkouts", async () => {
+		const env = await setup();
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		await env.webhook(`id=${second.payment.id}`);
+		expect([...env.fake.refunds.values()].map((r) => r.paymentId)).toEqual([second.payment.id]);
+		expect((await env.subscriptions())[0]).toMatchObject({ status: "active", plan: "starter" });
+	});
+
+	it("finishes a plan change whose Mollie response was lost, without a second subscription", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "business");
+		env.fake.afterNextCreate("subscriptions.create", () => {
+			throw new TypeError("socket hang up");
+		});
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		const row = await env.subscription(subscription.id);
+		expect(row.pendingPlan).toBe("starter");
+		// The replacement exists at Mollie but was never recorded.
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
+		expect(env.fake.subscriptions.get(row.mollieSubscriptionId!)?.status).toBe("canceled");
+
+		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		const healed = await env.subscription(subscription.id);
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active.map((s) => s.id)).toEqual([healed.mollieSubscriptionId]);
+		expect(active[0]).toMatchObject({ amount: { value: "9.95" }, metadata: { plan: "starter" } });
+	});
+
+	it("moves billing to the upgraded plan even if canceling the old Mollie subscription failed", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		env.fake.failNext("subscriptions.cancel", new TypeError("fetch failed"));
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		expect((await env.subscription(subscription.id)).plan).toBe("business");
+		// Still billing the old plan for now...
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)[0]?.amount.value).toBe(
+			"9.95",
+		);
+
+		// ...until the sync before the next payment date fixes it.
+		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active).toHaveLength(1);
+		expect(active[0]?.amount.value).toBe("49.00");
+	});
+
+	it("finishes a paid recovery that was never applied", async () => {
+		const env = await setup();
+		const { subscription, headers } = await delinquent(env);
+		const recovery = await recover(env, headers);
+		env.fake.completePayment(recovery.id, "paid");
+		// The payment was recorded as paid, then the process stopped.
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: recovery.id }],
+			update: { status: "paid", paidAt: new Date() },
+		});
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+	});
+
+	it("notices a failed pro-rata charge whose webhook never arrived", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		const proration = [...env.fake.payments.values()].at(-1)!;
+		expect((proration.metadata as { purpose: string }).purpose).toBe("proration");
+		env.fake.completePayment(proration.id, "failed");
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+	});
+});

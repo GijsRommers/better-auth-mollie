@@ -88,8 +88,7 @@ export async function createSalesInvoice(
 				idempotencyKey,
 			),
 		getId: (invoice) => invoice.id,
-		recover: (idempotencyKey, attempt) =>
-			gateway.findSalesInvoiceByOperationKey(idempotencyKey, attempt.createdAt),
+		recover: (idempotencyKey) => gateway.findSalesInvoiceByOperationKey(idempotencyKey),
 	});
 	if (!operation.result) return null;
 	await config.onInvoiceCreated?.({ ...data, invoice: operation.result }, ctx);

@@ -19,6 +19,8 @@ export const MOLLIE_ERROR_CODES = defineErrorCodes({
 	UNABLE_TO_CREATE_SUBSCRIPTION: "Unable to create Mollie subscription",
 	UNABLE_TO_CANCEL_SUBSCRIPTION: "Unable to cancel Mollie subscription",
 	MANDATE_NOT_FOUND: "No Mollie mandate is available for this subscription",
+	PAYMENT_IN_PROGRESS:
+		"A payment for this subscription is still being processed. Try again once it has completed.",
 	OPERATION_IN_PROGRESS:
 		"Another billing operation for this subscription is in progress. Retry in a moment.",
 	EMAIL_VERIFICATION_REQUIRED: "Email verification is required before you can subscribe to a plan",

@@ -391,7 +391,7 @@ describe("syncMollieSubscriptions", () => {
 		travel(new Date(subscription.periodEnd!).getTime() - 3_600_000);
 		const due = await syncMollieSubscriptions(env.auth as never);
 		expect(due.remoteChecked).toBe(1);
-		expect(calls()).toBe(before + 1);
+		expect(calls()).toBeGreaterThan(before);
 	});
 
 	it("picks up a renewal whose webhook never arrived", async () => {

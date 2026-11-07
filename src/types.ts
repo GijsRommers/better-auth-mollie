@@ -144,6 +144,7 @@ export type MollieOperationKind =
 	| "create_subscription"
 	| "cancel_subscription"
 	| "create_proration_payment"
+	| "create_refund"
 	| "create_sales_invoice"
 	/** Marks a hook as delivered, so it runs at most once. */
 	| "hook_delivery"
@@ -360,6 +361,23 @@ export type SubscriptionOptions = {
 	 */
 	onPaymentFailed?:
 		| ((data: PaymentHookData, ctx: GenericEndpointContext) => Promise<void>)
+		| undefined;
+	/**
+	 * Refund a payment that paid for something already paid (e.g. a recovery
+	 * checkout that raced Mollie's own successful retry, or two checkouts
+	 * paid in different tabs).
+	 * @default true
+	 */
+	refundDuplicatePayments?: boolean | undefined;
+	/**
+	 * Runs once when a payment turns out to pay for something already paid,
+	 * after it was refunded (unless `refundDuplicatePayments` is false).
+	 */
+	onDuplicatePayment?:
+		| ((
+				data: PaymentHookData & { refunded: boolean },
+				ctx: GenericEndpointContext,
+		  ) => Promise<void>)
 		| undefined;
 	/**
 	 * Runs once when a subscription becomes `canceled`: at the end of the
