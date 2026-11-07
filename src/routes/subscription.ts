@@ -3,6 +3,7 @@ import { APIError, createAuthEndpoint, originCheck } from "better-auth/api";
 import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
+	checkoutScope,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
@@ -716,6 +717,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					await lock.fence();
 					const url = await createCheckout(ctx, options, {
 						row,
+						fence: lock.fence,
 						plan,
 						amount,
 						tax,
@@ -817,6 +819,8 @@ async function createCheckout(
 	options: MollieOptions,
 	input: {
 		row: Subscription;
+		/** Of the row's lock: checked again right before Mollie is called. */
+		fence: Fence;
 		plan: MolliePlan;
 		amount: string;
 		tax: TaxBreakdown | null;
@@ -858,12 +862,15 @@ async function createCheckout(
 	const locale = body.locale ?? extra.locale;
 	const gateway = gatewayFor(options);
 
+	// `getFirstPaymentParams` may have taken long enough for the lock to be
+	// lost (and the row to change, e.g. expire): then no checkout for it.
+	await input.fence();
 	let payment: Awaited<ReturnType<typeof gateway.getPayment>>;
 	try {
 		const operation = await runOperation(ctx.context, {
 			kind: "create_first_payment",
 			referenceId,
-			scope: `${purpose === "recovery" ? "recovery" : "first-payment"}:${row.id}:${planName}:${amount}`,
+			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}`,
 			reuseSucceeded: false,
 			execute: (idempotencyKey) =>
 				gateway.createPayment(

@@ -37,6 +37,7 @@ import {
 } from "./status";
 import { chargeAmount, resolveTax, trustedTax } from "./tax";
 import type {
+	MollieOperation,
 	MollieOptions,
 	MolliePaymentRecord,
 	MolliePlan,
@@ -670,6 +671,30 @@ async function recoverSubscription(
 /** A pending row without any checkout attempt is expired after this. */
 const ABANDONED_ROW_MS = 24 * 60 * 60 * 1000;
 
+/** Journal scope prefix of the checkouts (first payments) created for a row. */
+export function checkoutScope(purpose: PaymentPurpose, subscriptionId: string): string {
+	return `${purpose === "recovery" ? "recovery" : "first-payment"}:${subscriptionId}:`;
+}
+
+/** Whether the row, or the latest attempt to create its checkout, is less than a day old. */
+async function startedRecently(ctx: Ctx, subscription: Subscription): Promise<boolean> {
+	const since = new Date(Date.now() - ABANDONED_ROW_MS);
+	if (new Date(subscription.createdAt) > since) return true;
+	const prefix = checkoutScope("checkout", subscription.id);
+	const recent = await ctx.context.adapter.findMany<MollieOperation>({
+		model: "mollieOperation",
+		where: [
+			{ field: "referenceId", value: subscription.referenceId },
+			{ field: "kind", value: "create_first_payment" },
+			// SQL adapters may over-match this (LIKE); filtered below.
+			{ field: "idempotencyKey", operator: "starts_with", value: prefix },
+			{ field: "createdAt", operator: "gt", value: since },
+		],
+		limit: 100,
+	});
+	return recent.some((op) => op.idempotencyKey.startsWith(prefix));
+}
+
 /**
  * A first payment failed, expired or was canceled. The checkout is over
  * unless another attempt for this subscription is still open or paid.
@@ -688,12 +713,9 @@ export async function expireCheckout(
 		],
 		limit: 100,
 	});
-	// No attempt at all: a checkout whose creation failed. After a day (one may
-	// still have been on its way), the row is expired.
-	if (attempts.length === 0) {
-		const age = Date.now() - new Date(subscription.createdAt).getTime();
-		if (age < ABANDONED_ROW_MS) return null;
-	}
+	// No attempt at all: a checkout whose creation failed, or is still on its
+	// way. A day after the row and its latest creation attempt, it is expired.
+	if (attempts.length === 0 && (await startedRecently(ctx, subscription))) return null;
 	if (attempts.some((a) => !isFinalPaymentStatus(a.status) || a.status === "paid")) return null;
 	return guardedUpdate(ctx, subscription.id, ["incomplete"], { status: "incomplete_expired" }, [], {
 		lock,

@@ -120,4 +120,26 @@ describe("efficient sync", () => {
 		await syncMollieSubscriptions(env.auth as never);
 		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
 	});
+
+	it("gives an old pending row a day from its latest checkout attempt", async () => {
+		const env = await setup();
+		env.fake.failNext("payments.create", Object.assign(new Error("invalid"), { statusCode: 422 }));
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		const [row] = await env.subscriptions();
+		travel(Date.now() + 25 * 3_600_000);
+
+		// A retry whose response is lost: the payment may exist, unrecorded.
+		env.fake.loseNextResponse("payments.create");
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete");
+
+		travel(Date.now() + 25 * 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
+	});
 });

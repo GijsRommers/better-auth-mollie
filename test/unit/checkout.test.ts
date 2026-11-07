@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { AUTH_URL, settle, setup } from "../helpers/setup";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { syncMollieSubscriptions } from "../../src";
+import { AUTH_URL, gate, settle, setup, travel } from "../helpers/setup";
+
+afterEach(() => {
+	vi.useRealTimers();
+});
 
 describe("subscription.upgrade (new subscription)", () => {
 	it("creates a Mollie customer and a first payment, and returns its checkout URL", async () => {
@@ -71,6 +76,37 @@ describe("subscription.upgrade (new subscription)", () => {
 		const subscriptions = await env.subscriptions();
 		expect(subscriptions).toHaveLength(1);
 		expect(subscriptions[0]?.plan).toBe("business");
+	});
+
+	it("creates no checkout for a row that changed while getFirstPaymentParams ran", async () => {
+		let stall: ReturnType<typeof gate> | null = null;
+		const env = await setup({
+			subscription: {
+				getFirstPaymentParams: async () => {
+					await stall?.hold();
+					return {};
+				},
+			},
+		});
+		env.fake.failNext("payments.create", Object.assign(new Error("invalid"), { statusCode: 422 }));
+		await expect(env.checkout("starter")).rejects.toBeTruthy();
+		const [row] = await env.subscriptions();
+		travel(Date.now() + 25 * 3_600_000);
+
+		stall = gate();
+		const retry = env.checkout("starter").catch((error: unknown) => error);
+		await stall.paused;
+		// The lock lease runs out; the sync expires the abandoned row meanwhile.
+		travel(Date.now() + 5 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
+		stall.release();
+		await retry;
+
+		const forRow = [...env.fake.payments.values()].filter(
+			(payment) => (payment.metadata as { subscriptionId?: string }).subscriptionId === row!.id,
+		);
+		expect(forRow).toEqual([]);
 	});
 
 	it("rejects unknown plans", async () => {
