@@ -1149,6 +1149,15 @@ export async function reconcileRemote(
 
 	const previous = subscription.mollieSubscriptionId ?? null;
 	if (!mollieSubscriptionId) {
+		// A mandate Mollie no longer accepts (the usual reason it suspends a
+		// subscription) cannot bill anything new: wait for a recovery payment,
+		// which brings a new mandate, instead of failing to create on it again.
+		if (!(await mandateUsable(options, customerId, mandateId))) {
+			ctx.context.logger.warn(
+				`[mollie] ${subscription.id}: mandate ${mandateId} is no longer valid; billing resumes after a recovery payment`,
+			);
+			return settled();
+		}
 		const baseScope = `remote:${subscription.id}:${planName}:${toMollieDate(startAt)}:${subscription.mollieMandateId}:${amount}:${previous ?? "none"}`;
 		// A reused earlier creation may have been canceled since (e.g. swept as
 		// an orphan); then start a fresh attempt instead of adopting a dead one.
@@ -1188,6 +1197,21 @@ export async function reconcileRemote(
 	// This Mollie subscription was made for an outdated row: it must not charge.
 	await cancelMollieSubscription(ctx, options, { ...subscription, mollieSubscriptionId });
 	return again(latest);
+}
+
+/** Whether a mandate can still be charged (valid, or pending confirmation). */
+async function mandateUsable(
+	options: MollieOptions,
+	customerId: string,
+	mandateId: string,
+): Promise<boolean> {
+	try {
+		const mandate = await gatewayFor(options).getMandate(customerId, mandateId);
+		return mandate.status !== "invalid";
+	} catch (error) {
+		if (isMollieNotFound(error)) return false;
+		throw error;
+	}
 }
 
 /** `reconcileRemote` under a held lock for background paths: failures are left for the next sync. */

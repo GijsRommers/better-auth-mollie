@@ -111,6 +111,9 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 				options,
 			),
 
+		getMandate: (customerId: string, mandateId: string) =>
+			client.mandates.get({ customerId, mandateId }, options),
+
 		getSubscription: (customerId: string, subscriptionId: string) =>
 			client.subscriptions.get({ customerId, subscriptionId }, options),
 

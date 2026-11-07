@@ -333,6 +333,12 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			},
 		},
 		mandates: {
+			async get(request: { customerId: string; mandateId: string }) {
+				record("mandates.get", [request]);
+				const mandate = mandates.get(request.mandateId);
+				if (!mandate || mandate.customerId !== request.customerId) notFound();
+				return clone(mandate);
+			},
 			async list(request: { customerId: string }) {
 				record("mandates.list", [request]);
 				return paginate(
