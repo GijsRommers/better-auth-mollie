@@ -149,6 +149,16 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 				metadata: { subscriptionId: subscription.id, plan: "starter" },
 			},
 		};
+		// A fresh mandate can take a while to become valid in test mode.
+		const deadline = Date.now() + 90_000;
+		for (;;) {
+			const mandate = await env.real.mandates.get({
+				customerId: subscription.mollieCustomerId as string,
+				mandateId: subscription.mollieMandateId as string,
+			});
+			if (mandate.status === "valid" || Date.now() > deadline) break;
+			await new Promise((resolve) => setTimeout(resolve, 2000));
+		}
 		for (let attempt = 0; ; attempt++) {
 			try {
 				return await env.real.payments.create(request);
@@ -234,7 +244,8 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 			subscriptionId: subscription.mollieSubscriptionId as string,
 		});
 		expect(remote).toMatchObject({
-			status: "active",
+			// `pending` while Mollie still confirms the mandate of the first payment.
+			status: expect.stringMatching(/^(active|pending)$/),
 			interval: "1 month",
 			amount: { value: "9.95", currency: "EUR" },
 			startDate: toMollieDate(new Date(subscription.periodEnd as Date)),
