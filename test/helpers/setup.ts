@@ -137,3 +137,39 @@ export type TestEnv = Awaited<ReturnType<typeof setup>>;
 export function settle() {
 	return new Promise((resolve) => setTimeout(resolve, 20));
 }
+
+/** Moves the clock (Date only; timers and I/O keep running). */
+export function travel(to: Date | number) {
+	vi.useFakeTimers({ toFake: ["Date"] });
+	vi.setSystemTime(to);
+}
+
+/** A paid checkout for `plan`, processed by its webhook; returns the subscription row. */
+export async function subscribe(env: TestEnv, plan = "starter"): Promise<Subscription> {
+	const { payment } = await env.checkout(plan);
+	env.fake.completePayment(payment.id, "paid");
+	await env.webhook(`id=${payment.id}`);
+	const [subscription] = await env.subscriptions();
+	return subscription!;
+}
+
+/**
+ * A one-shot gate for stopping code under test at a chosen point: the code
+ * calls `hold()` (so `paused` resolves) and continues once the test calls
+ * `release()`.
+ */
+export function gate() {
+	let release!: () => void;
+	let reached!: () => void;
+	const opened = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const paused = new Promise<void>((resolve) => {
+		reached = resolve;
+	});
+	const hold = async () => {
+		reached();
+		await opened;
+	};
+	return { paused, release, hold };
+}

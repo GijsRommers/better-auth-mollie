@@ -1,10 +1,10 @@
 import type { GenericEndpointContext, User } from "better-auth";
 import { APIError } from "better-auth/api";
 import type { Organization } from "better-auth/plugins/organization";
-import type { CustomerResponse } from "mollie-api-typescript/models";
+import type { CustomerResponse, EntityCustomer } from "mollie-api-typescript/models";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
 import { toAPIError } from "./errors";
-import { gatewayFor } from "./gateway";
+import { gatewayFor, metadataOf } from "./gateway";
 import { OperationInProgressError, runOperation, withLock } from "./operations";
 import type { CustomerType, MollieOptions, WithMollieCustomerId } from "./types";
 import { mergeMetadata } from "./utils";
@@ -23,7 +23,7 @@ export async function getOrCreateCustomer(
 
 	let name: string | undefined;
 	let email: string | undefined;
-	let extra: Record<string, any> = {};
+	let extra: Partial<EntityCustomer> = {};
 	let user: (User & WithMollieCustomerId) | null = null;
 	let organization: (Organization & WithMollieCustomerId) | null = null;
 
@@ -71,7 +71,7 @@ export async function getOrCreateCustomer(
 									: { userId: referenceId }),
 								operationKey: idempotencyKey,
 							},
-							extra.metadata,
+							metadataOf(extra),
 						),
 					},
 					idempotencyKey,
@@ -122,7 +122,7 @@ export async function getOrCreateCustomer(
  * Claims a one-time delivery (e.g. of a hook) by inserting a journal row
  * with a unique key. Exactly one concurrent caller gets `true`.
  */
-export async function claimDelivery(
+async function claimDelivery(
 	ctx: GenericEndpointContext,
 	key: string,
 	referenceId: string,

@@ -101,10 +101,7 @@ export function taxMetadata(tax: TaxBreakdown | null): Record<string, unknown> {
 	};
 }
 
-export function taxFromMetadata(
-	metadata: Record<string, unknown>,
-	currency: string,
-): TaxBreakdown | null {
+function taxFromMetadata(metadata: Record<string, unknown>, currency: string): TaxBreakdown | null {
 	const { vatRate, netAmount, vatAmount, grossAmount } = metadata;
 	if (
 		typeof vatRate !== "string" ||

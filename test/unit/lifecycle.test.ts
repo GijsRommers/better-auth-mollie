@@ -2,19 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { hasActiveSubscription, syncMollieSubscriptions } from "../../src";
 import { prorationCents } from "../../src/routes/subscription";
 import type { Subscription } from "../../src/types";
-import { settle, setup, type TestEnv } from "../helpers/setup";
+import { settle, setup, type TestEnv, travel } from "../helpers/setup";
 
 const DAY = 86_400_000;
 
 afterEach(() => {
 	vi.useRealTimers();
 });
-
-/** Moves the clock (Date only; timers and I/O keep running). */
-function travel(to: Date | number) {
-	vi.useFakeTimers({ toFake: ["Date"] });
-	vi.setSystemTime(to);
-}
 
 async function subscribe(env: TestEnv, plan = "starter") {
 	const { payment } = await env.checkout(plan);

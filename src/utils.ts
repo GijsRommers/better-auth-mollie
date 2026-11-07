@@ -1,7 +1,7 @@
 import type { GenericEndpointContext } from "better-auth";
 import type { MollieInterval, MollieOptions, MolliePlan } from "./types";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+export const DAY_MS = 24 * 60 * 60 * 1000;
 
 const AMOUNT_PATTERN = /^\d+\.\d{2}$/;
 const INTERVAL_PATTERN = /^(\d+) (day|days|week|weeks|month|months)$/;
@@ -195,14 +195,15 @@ export function validatePlans(plans: MolliePlan[]): void {
 }
 
 /**
- * Shape of errors thrown by `@mollie/api-client`.
+ * An error response from the Mollie API: `mollie-api-typescript` throws
+ * `ErrorResponse` (extending `ClientError`), which carries the HTTP status
+ * as `statusCode`. Network errors and timeouts have no status.
  */
-export type MollieApiErrorLike = Error & { statusCode?: number; field?: string };
+export type MollieApiErrorLike = Error & { statusCode: number };
 
 export function isMollieApiError(error: unknown): error is MollieApiErrorLike {
 	return (
-		error instanceof Error &&
-		(error.name === "ApiError" || typeof (error as MollieApiErrorLike).statusCode === "number")
+		error instanceof Error && typeof (error as { statusCode?: unknown }).statusCode === "number"
 	);
 }
 
@@ -219,11 +220,7 @@ export function isMollieNotFound(error: unknown): boolean {
 const REJECTED_STATUSES = new Set([401, 403, 404, 410, 422]);
 
 export function isRejectedMollieRequest(error: unknown): boolean {
-	return (
-		isMollieApiError(error) &&
-		typeof error.statusCode === "number" &&
-		REJECTED_STATUSES.has(error.statusCode)
-	);
+	return isMollieApiError(error) && REJECTED_STATUSES.has(error.statusCode);
 }
 
 /** 400: a malformed request, or an idempotency key reused with other parameters. */

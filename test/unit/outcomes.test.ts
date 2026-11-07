@@ -4,27 +4,14 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { applyTimeTransitions } from "../../src/billing";
+import { applyTimeTransitions } from "../../src/sync";
 import { addDays, toMollieDate } from "../../src/utils";
 import { mollieError } from "../helpers/fake-mollie";
-import { PLANS, settle, setup, type TestEnv } from "../helpers/setup";
+import { gate, PLANS, settle, setup, subscribe, type TestEnv, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
 });
-
-function travel(to: Date | number) {
-	vi.useFakeTimers({ toFake: ["Date"] });
-	vi.setSystemTime(to);
-}
-
-async function subscribe(env: TestEnv, plan = "starter") {
-	const { payment } = await env.checkout(plan);
-	env.fake.completePayment(payment.id, "paid");
-	await env.webhook(`id=${payment.id}`);
-	const [subscription] = await env.subscriptions();
-	return subscription!;
-}
 
 /** past_due after a failed renewal; returns fresh sign-in headers (sessions expire). */
 async function delinquent(env: TestEnv) {
@@ -46,33 +33,107 @@ async function recoveryPayment(env: TestEnv, headers: Headers) {
  * after it recorded the payment, while another delivery runs.
  */
 function pausablePlans() {
-	let pause: { reached: () => void; gate: Promise<void> } | null = null;
+	let pause: (() => Promise<void>) | null = null;
 	return {
 		plans: async () => {
-			const current = pause;
-			if (current) {
+			const hold = pause;
+			if (hold) {
 				pause = null;
-				current.reached();
-				await current.gate;
+				await hold();
 			}
 			return PLANS;
 		},
 		pauseNext() {
-			let release!: () => void;
-			let reached!: () => void;
-			const gate = new Promise<void>((resolve) => {
-				release = resolve;
-			});
-			const paused = new Promise<void>((resolve) => {
-				reached = resolve;
-			});
-			pause = { reached, gate };
+			const { paused, release, hold } = gate();
+			pause = hold;
 			return { paused, release };
 		},
 	};
 }
 
 const refundedIds = (env: TestEnv) => [...env.fake.refunds.values()].map((r) => r.paymentId);
+
+const prorations = (env: TestEnv) =>
+	[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
+
+/** Subscriptions of the test user that currently bill. */
+const billing = async (env: TestEnv) =>
+	(await env.subscriptions()).filter(
+		(s) => (s.status === "active" || s.status === "trialing") && !s.cancelAtPeriodEnd,
+	);
+
+/** A subscription row written directly, e.g. one from before a column existed. */
+function row(env: TestEnv, data: Record<string, unknown>) {
+	return env.context.adapter.create<any, any>({
+		model: "subscription",
+		data: {
+			plan: "starter",
+			cancelAtPeriodEnd: false,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+			...data,
+		},
+	});
+}
+
+/** A first payment for `row` created at Mollie directly (no checkout request). */
+async function firstPayment(
+	env: TestEnv,
+	row: { id: string; mollieCustomerId: string },
+	plan: string,
+	key: string,
+) {
+	const payment = await env.fake.client.payments.create({
+		idempotencyKey: key,
+		paymentRequest: {
+			amount: { currency: "EUR", value: "9.95" },
+			description: plan,
+			sequenceType: "first",
+			customerId: row.mollieCustomerId,
+			redirectUrl: "https://app.example.com/done",
+			metadata: { subscriptionId: row.id, plan, purpose: "checkout" },
+		},
+	} as never);
+	return payment;
+}
+
+/** A paid first payment for the starter plan on `pending`. */
+async function paidCheckout(
+	env: TestEnv,
+	pending: { id: string; mollieCustomerId: string },
+	key: string,
+) {
+	const payment = await firstPayment(env, pending, "starter", key);
+	env.fake.completePayment(payment.id, "paid");
+	return payment;
+}
+
+/** Pauses the first adapter `incrementOne` matching `when`, until released. */
+function pauseWrite(env: TestEnv, when: (args: any) => boolean) {
+	const adapter = env.context.adapter as any;
+	const original = adapter.incrementOne.bind(adapter);
+	let armed = true;
+	const { paused, release, hold } = gate();
+	adapter.incrementOne = async (args: any) => {
+		if (armed && when(args)) {
+			armed = false;
+			await hold();
+		}
+		return original(args);
+	};
+	return { paused, release, restore: () => (adapter.incrementOne = original) };
+}
+
+/** Polls until `condition` holds, `promise` settles, or 5 seconds pass. */
+async function until(condition: () => boolean, promise?: Promise<unknown>) {
+	let done = false;
+	promise?.finally(() => {
+		done = true;
+	});
+	for (let i = 0; i < 500 && !condition() && !done; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
 
 describe("duplicate payments are refunded exactly when they are duplicates", () => {
 	it("retries a duplicate's refund that failed, from the sync", async () => {
@@ -494,23 +555,10 @@ function metadataPurpose(payment: { metadata?: unknown }) {
 }
 
 describe("re-check of 36f27be: shared charges, unseen charges, stale transitions", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
 	/** An upgrade to business that stalls right after charging, until released. */
 	async function stalledUpgrade(env: TestEnv) {
-		let reached!: () => void;
-		const charged = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		env.fake.afterNextCreate("payments.create", async () => {
-			reached();
-			await gate;
-		});
+		const { paused: charged, release, hold } = gate();
+		env.fake.afterNextCreate("payments.create", hold);
 		const upgrade = env.api
 			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })
 			.catch((error: unknown) => error);
@@ -633,43 +681,6 @@ describe("re-check of 36f27be: shared charges, unseen charges, stale transitions
 });
 
 describe("re-check of 8ede203: lost charges, stalled writers, serialized payments", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
-	/** Pauses the first adapter `incrementOne` matching `when`, until released. */
-	function pauseWrite(env: TestEnv, when: (args: any) => boolean) {
-		const adapter = env.context.adapter as any;
-		const original = adapter.incrementOne.bind(adapter);
-		let armed = true;
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let reached!: () => void;
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		adapter.incrementOne = async (args: any) => {
-			if (armed && when(args)) {
-				armed = false;
-				reached();
-				await gate;
-			}
-			return original(args);
-		};
-		return { paused, release, restore: () => (adapter.incrementOne = original) };
-	}
-
-	async function until(condition: () => boolean, promise?: Promise<unknown>) {
-		let done = false;
-		promise?.finally(() => {
-			done = true;
-		});
-		for (let i = 0; i < 500 && !condition() && !done; i++) {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		}
-	}
-
 	it("refunds a pro-rata charge whose creation response was lost, after the upgrade is retried", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env, "starter");
@@ -821,32 +832,6 @@ describe("re-check of 8ede203: lost charges, stalled writers, serialized payment
 });
 
 describe("re-check of 0830e45: takeover, recovery bookkeeping, short intervals", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
-	function pauseWrite(env: TestEnv, when: (args: any) => boolean) {
-		const adapter = env.context.adapter as any;
-		const original = adapter.incrementOne.bind(adapter);
-		let armed = true;
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let reached!: () => void;
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		adapter.incrementOne = async (args: any) => {
-			if (armed && when(args)) {
-				armed = false;
-				reached();
-				await gate;
-			}
-			return original(args);
-		};
-		return { paused, release, restore: () => (adapter.incrementOne = original) };
-	}
-
 	it("never lets a processor whose lease expired refund a payment the next holder applies", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env);
@@ -949,9 +934,6 @@ describe("re-check of 0830e45: takeover, recovery bookkeeping, short intervals",
 });
 
 describe("re-check of 5d94fe8: older records, hooks of recovered charges, ended subscriptions", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
 	async function loseUpgradeCharge(env: TestEnv) {
 		env.fake.afterNextCreate("payments.create", () => {
 			throw new TypeError("socket hang up");
@@ -1050,9 +1032,6 @@ describe("re-check of 5d94fe8: older records, hooks of recovered charges, ended 
 });
 
 describe("re-check of 933ba33: successive upgrades, hooks when a refund fails", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
 	it("makes a subscription past due when an earlier upgrade's charge fails after a later upgrade", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env, "starter");
@@ -1092,9 +1071,6 @@ describe("re-check of 933ba33: successive upgrades, hooks when a refund fails", 
 });
 
 describe("re-check of f77df6d: failures are applied even if processing stopped", () => {
-	const prorations = (env: TestEnv) =>
-		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
-
 	it("applies a failed charge recorded right before the process stopped", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env, "starter");
@@ -1278,20 +1254,12 @@ describe("re-check of ff9b5be: vanished subscriptions, checkout races", () => {
 			incrementOne: adapter.incrementOne.bind(adapter),
 		};
 		let armed = true;
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let reached!: () => void;
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
+		const { paused, release, hold } = gate();
 		const wrap = (name: "update" | "incrementOne") => async (args: any) => {
 			const set = name === "update" ? args.update : args.set;
 			if (armed && args.model === "subscription" && set && when(set)) {
 				armed = false;
-				reached();
-				await gate;
+				await hold();
 			}
 			return originals[name](args);
 		};
@@ -1405,12 +1373,6 @@ describe("re-check of ff9b5be: vanished subscriptions, checkout races", () => {
 });
 
 describe("re-check of bfe76d6: uncertain discovery, replacement rows, unlocked writers, contention", () => {
-	async function until(condition: () => boolean) {
-		for (let i = 0; i < 500 && !condition(); i++) {
-			await new Promise((resolve) => setTimeout(resolve, 10));
-		}
-	}
-
 	it("never makes a subscription delinquent while its charges could not be checked", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env);
@@ -1705,46 +1667,20 @@ describe("re-check of 313584a: stale Mollie status, concurrent replacements, lis
 });
 
 describe("re-check of 569026d: one subscription per identity, under concurrency", () => {
-	async function secondPendingRow(
+	function secondPendingRow(
 		env: TestEnv,
 		base: { referenceId: string; mollieCustomerId: string },
 		plan: string,
 		extra = {},
 	) {
-		return env.context.adapter.create<any, any>({
-			model: "subscription",
-			data: {
-				referenceId: base.referenceId,
-				plan,
-				status: "incomplete",
-				mollieCustomerId: base.mollieCustomerId,
-				customerType: "user",
-				cancelAtPeriodEnd: false,
-				createdAt: new Date(),
-				updatedAt: new Date(),
-				...extra,
-			},
+		return row(env, {
+			referenceId: base.referenceId,
+			plan,
+			status: "incomplete",
+			mollieCustomerId: base.mollieCustomerId,
+			customerType: "user",
+			...extra,
 		});
-	}
-
-	async function firstPayment(
-		env: TestEnv,
-		row: { id: string; mollieCustomerId: string },
-		plan: string,
-		key: string,
-	) {
-		const payment = await env.fake.client.payments.create({
-			idempotencyKey: key,
-			paymentRequest: {
-				amount: { currency: "EUR", value: "9.95" },
-				description: plan,
-				sequenceType: "first",
-				customerId: row.mollieCustomerId,
-				redirectUrl: "https://app.example.com/done",
-				metadata: { subscriptionId: row.id, plan, purpose: "checkout" },
-			},
-		} as never);
-		return payment;
 	}
 
 	it("activates only one of two pending rows paid at the same time", async () => {
@@ -1837,66 +1773,6 @@ describe("re-check of 569026d: one subscription per identity, under concurrency"
 });
 
 describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows", () => {
-	async function row(env: TestEnv, data: Record<string, unknown>) {
-		return env.context.adapter.create<any, any>({
-			model: "subscription",
-			data: {
-				plan: "starter",
-				cancelAtPeriodEnd: false,
-				createdAt: new Date(),
-				updatedAt: new Date(),
-				...data,
-			},
-		});
-	}
-
-	async function paidCheckout(
-		env: TestEnv,
-		pending: { id: string; mollieCustomerId: string },
-		key: string,
-	) {
-		const payment = await env.fake.client.payments.create({
-			idempotencyKey: key,
-			paymentRequest: {
-				amount: { currency: "EUR", value: "9.95" },
-				description: "starter",
-				sequenceType: "first",
-				customerId: pending.mollieCustomerId,
-				redirectUrl: "https://app.example.com/done",
-				metadata: { subscriptionId: pending.id, plan: "starter", purpose: "checkout" },
-			},
-		} as never);
-		env.fake.completePayment(payment.id, "paid");
-		return payment;
-	}
-
-	function pauseNext(env: TestEnv, when: (args: any) => boolean) {
-		const adapter = env.context.adapter as any;
-		const original = adapter.incrementOne.bind(adapter);
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let reached!: () => void;
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		adapter.incrementOne = async (args: any) => {
-			if (when(args)) {
-				adapter.incrementOne = original;
-				reached();
-				await gate;
-			}
-			return original(args);
-		};
-		return { paused, release, restore: () => (adapter.incrementOne = original) };
-	}
-
-	const billing = async (env: TestEnv) =>
-		(await env.subscriptions()).filter(
-			(s) => (s.status === "active" || s.status === "trialing") && !s.cancelAtPeriodEnd,
-		);
-
 	it("never lets a restore at the deadline and another checkout both bill", async () => {
 		const env = await setup();
 		const first = await subscribe(env);
@@ -1913,7 +1789,7 @@ describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows"
 		const { headers } = await env.signInWithTestUser();
 
 		// The restore is decided just before the period ends, then stalls...
-		const stall = pauseNext(
+		const stall = pauseWrite(
 			env,
 			(args) => args.model === "subscription" && args.set?.cancelAtPeriodEnd === false,
 		);
@@ -1953,7 +1829,7 @@ describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows"
 		const legacyPayment = await paidCheckout(env, legacy, "legacy");
 		const typedPayment = await paidCheckout(env, typed, "typed");
 
-		const stall = pauseNext(
+		const stall = pauseWrite(
 			env,
 			(args) => args.model === "subscription" && args.set?.status === "active",
 		);
@@ -2009,66 +1885,6 @@ describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows"
 });
 
 describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging", () => {
-	async function row(env: TestEnv, data: Record<string, unknown>) {
-		return env.context.adapter.create<any, any>({
-			model: "subscription",
-			data: {
-				plan: "starter",
-				cancelAtPeriodEnd: false,
-				createdAt: new Date(),
-				updatedAt: new Date(),
-				...data,
-			},
-		});
-	}
-
-	async function paidCheckout(
-		env: TestEnv,
-		pending: { id: string; mollieCustomerId: string },
-		key: string,
-	) {
-		const payment = await env.fake.client.payments.create({
-			idempotencyKey: key,
-			paymentRequest: {
-				amount: { currency: "EUR", value: "9.95" },
-				description: "starter",
-				sequenceType: "first",
-				customerId: pending.mollieCustomerId,
-				redirectUrl: "https://app.example.com/done",
-				metadata: { subscriptionId: pending.id, plan: "starter", purpose: "checkout" },
-			},
-		} as never);
-		env.fake.completePayment(payment.id, "paid");
-		return payment;
-	}
-
-	function pauseNext(env: TestEnv, when: (args: any) => boolean) {
-		const adapter = env.context.adapter as any;
-		const original = adapter.incrementOne.bind(adapter);
-		let release!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let reached!: () => void;
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		adapter.incrementOne = async (args: any) => {
-			if (when(args)) {
-				adapter.incrementOne = original;
-				reached();
-				await gate;
-			}
-			return original(args);
-		};
-		return { paused, release, restore: () => (adapter.incrementOne = original) };
-	}
-
-	const billing = async (env: TestEnv) =>
-		(await env.subscriptions()).filter(
-			(s) => (s.status === "active" || s.status === "trialing") && !s.cancelAtPeriodEnd,
-		);
-
 	it("never lets a restore that stalled past its lease undo a cancellation after another checkout took over", async () => {
 		const env = await setup();
 		const first = await subscribe(env);
@@ -2084,7 +1900,7 @@ describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging",
 		travel(periodEnd - 60_000);
 		const { headers } = await env.signInWithTestUser();
 
-		const stall = pauseNext(
+		const stall = pauseWrite(
 			env,
 			(args) => args.model === "subscription" && args.set?.cancelAtPeriodEnd === false,
 		);
@@ -2176,7 +1992,7 @@ describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging",
 				return target;
 			},
 		};
-		const { coverage } = await import("../../src/billing");
+		const { coverage } = await import("../../src/identity");
 		const result = await coverage(
 			{ context: { adapter, runInBackground: () => {}, logger: console } } as never,
 			{ subscription: { enabled: true, plans: PLANS } } as never,

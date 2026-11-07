@@ -2,18 +2,15 @@ import type { GenericEndpointContext } from "better-auth";
 import { HIDE_METADATA } from "better-auth";
 import { APIError, createAuthEndpoint, getSessionFromCtx, originCheck } from "better-auth/api";
 import * as z from "zod";
-import {
-	findSubscription,
-	processMollieSubscription,
-	processPayment,
-	syncAllSubscriptions,
-	syncSubscription,
-} from "../billing";
+import { processPayment } from "../billing";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
 import { type BillingEvent, dispatchEvents } from "../events";
-import { gatewayFor } from "../gateway";
+import { gatewayFor, type MolliePayment } from "../gateway";
 import { OperationInProgressError, OperationSupersededError } from "../operations";
-import { DEFAULT_GRACE_PERIOD_DAYS, hasSubscriptionAccess } from "../status";
+import { processMollieSubscription } from "../remote";
+import { gracePeriodDays, reload } from "../rows";
+import { hasSubscriptionAccess } from "../status";
+import { syncAllSubscriptions, syncSubscription } from "../sync";
 import type { MollieOptions, Subscription } from "../types";
 import { errorMessage, getUrl, isMollieNotFound } from "../utils";
 
@@ -24,7 +21,7 @@ const RESOURCE_ID = /^(tr|sub)_[A-Za-z0-9]+$/;
  * `id=tr_…` form-encoded; a JSON `{ "id": … }` body is accepted too. Nothing
  * else from the body is used.
  */
-export function parseWebhookId(body: string): string | null {
+function parseWebhookId(body: string): string | null {
 	const text = body.trim();
 	if (!text) return null;
 	let id: unknown = null;
@@ -47,7 +44,7 @@ async function handleWebhookResource(
 ): Promise<BillingEvent[]> {
 	const gateway = gatewayFor(options);
 	if (id.startsWith("tr_")) {
-		let payment: Awaited<ReturnType<typeof gateway.getPayment>>;
+		let payment: MolliePayment;
 		try {
 			payment = await gateway.getPayment(id);
 		} catch (error) {
@@ -135,9 +132,7 @@ export const subscriptionSuccess = (options: MollieOptions) =>
 			const session = await getSessionFromCtx(ctx);
 			if (subscriptionId && session) {
 				try {
-					const subscription = await findSubscription(ctx, [
-						{ field: "id", value: subscriptionId },
-					]);
+					const subscription = await reload(ctx, subscriptionId);
 					// Only for subscriptions the signed-in user may act on.
 					const allowed =
 						!!subscription &&
@@ -192,12 +187,11 @@ export const hasActiveSubscriptionEndpoint = (options: MollieOptions) =>
 				sortBy: { field: "createdAt", direction: "desc" },
 				limit: 100,
 			});
-			const gracePeriodDays = options.subscription?.enabled
-				? (options.subscription.gracePeriodDays ?? DEFAULT_GRACE_PERIOD_DAYS)
-				: DEFAULT_GRACE_PERIOD_DAYS;
 			const now = new Date();
 			const subscription =
-				subscriptions.find((s) => hasSubscriptionAccess(s, { now, gracePeriodDays })) ?? null;
+				subscriptions.find((s) =>
+					hasSubscriptionAccess(s, { now, gracePeriodDays: gracePeriodDays(options) }),
+				) ?? null;
 			return ctx.json({ active: subscription !== null, subscription });
 		},
 	);

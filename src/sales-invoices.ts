@@ -18,7 +18,7 @@ import { addDays, errorMessage, mergeMetadata } from "./utils";
  * amount at the customer's VAT rate; otherwise the charged amount is treated
  * as VAT-inclusive at `salesInvoices.vatRate`.
  */
-export function defaultInvoiceRequest(
+function defaultInvoiceRequest(
 	options: MollieOptions,
 	data: PaymentHookData,
 ): Omit<SalesInvoiceRequest, "recipient"> {

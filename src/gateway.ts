@@ -17,7 +17,7 @@ export type MolliePayment = PaymentResponse | ListPaymentResponse;
 export type MollieSubscription = SubscriptionResponse | ListSubscriptionResponse;
 
 /** The SDK sets no request timeout of its own. */
-export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 /**
  * How far before an attempt's journal timestamp a recovery scan keeps
@@ -175,7 +175,7 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			for await (const page of pages) {
 				for (const payment of page.result.embedded?.payments ?? []) {
 					if (new Date(payment.createdAt).getTime() < cutoff) return found;
-					found.push(payment as ListPaymentResponse);
+					found.push(payment);
 				}
 			}
 			return found;
@@ -191,7 +191,7 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			// Mollie does not document this list's order, so scan it completely.
 			return scanForOperationKey(
 				await client.salesInvoices.list({ limit: PAGE_LIMIT }, options),
-				(page) => page.result.embedded?.invoices as Listed[] | undefined,
+				(page) => page.result.embedded?.invoices,
 				operationKey,
 				new Date(0),
 			);
@@ -210,7 +210,7 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 		async findRefundByOperationKey(paymentId: string, operationKey: string) {
 			return scanForOperationKey(
 				await client.refunds.list({ paymentId, limit: PAGE_LIMIT }, options),
-				(page) => page.result.embedded?.refunds as Listed[] | undefined,
+				(page) => page.result.embedded?.refunds,
 				operationKey,
 				new Date(0),
 			);

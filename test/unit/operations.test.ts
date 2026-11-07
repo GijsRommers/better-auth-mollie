@@ -14,6 +14,7 @@ import {
 import { mollieOperationSchema } from "../../src/schema";
 import type { MollieOperation } from "../../src/types";
 import { createFakeMollie, type FakeMollie, mollieError } from "../helpers/fake-mollie";
+import { gate } from "../helpers/setup";
 
 async function setup() {
 	const { auth } = await getTestInstance(
@@ -219,14 +220,7 @@ describe("runOperation", () => {
 		recover: Recover,
 		pause: "before-lookup" | "after-lookup" = "before-lookup",
 	) {
-		let resume!: () => void;
-		let reached!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			resume = resolve;
-		});
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
+		const { paused, release: resume, hold } = gate();
 		let first = true;
 		return {
 			paused,
@@ -235,8 +229,7 @@ describe("runOperation", () => {
 				if (!first) return recover(key, attempt);
 				first = false;
 				const found = pause === "after-lookup" ? await recover(key, attempt) : undefined;
-				reached();
-				await gate;
+				await hold();
 				return pause === "after-lookup" ? (found ?? null) : recover(key, attempt);
 			},
 		};

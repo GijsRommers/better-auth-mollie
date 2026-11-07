@@ -60,8 +60,9 @@ export type MolliePlan = {
 	name: string;
 	/**
 	 * Amount charged every interval, as a decimal string with two decimals,
-	 * e.g. `"9.95"`. This is the amount Mollie charges, so include VAT if your
-	 * prices are VAT-inclusive.
+	 * e.g. `"9.95"`. With `subscription.tax` configured it is the net price
+	 * (unless `tax.pricesIncludeVat`); otherwise it is exactly what Mollie
+	 * charges.
 	 */
 	amount: string;
 	/**
@@ -374,7 +375,8 @@ export type SubscriptionOptions = {
 	tax?: TaxOptions | undefined;
 	/**
 	 * Runs once when a subscription moves from `incomplete` to `trialing` or
-	 * `active` after its first payment is paid.
+	 * `active` after its first payment is paid, and again when a `past_due`
+	 * or `unpaid` subscription is restarted by a paid recovery checkout.
 	 */
 	onSubscriptionActivated?:
 		| ((

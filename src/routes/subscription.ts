@@ -3,31 +3,31 @@ import { APIError, createAuthEndpoint, originCheck } from "better-auth/api";
 import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
-	applyDueTransitions,
-	beforeCancellationTakesEffect,
-	billsIdentity,
-	coverage,
-	findSubscription,
-	guardedUpdate,
-	lockWaitMs,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
 	recordPayment,
 	refundUnappliedPayment,
-	sameAppliedPayment,
-	settlePreviousPayment,
 	settleRecentCharges,
-	withReferenceLock,
 } from "../billing";
 import { getOrCreateCustomer } from "../customer";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
 import { toAPIError } from "../errors";
 import { dispatchEvents } from "../events";
 import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
+import { billsIdentity, coverage, withReferenceLock } from "../identity";
 import { type SubscriptionLock, withSubscriptionLock } from "../lock";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
 import { type Fence, runOperation } from "../operations";
+import {
+	beforeCancellationTakesEffect,
+	guardedUpdate,
+	lockWaitMs,
+	periodEndOf,
+	reload,
+	sameAppliedPayment,
+	settlePreviousPayment,
+} from "../rows";
 import {
 	ACCESS_STATUSES,
 	BILLING_STATUSES,
@@ -35,9 +35,11 @@ import {
 	hasSubscriptionAccess,
 	isFinalPaymentStatus,
 } from "../status";
+import { applyDueTransitions } from "../sync";
 import { chargeAmount, fromCents, resolveTax, taxMetadata, toCents } from "../tax";
 import type {
 	CustomerType,
+	FirstPaymentParams,
 	MollieCtxSession,
 	MollieOptions,
 	MolliePaymentRecord,
@@ -60,13 +62,10 @@ import {
 	toMollieDate,
 } from "../utils";
 
-type ReferenceContext = { referenceId: string; customerType: CustomerType };
-
 function subscriptionOptions(options: MollieOptions): SubscriptionOptions {
 	return options.subscription as SubscriptionOptions;
 }
 
-/** Subscriptions of a reference, newest first. */
 /** Subscriptions of a billing identity (reference and customer type), newest first. */
 async function referenceSubscriptions(
 	ctx: GenericEndpointContext,
@@ -132,7 +131,7 @@ const PROTECTED_PAYMENT_KEYS = [
 	"cancelUrl",
 	"webhookUrl",
 	"testmode",
-] as const;
+] as const satisfies readonly (keyof PaymentRequest)[];
 
 /**
  * Reuses a still-open checkout for the same plan, amount and purpose.
@@ -192,7 +191,7 @@ function lockSubscription<T>(
 		ctx,
 		subscription.id,
 		async (lock) => {
-			const fresh = await findSubscription(ctx, [{ field: "id", value: subscription.id }]);
+			const fresh = await reload(ctx, subscription.id);
 			if (!fresh) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			return fn(fresh, lock);
 		},
@@ -222,7 +221,7 @@ async function whileCancellationHolds<T>(
 	};
 	return withReferenceLock(ctx, options, identity, async (fence) => {
 		const now = new Date();
-		const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+		const periodEnd = periodEndOf(subscription);
 		if (!periodEnd || periodEnd <= now) {
 			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PERIOD_ENDED);
 		}
@@ -268,7 +267,7 @@ async function applyToMollie(
 
 /** When the next period starts (the end of the current one, or now if it already ended). */
 function nextPeriodStart(subscription: Subscription, now: Date): Date {
-	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	const periodEnd = periodEndOf(subscription);
 	return periodEnd && periodEnd > now ? periodEnd : ceilToUTCDate(now);
 }
 
@@ -388,9 +387,7 @@ async function changePlan(
 	if (charges.inProgress) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.PAYMENT_IN_PROGRESS);
 	}
-	const current = charges.processed
-		? await findSubscription(ctx, [{ field: "id", value: initial.id }])
-		: initial;
+	const current = charges.processed ? await reload(ctx, initial.id) : initial;
 	if (!current || !ACCESS_STATUSES.includes(current.status)) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
 	}
@@ -505,7 +502,7 @@ async function restore(
 	if (!subscription.cancelAtPeriodEnd) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_PENDING_CHANGE);
 	}
-	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	const periodEnd = periodEndOf(subscription);
 	if (!periodEnd || periodEnd <= new Date()) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PERIOD_ENDED);
 	}
@@ -569,8 +566,9 @@ const upgradeSubscriptionBodySchema = z.object({
  * **client:** `authClient.subscription.upgrade`
  *
  * Starts a subscription (returns the Mollie checkout URL for the first
- * payment) or changes the plan of the current one (no proration; the new
- * price applies from the next period).
+ * payment), restarts a delinquent one (a recovery checkout), or changes the
+ * plan of the current one: an upgrade applies right away and charges the
+ * pro-rata difference; anything else from the next period (see `changePlan`).
  */
 export const upgradeSubscription = (options: MollieOptions) =>
 	createAuthEndpoint(
@@ -587,7 +585,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 		},
 		async (ctx) => {
 			const { user, session } = ctx.context.session as MollieCtxSession;
-			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const { referenceId, customerType } = ctx.context;
 			const config = subscriptionOptions(options);
 			const body = ctx.body;
 			const respond = (url: string) =>
@@ -633,7 +631,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			const checkout = async (
 				candidate: Subscription,
 				input: { purpose: PaymentPurpose; trialDays: number; customerId: string },
-			) => {
+			): ReturnType<typeof respond> => {
 				const tax = await resolveTax(ctx, options, { referenceId, customerType, plan });
 				const amount =
 					input.purpose === "verification"
@@ -644,10 +642,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					recovery
 						? (row.status !== "past_due" && row.status !== "unpaid") || !!row.cancelAtPeriodEnd
 						: row.status === "active" || row.status === "trialing";
-				const issued = await lockSubscription(ctx, options, candidate, async (fresh, lock) => {
+				// Either the response, or the new row to start over on.
+				type Issued = { response: ReturnType<typeof respond> } | { restart: Subscription };
+				const issue = async (fresh: Subscription, lock: SubscriptionLock): Promise<Issued> => {
 					let row = fresh;
 					// Activated (another tab, the webhook) or recovered meanwhile.
-					if (settled(row)) return respond(body.successUrl);
+					if (settled(row)) return { response: respond(body.successUrl) };
 					if (row.status === "incomplete") {
 						const differs =
 							row.plan !== planName ||
@@ -676,11 +676,13 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							{ plan: planName, amount, purpose: input.purpose, customerId: input.customerId },
 							lock,
 						);
-						if (open.activated) return respond(body.successUrl);
-						if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
+						if (open.activated) return { response: respond(body.successUrl) };
+						if (open.url) {
+							return { response: ctx.json({ url: open.url, redirect: !body.disableRedirect }) };
+						}
 						// Processing earlier attempts may have moved the row on.
-						row = (await findSubscription(ctx, [{ field: "id", value: row.id }])) ?? row;
-						if (settled(row)) return respond(body.successUrl);
+						row = (await reload(ctx, row.id)) ?? row;
+						if (settled(row)) return { response: respond(body.successUrl) };
 					}
 					if (!recovery && row.status !== "incomplete") {
 						// The checkout expired meanwhile: start over on a new row, under
@@ -709,12 +711,10 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						user,
 						session,
 					});
-					return ctx.json({ url, redirect: !body.disableRedirect });
-				});
-				if (issued && typeof issued === "object" && "restart" in issued) {
-					return checkout(issued.restart as Subscription, input);
-				}
-				return issued;
+					return { response: ctx.json({ url, redirect: !body.disableRedirect }) };
+				};
+				const issued = await lockSubscription(ctx, options, candidate, issue);
+				return "restart" in issued ? checkout(issued.restart, input) : issued.response;
 			};
 
 			if (current) {
@@ -731,7 +731,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.PAYMENT_IN_PROGRESS);
 					}
 					if (charges.processed) {
-						const latest = await findSubscription(ctx, [{ field: "id", value: current.id }]);
+						const latest = await reload(ctx, current.id);
 						if (latest?.status !== "past_due" && latest?.status !== "unpaid") {
 							return respond(body.successUrl);
 						}
@@ -816,7 +816,7 @@ async function createCheckout(
 	const { row, plan, amount, tax, purpose, trialDays, customerId, referenceId, body } = input;
 	const config = subscriptionOptions(options);
 	const planName = plan.name.toLowerCase();
-	const extra: Record<string, any> = {
+	const extra: FirstPaymentParams = {
 		...((await config.getFirstPaymentParams?.(
 			{
 				user: input.user,
@@ -828,7 +828,8 @@ async function createCheckout(
 			ctx,
 		)) ?? {}),
 	};
-	for (const key of PROTECTED_PAYMENT_KEYS) delete extra[key];
+	// The type leaves these out, but a cast could still smuggle them in.
+	for (const key of PROTECTED_PAYMENT_KEYS) delete (extra as Record<string, unknown>)[key];
 	const redirectUrl = `${ctx.context.baseURL}/subscription/success?${new URLSearchParams({
 		subscriptionId: row.id,
 		callbackURL: body.successUrl,
@@ -872,9 +873,9 @@ async function createCheckout(
 								...taxMetadata(tax),
 							},
 							body.metadata,
-							extra.metadata,
+							metadataOf(extra),
 						),
-					} as PaymentRequest,
+					},
 					idempotencyKey,
 				),
 			getId: (created) => created.id,
@@ -931,7 +932,7 @@ export const cancelSubscription = (options: MollieOptions) =>
 			],
 		},
 		async (ctx) => {
-			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const { referenceId, customerType } = ctx.context;
 			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const subscription = ctx.body.subscriptionId
 				? findTarget(subscriptions, ctx.body.subscriptionId)
@@ -998,7 +999,7 @@ export const restoreSubscription = (options: MollieOptions) =>
 			use: [mollieSessionMiddleware, referenceMiddleware(options, "restore-subscription")],
 		},
 		async (ctx) => {
-			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const { referenceId, customerType } = ctx.context;
 			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const subscription = ctx.body.subscriptionId
 				? findTarget(subscriptions, ctx.body.subscriptionId)
@@ -1044,7 +1045,7 @@ export const listActiveSubscriptions = (options: MollieOptions) =>
 			use: [mollieSessionMiddleware, referenceMiddleware(options, "list-subscription")],
 		},
 		async (ctx) => {
-			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const { referenceId, customerType } = ctx.context;
 			const now = new Date();
 			const subscriptions: Subscription[] = [];
 			// Apply clock-based changes (period ended, scheduled plan change) so

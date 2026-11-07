@@ -1,6 +1,5 @@
 import type { AuthContext, BetterAuthPlugin, GenericEndpointContext, User } from "better-auth";
 import { APIError } from "better-auth/api";
-import type { SyncResult } from "./billing";
 import { getOrCreateCustomer, syncCustomerDetails } from "./customer";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
 import {
@@ -25,6 +24,7 @@ import {
 	type userSchema,
 } from "./schema";
 import { BILLING_STATUSES } from "./status";
+import type { SyncResult } from "./sync";
 import type { MollieOptions, Subscription, WithMollieCustomerId } from "./types";
 import { errorMessage, isValidAmount, validatePlans } from "./utils";
 import { PACKAGE_VERSION } from "./version";
@@ -274,7 +274,6 @@ export function syncMollieSubscriptions(
 	});
 }
 
-export type { SyncResult } from "./billing";
 export { MOLLIE_ERROR_CODES } from "./error-codes";
 export {
 	mollieOperationSchema,
@@ -284,5 +283,6 @@ export {
 	userSchema,
 } from "./schema";
 export { accessDeadline, hasSubscriptionAccess } from "./status";
+export type { SyncResult } from "./sync";
 export { computeTax } from "./tax";
 export type * from "./types";

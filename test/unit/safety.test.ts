@@ -1,23 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { AUTH_URL, settle, setup, type TestEnv } from "../helpers/setup";
+import { AUTH_URL, gate, settle, setup, subscribe, type TestEnv, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
 });
-
-function travel(to: Date | number) {
-	vi.useFakeTimers({ toFake: ["Date"] });
-	vi.setSystemTime(to);
-}
-
-async function subscribe(env: TestEnv, plan = "starter") {
-	const { payment } = await env.checkout(plan);
-	env.fake.completePayment(payment.id, "paid");
-	await env.webhook(`id=${payment.id}`);
-	const [subscription] = await env.subscriptions();
-	return subscription!;
-}
 
 describe("prices cannot be changed from the outside", () => {
 	it("ignores reserved keys in caller metadata", async () => {
@@ -74,18 +61,8 @@ describe("renewals only pay for their own period", () => {
 describe("concurrent changes leave exactly one chargeable Mollie subscription", () => {
 	/** Pauses the next create of `method` after Mollie stored it, until released. */
 	function pauseAfterCreate(env: TestEnv, method: string) {
-		let release!: () => void;
-		let reached!: () => void;
-		const gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const paused = new Promise<void>((resolve) => {
-			reached = resolve;
-		});
-		env.fake.afterNextCreate(method, async () => {
-			reached();
-			await gate;
-		});
+		const { paused, release, hold } = gate();
+		env.fake.afterNextCreate(method, hold);
 		return { paused, release };
 	}
 

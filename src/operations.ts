@@ -157,7 +157,10 @@ export async function pendingOperations(
 	return found;
 }
 
-async function loadAttempts(context: AuthContext, options: RunOperationOptions<unknown>) {
+async function loadAttempts(
+	context: AuthContext,
+	options: Pick<RunOperationOptions<unknown>, "scope" | "referenceId" | "kind">,
+) {
 	const prefix = `${options.scope}#`;
 	const attempts: MollieOperation[] = [];
 	for (let offset = 0; ; offset += PAGE_SIZE) {
@@ -245,7 +248,7 @@ async function runRound<T>(
 	options: RunOperationOptions<T>,
 ): Promise<OperationResult<T> | typeof RELOAD> {
 	const now = options.now ?? (() => new Date());
-	const attempts = await loadAttempts(context, options as RunOperationOptions<unknown>);
+	const attempts = await loadAttempts(context, options);
 
 	if (options.reuseSucceeded) {
 		const done = attempts.find((op) => op.status === "succeeded" && op.mollieId);
@@ -365,18 +368,6 @@ async function executeAttempt<T>(
 	);
 	await options.compensate?.(mollieId);
 	throw new OperationSupersededError(idempotencyKey, mollieId);
-}
-
-/** Finds the first resource in a Mollie page whose metadata carries `operationKey`. */
-export function findByOperationKey<T extends { id: string; metadata?: unknown }>(
-	items: Iterable<T>,
-	operationKey: string,
-): string | null {
-	for (const item of items) {
-		const metadata = item.metadata as Record<string, unknown> | null | undefined;
-		if (metadata && metadata.operationKey === operationKey) return item.id;
-	}
-	return null;
 }
 
 /** How long a lifecycle lock is held without renewal before others may take it over. */
