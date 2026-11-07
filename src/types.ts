@@ -95,6 +95,14 @@ export type MolliePlan = {
 				days: number;
 		  }
 		| undefined;
+	/**
+	 * No longer offered: new subscriptions and plan changes to it are
+	 * refused (`SUBSCRIPTION_PLAN_ARCHIVED`), while subscriptions already on
+	 * it keep it, at its price. To change a price for new customers only, add
+	 * a new plan and archive the old one. (Changing `amount` itself re-prices
+	 * every subscription on the plan from its next charge.)
+	 */
+	archived?: boolean | undefined;
 };
 
 export interface Subscription {

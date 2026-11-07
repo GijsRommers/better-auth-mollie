@@ -11,6 +11,7 @@ export const MOLLIE_ERROR_CODES = defineErrorCodes({
 	INVALID_REQUEST_BODY: "Invalid request body",
 	SUBSCRIPTION_NOT_FOUND: "Subscription not found",
 	SUBSCRIPTION_PLAN_NOT_FOUND: "Subscription plan not found",
+	SUBSCRIPTION_PLAN_ARCHIVED: "This plan is no longer available",
 	ALREADY_SUBSCRIBED_PLAN: "You're already subscribed to this plan",
 	REFERENCE_ID_NOT_ALLOWED: "Reference id is not allowed",
 	CUSTOMER_NOT_FOUND: "Mollie customer not found for this reference",

@@ -107,10 +107,13 @@ type MolliePlan = {
 	description?: string; // shown on the checkout and bank statement
 	limits?: Record<string, unknown>; // returned by subscription.list
 	freeTrial?: { days: number };
+	archived?: boolean; // no longer offered; its subscribers keep it
 };
 ```
 
 `plans` can also be an async function, for example to load plans from your database. An annual plan is a plan of its own, for example `{ name: "pro-yearly", amount: "290.00", interval: "12 months" }`.
+
+**Changing prices.** To change a price for new customers only, add a plan with the new price (for example `pro-2027`) and set `archived: true` on the old one. New subscriptions and plan changes to an archived plan are refused (`SUBSCRIPTION_PLAN_ARCHIVED`). Its subscribers keep it at their price, and can still cancel, restore, recover after a failed payment, and change to another plan. Leave archived plans in your configuration for as long as anyone is on them, and leave them out of your pricing page. Changing a plan's `amount` instead re-prices every subscription on that plan from its next charge.
 
 ## Subscriptions
 
@@ -445,7 +448,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                       |
 | `schema`                                                                |                             | Rename tables and fields                                                                                                        |
 
-Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND`, `SUBSCRIPTION_PERIOD_ENDED` and `ANOTHER_SUBSCRIPTION_ACTIVE`.
+Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND`, `SUBSCRIPTION_PERIOD_ENDED`, `SUBSCRIPTION_PLAN_ARCHIVED` and `ANOTHER_SUBSCRIPTION_ACTIVE`.
 
 ## Known limits
 

@@ -191,6 +191,9 @@ export function validatePlans(plans: MolliePlan[]): void {
 		if (plan.freeTrial && (!Number.isInteger(plan.freeTrial.days) || plan.freeTrial.days < 1)) {
 			throw new Error(`Mollie plan "${plan.name}" has an invalid freeTrial.days value.`);
 		}
+		if (plan.archived !== undefined && typeof plan.archived !== "boolean") {
+			throw new Error(`Mollie plan "${plan.name}" has an invalid archived value.`);
+		}
 	}
 }
 

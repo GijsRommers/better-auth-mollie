@@ -608,6 +608,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			const plan = await getPlanByName(options, body.plan);
 			if (!plan) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
 			const planName = plan.name.toLowerCase();
+			// An archived plan stays for the subscriptions already on it.
+			const refuseArchived = () => {
+				if (plan.archived) {
+					throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_ARCHIVED);
+				}
+			};
 
 			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const target = findTarget(subscriptions, body.subscriptionId);
@@ -754,6 +760,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							return respond(body.successUrl);
 						}
 					}
+					if (planName !== current.plan) refuseArchived();
 					const customerId =
 						current.mollieCustomerId ??
 						(await getOrCreateCustomer(ctx, options, { customerType, referenceId }));
@@ -777,6 +784,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ALREADY_SUBSCRIBED_PLAN);
 					}
 					if (fresh.pendingPlan === planName && !fresh.cancelAtPeriodEnd) return fresh;
+					refuseArchived();
 					return whileCancellationHolds(ctx, options, fresh, () =>
 						changePlan(ctx, options, fresh, plan, customerType, lock),
 					);
@@ -785,6 +793,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			}
 
 			// New subscription: checkout for the first (mandate) payment.
+			refuseArchived();
 			const customerId = await getOrCreateCustomer(ctx, options, { customerType, referenceId });
 			// Reuse the pending row (updated under its lock in `checkout`), or start one.
 			let row =
