@@ -1128,3 +1128,80 @@ describe("re-check of f77df6d: failures are applied even if processing stopped",
 		expect((await env.subscription(subscription.id)).status).toBe("past_due");
 	});
 });
+
+describe("re-check of 0d722f4: failure consequences under lease loss and replay", () => {
+	it("keeps a failure to be done when its consequence was refused because the lease expired", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+
+		// The delivery claims the payment, then stalls past its lease.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			const result = await original(args);
+			if (args.model === "molliePayment" && args.set && "claimSerial" in args.set) {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return result;
+		};
+		const delivery = env.webhook(`id=${failed.id}`);
+		await paused;
+		travel(Date.now() + 3 * 60_000);
+		release();
+		await delivery;
+		adapter.incrementOne = original;
+		expect((await env.payments()).find((r) => r.molliePaymentId === failed.id)?.outcome).not.toBe(
+			"handled",
+		);
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+		expect((await env.payments()).find((r) => r.molliePaymentId === failed.id)?.outcome).toBe(
+			"handled",
+		);
+	});
+
+	it("does not make a subscription past due again when its cycle was paid after the failure", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+
+		// The failure is applied, then the process stops before recording that.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		adapter.incrementOne = async (args: any) => {
+			const result = await original(args);
+			if (args.model === "subscription" && args.set?.status === "past_due") {
+				adapter.incrementOne = original;
+				throw new Error("process stopped");
+			}
+			return result;
+		};
+		await env.webhook(`id=${failed.id}`);
+		adapter.incrementOne = original;
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+
+		// A retry for the same cycle is paid.
+		const retry = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${retry.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+
+		// The failure is processed again: that cycle is paid, nothing changes.
+		await env.webhook(`id=${failed.id}`);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+	});
+});

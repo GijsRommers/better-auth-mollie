@@ -503,9 +503,13 @@ async function applyPayment(
 				(purpose === "proration" &&
 					(subscription.appliedPaymentId === payment.id || record.outcome === "applied")))
 		) {
-			subscription = (await applyFailedRenewal(ctx, subscription, payment, lock)) ?? subscription;
+			subscription =
+				(await applyFailedRenewal(ctx, options, subscription, payment, lock)) ?? subscription;
 		}
 		// A failed recovery leaves the subscription as it was.
+		// Only while the lease still holds: a consequence that was not applied
+		// because the lease expired must stay to be done (fence throws then).
+		await lock.fence();
 		record = (await setOutcome(ctx, payment.id, UNHANDLED, "handled", claim)) ?? record;
 	}
 
@@ -906,24 +910,36 @@ async function applyRenewal(
 }
 
 /**
- * A recurring payment failed: `trialing | active → past_due`, unless the
- * payment predates the current period (a later payment already succeeded) or
- * comes from a Mollie subscription that has been replaced. Guarded on the
- * period it checked, so a renewal that lands concurrently wins.
+ * A charge failed: `trialing | active → past_due`, unless what it was for is
+ * paid anyway or no longer relevant:
+ * - a renewal: when the billing cycle it was charged for is already paid
+ *   (e.g. a retry for that cycle succeeded, also if this failure is processed
+ *   again later), or when it comes from a replaced Mollie subscription;
+ * - a pro-rata charge: when it predates the current period (a renewal or a
+ *   recovery started a new one since).
+ * Guarded on the period it checked, so a renewal that lands concurrently wins.
  */
 async function applyFailedRenewal(
 	ctx: Ctx,
+	options: MollieOptions,
 	subscription: Subscription,
 	payment: MolliePayment,
 	lock: SubscriptionLock,
 ): Promise<Subscription | null> {
 	if (subscription.status !== "trialing" && subscription.status !== "active") return null;
 	if (subscription.cancelAtPeriodEnd) return null;
-	if (payment.subscriptionId && payment.subscriptionId !== subscription.mollieSubscriptionId) {
+	const createdAt = new Date(payment.createdAt);
+	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+	if (payment.subscriptionId) {
+		if (payment.subscriptionId !== subscription.mollieSubscriptionId) return null;
+		const customerId = payment.customerId ?? subscription.mollieCustomerId;
+		if (!customerId) return null;
+		const remote = await gatewayFor(options).getSubscription(customerId, payment.subscriptionId);
+		const cycle = billingCycle(fromMollieDate(remote.startDate), remote.interval, createdAt);
+		if (periodEnd && cycle.end <= periodEnd) return null;
+	} else if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) {
 		return null;
 	}
-	const createdAt = new Date(payment.createdAt);
-	if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) return null;
 	return guardedUpdate(
 		ctx,
 		subscription.id,
@@ -1653,11 +1669,13 @@ async function outstandingPayments(
 			{ field: "outcome", operator: "in", value: ["pending", "duplicate"] },
 		],
 		// Not paid, consequence not applied yet (e.g. a failed renewal recorded
-		// right before the process stopped).
+		// right before the process stopped). Across all subscriptions only
+		// charges: failed checkouts matter for incomplete rows, synced anyway.
 		[
 			...scope,
 			{ field: "status", operator: "in", value: ["failed", "expired", "canceled"] },
 			{ field: "outcome", operator: "in", value: [...UNHANDLED] },
+			...(subscriptionId ? [] : [{ field: "sequenceType", value: "recurring" }]),
 		],
 	];
 	queries.unshift([
