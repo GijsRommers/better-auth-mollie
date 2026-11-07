@@ -178,6 +178,11 @@ export const molliePaymentSchema = {
 				defaultValue: false,
 				input: false,
 			},
+			invoice: {
+				type: "string",
+				required: false,
+				input: false,
+			},
 		},
 	},
 } satisfies BetterAuthPluginDBSchema;

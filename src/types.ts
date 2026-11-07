@@ -167,6 +167,11 @@ export interface MolliePaymentRecord {
 	claimSerial?: number | null | undefined;
 	/** Internal: its `payment.paid` / `payment.failed` hooks are still to be dispatched. */
 	hooksDue?: boolean | null | undefined;
+	/**
+	 * Its Mollie sales invoice: `created`, or `skipped` (not to be invoiced:
+	 * a verification payment, a duplicate, or `getRecipient` returned `null`).
+	 */
+	invoice?: "created" | "skipped" | null | undefined;
 }
 
 export type MollieOperationStatus = "pending" | "succeeded" | "failed";
@@ -434,7 +439,8 @@ export type SalesInvoicesOptions = {
 	enabled: boolean;
 	/**
 	 * The invoice recipient for a paid payment, from your own customer data
-	 * (Mollie requires name, email and address). Return `null` to skip.
+	 * (Mollie requires name, email and address). Return `null` to never
+	 * invoice this payment; throw to have the sync try again later.
 	 */
 	getRecipient: (
 		data: PaymentHookData,

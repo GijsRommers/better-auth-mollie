@@ -62,12 +62,23 @@ export async function createSalesInvoice(
 ): Promise<SalesInvoiceResponse | null> {
 	const config = options.salesInvoices;
 	if (!config?.enabled) return null;
-	if (data.isVerification && !config.invoiceVerificationPayments) return null;
-	// Only payments that paid for something: not one still being decided, and
-	// not a duplicate that is (being) refunded.
-	if (!INVOICED_OUTCOMES.includes(data.record.outcome)) return null;
+	// Not decided yet: the payment may still turn out to be a duplicate.
+	if (data.record.outcome === "pending") return null;
+	// Never invoiced (recorded, so the catch-up does not look at it again):
+	// verification payments (unless asked), duplicates that are (being)
+	// refunded, and payments the app chose not to invoice.
+	if (
+		(data.isVerification && !config.invoiceVerificationPayments) ||
+		!INVOICED_OUTCOMES.includes(data.record.outcome)
+	) {
+		await markInvoice(ctx, data.payment.id, "skipped");
+		return null;
+	}
 	const recipient = await config.getRecipient(data, ctx);
-	if (!recipient) return null;
+	if (!recipient) {
+		await markInvoice(ctx, data.payment.id, "skipped");
+		return null;
+	}
 
 	let request: SalesInvoiceRequest = { ...defaultInvoiceRequest(options, data), recipient };
 	if (config.getInvoiceParams) request = await config.getInvoiceParams(data, request, ctx);
@@ -96,9 +107,22 @@ export async function createSalesInvoice(
 		getId: (invoice) => invoice.id,
 		recover: (idempotencyKey) => gateway.findSalesInvoiceByOperationKey(idempotencyKey),
 	});
+	await markInvoice(ctx, data.payment.id, "created");
 	if (!operation.result) return null;
 	await config.onInvoiceCreated?.({ ...data, invoice: operation.result }, ctx);
 	return operation.result;
+}
+
+async function markInvoice(
+	ctx: GenericEndpointContext,
+	molliePaymentId: string,
+	invoice: "created" | "skipped",
+): Promise<void> {
+	await ctx.context.adapter.update({
+		model: "molliePayment",
+		where: [{ field: "molliePaymentId", value: molliePaymentId }],
+		update: { invoice },
+	});
 }
 
 /** How far back the sync looks for paid payments without an invoice. */
@@ -132,6 +156,8 @@ export async function catchUpSalesInvoices(
 			where: [
 				{ field: "status", value: "paid" },
 				{ field: "outcome", operator: "in", value: [...INVOICED_OUTCOMES] },
+				// Not invoiced or skipped yet.
+				{ field: "invoice", value: null },
 				{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
 			],
 			sortBy: { field: "molliePaymentId", direction: "asc" },

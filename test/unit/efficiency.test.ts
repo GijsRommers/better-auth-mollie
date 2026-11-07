@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { PLANS, setup, subscribe, travel } from "../helpers/setup";
+import { PLANS, settle, setup, subscribe, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -26,6 +26,23 @@ describe("efficient sync", () => {
 		}
 		expect(env.fake.callsTo("subscriptions.create")).toHaveLength(creates);
 		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+	});
+
+	it("does not refetch payments it decided not to invoice", async () => {
+		const getRecipient = vi.fn(async () => null);
+		const env = await setup({
+			subscription: { tax: { calculate: () => ({ rate: "21.00", country: "NL" }) } },
+			options: { salesInvoices: { enabled: true, getRecipient } },
+		});
+		await subscribe(env);
+		await settle();
+		await syncMollieSubscriptions(env.auth as never);
+		const asked = getRecipient.mock.calls.length;
+		const fetches = env.fake.callsTo("payments.get").length;
+		await syncMollieSubscriptions(env.auth as never);
+		expect(getRecipient.mock.calls.length).toBe(asked);
+		expect(env.fake.callsTo("payments.get")).toHaveLength(fetches);
+		expect(env.fake.salesInvoices.size).toBe(0);
 	});
 
 	it("does not reuse an open checkout in another currency", async () => {

@@ -364,7 +364,7 @@ mollie({
 });
 ```
 
-Invoice lines use the VAT that was actually charged, including reverse charge. Each payment is invoiced at most once, and invoices that failed are retried by the sync for 30 days. Duplicates that were refunded are not invoiced.
+Invoice lines use the VAT that was actually charged, including reverse charge. Each payment is invoiced at most once, and invoices that failed are retried by the sync for 30 days. Duplicates that were refunded are not invoiced. When `getRecipient` returns `null`, that payment is never invoiced; throw instead to have the sync try again later.
 
 ## Hooks
 
@@ -408,7 +408,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), and internally `claimSerial` and `hooksDue`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), and internally `claimSerial` and `hooksDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 
