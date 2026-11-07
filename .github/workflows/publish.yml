@@ -50,17 +50,36 @@ jobs:
         run: pnpm test:integration
       - run: pnpm build
       - run: pnpm lint:package
-      # A prerelease (1.1.0-beta.0) goes out under its own dist-tag (beta),
-      # so `latest` keeps pointing at the last stable version. A version that
-      # is on npm already (e.g. the first one, published by hand) is skipped.
+      # A prerelease (1.1.0-beta.0) goes out under its own dist-tag (alpha,
+      # beta, rc, or else next), so `latest` keeps pointing at the last stable
+      # version. A version that is on npm already (e.g. the first one,
+      # published by hand) is skipped.
       - name: Publish
         run: |
           version="$(node -p 'require("./package.json").version')"
-          if npm view "better-auth-mollie@$version" version >/dev/null 2>&1; then
-            echo "better-auth-mollie@$version is on npm already"
-            exit 0
-          fi
-          tag=latest
-          case "$version" in *-*) pre="${version#*-}"; tag="${pre%%.*}" ;; esac
+          # Published already? Only "no such version" goes on; another
+          # failure is retried, and stops the release if it persists.
+          errors="$(mktemp)"
+          for attempt in 1 2 3; do
+            if found="$(npm view "better-auth-mollie@$version" version 2>"$errors")"; then
+              if [ -n "$found" ]; then
+                echo "better-auth-mollie@$version is on npm already"
+                exit 0
+              fi
+              break
+            fi
+            grep -q E404 "$errors" && break
+            echo "Looking up better-auth-mollie@$version failed (attempt $attempt):"
+            cat "$errors"
+            [ "$attempt" = 3 ] && exit 1
+            sleep 10
+          done
+          case "$version" in
+            *-alpha*) tag=alpha ;;
+            *-beta*) tag=beta ;;
+            *-rc*) tag=rc ;;
+            *-*) tag=next ;;
+            *) tag=latest ;;
+          esac
           # Trusted publishing needs npm 11.5.1 or later.
-          npx -y npm@11 publish --provenance --access public --tag "$tag"
+          npx -y npm@11.21.2 publish --provenance --access public --tag "$tag"
