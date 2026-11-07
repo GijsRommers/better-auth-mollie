@@ -1280,11 +1280,10 @@ export async function reconcileRemote(
 		return settled();
 	}
 
-	const plan = await getPlanByName(options, subscription.pendingPlan ?? subscription.plan);
-	if (!plan) {
-		ctx.context.logger.error(`[mollie] Plan of ${subscription.id} is not configured`);
-		return subscription;
-	}
+	const wanted = subscription.pendingPlan ?? subscription.plan;
+	const plan = await getPlanByName(options, wanted);
+	// Reported (the sync lists it in its errors); Mollie keeps billing as it was.
+	if (!plan) throw new Error(`Plan "${wanted}" of ${subscription.id} is not configured`);
 	const planName = plan.name.toLowerCase();
 	const tax = await resolveTax(ctx, options, {
 		referenceId: subscription.referenceId,

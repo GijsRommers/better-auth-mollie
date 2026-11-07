@@ -3,6 +3,7 @@
  * subscriptions already on the archived one keep it, at its price.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { syncMollieSubscriptions } from "../../src";
 import type { MolliePlan } from "../../src/types";
 import { PLANS, setup, subscribe, travel } from "../helpers/setup";
 
@@ -31,6 +32,18 @@ describe("archived plans", () => {
 			body: { code: "SUBSCRIPTION_PLAN_ARCHIVED" },
 		});
 		expect(env.fake.callsTo("payments.create")).toEqual([]);
+	});
+
+	it("still start from a checkout begun before archiving", async () => {
+		const { plans, archive } = archivable();
+		const env = await setup({ subscription: { plans } });
+		const { payment } = await env.checkout("starter");
+		archive();
+		env.fake.completePayment(payment.id, "paid");
+		await env.webhook(`id=${payment.id}`);
+		const [subscription] = await env.subscriptions();
+		expect(subscription).toMatchObject({ status: "active", plan: "starter" });
+		expect(subscription?.mollieSubscriptionId).toBeTruthy();
 	});
 
 	it("keep billing the subscriptions already on them, at their price", async () => {
@@ -108,5 +121,22 @@ describe("archived plans", () => {
 		await expect(
 			env.api.upgradeSubscription({ body: { plan: "starter" }, headers }),
 		).rejects.toMatchObject({ body: { code: "SUBSCRIPTION_PLAN_ARCHIVED" } });
+	});
+
+	it("report a subscription whose plan was removed from the configuration", async () => {
+		let current = PLANS;
+		const env = await setup({ subscription: { plans: async () => current } });
+		const subscription = await subscribe(env);
+		current = PLANS.filter((plan) => plan.name !== "starter");
+		// The day before the next charge, when the sync looks at Mollie.
+		travel(new Date(subscription.periodEnd!).getTime() - 12 * 3_600_000);
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors).toEqual([
+			expect.objectContaining({
+				subscriptionId: subscription.id,
+				message: expect.stringContaining('Plan "starter"'),
+			}),
+		]);
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
 	});
 });

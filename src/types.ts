@@ -98,9 +98,11 @@ export type MolliePlan = {
 	/**
 	 * No longer offered: new subscriptions and plan changes to it are
 	 * refused (`SUBSCRIPTION_PLAN_ARCHIVED`), while subscriptions already on
-	 * it keep it, at its price. To change a price for new customers only, add
-	 * a new plan and archive the old one. (Changing `amount` itself re-prices
-	 * every subscription on the plan from its next charge.)
+	 * it keep it, at its price. A checkout started before it was archived can
+	 * still be paid. To change a price for new customers only, add a new plan
+	 * and archive the old one. (Changing `amount` itself re-prices the
+	 * subscriptions on the plan when the sync updates them before their next
+	 * charge; an `unpaid` one keeps the old amount until it recovers.)
 	 */
 	archived?: boolean | undefined;
 };

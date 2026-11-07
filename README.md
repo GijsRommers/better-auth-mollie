@@ -113,7 +113,11 @@ type MolliePlan = {
 
 `plans` can also be an async function, for example to load plans from your database. An annual plan is a plan of its own, for example `{ name: "pro-yearly", amount: "290.00", interval: "12 months" }`.
 
-**Changing prices.** To change a price for new customers only, add a plan with the new price (for example `pro-2027`) and set `archived: true` on the old one. New subscriptions and plan changes to an archived plan are refused (`SUBSCRIPTION_PLAN_ARCHIVED`). Its subscribers keep it at their price, and can still cancel, restore, recover after a failed payment, and change to another plan. Leave archived plans in your configuration for as long as anyone is on them, and leave them out of your pricing page. Changing a plan's `amount` instead re-prices every subscription on that plan from its next charge.
+**Changing prices.** To change a price for new customers only, add a plan with the new price (for example `pro-2027`) and set `archived: true` on the old one. New subscriptions and plan changes to an archived plan are refused (`SUBSCRIPTION_PLAN_ARCHIVED`). Its subscribers keep it at their price, and can still cancel, restore, recover after a failed payment, and change to another plan. A checkout started before the plan was archived can still be paid, and starts the subscription on it: the customer agreed to that price, and Mollie expires open checkouts. Leave archived plans out of your pricing page.
+
+Changing a plan's `amount` instead re-prices the subscriptions on it: the sync updates each one's Mollie subscription before its next charge (a charge already in progress keeps the old amount, and an `unpaid` subscription keeps it until it recovers).
+
+Keep every plan that a subscription is on, or is scheduled to change to, in your configuration. Mollie keeps billing a subscription whose plan is missing, but the plugin can no longer change it, and the sync reports it in its `errors`.
 
 ## Subscriptions
 
