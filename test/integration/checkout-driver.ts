@@ -26,7 +26,9 @@ let browser: Browser | undefined;
 async function open(url: string): Promise<Page> {
 	browser ??= await chromium.launch();
 	const page = await browser.newPage({ locale: "en-US" });
-	await page.goto(url, { waitUntil: "networkidle" });
+	// Not "networkidle": Mollie's checkout keeps requests going. The steps
+	// after this wait for the elements they use.
+	await page.goto(url, { waitUntil: "load", timeout: 60_000 });
 	return page;
 }
 
