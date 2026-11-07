@@ -13,6 +13,7 @@ import type {
 } from "mollie-api-typescript/models";
 
 import { toCents } from "./tax";
+import type { PaymentPurpose } from "./types";
 
 /** A Mollie payment as returned by `payments.get` or a list endpoint. */
 export type MolliePayment = PaymentResponse | ListPaymentResponse;
@@ -31,6 +32,28 @@ const RECOVERY_SLACK_MS = 60 * 60 * 1000;
 const PAGE_LIMIT = 250;
 
 type Listed = { id: string; metadata?: unknown; createdAt?: string | null };
+
+const PURPOSES: readonly PaymentPurpose[] = [
+	"checkout",
+	"verification",
+	"renewal",
+	"proration",
+	"recovery",
+];
+
+/** Why a payment exists, from the metadata we set (or its sequence type). */
+export function paymentPurpose(payment: MolliePayment): PaymentPurpose {
+	const metadata = metadataOf(payment);
+	if (
+		typeof metadata.purpose === "string" &&
+		PURPOSES.includes(metadata.purpose as PaymentPurpose)
+	) {
+		return metadata.purpose as PaymentPurpose;
+	}
+	if (payment.sequenceType === "first")
+		return metadata.trial === true ? "verification" : "checkout";
+	return "renewal";
+}
 
 /** Payment metadata as a plain object (Mollie allows strings and arrays too). */
 export function metadataOf(resource: { metadata?: unknown }): Record<string, unknown> {

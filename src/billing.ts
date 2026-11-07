@@ -1,7 +1,13 @@
 import type { GenericEndpointContext as Ctx, Where } from "better-auth";
 import { PlanNotConfiguredError } from "./errors";
 import { type BillingEvent, dispatchEvents } from "./events";
-import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } from "./gateway";
+import {
+	gatewayFor,
+	type MolliePayment,
+	type MollieSubscription,
+	metadataOf,
+	paymentPurpose,
+} from "./gateway";
 import { coverage, withReferenceLock } from "./identity";
 import { type SubscriptionLock, withSubscriptionLock } from "./lock";
 import { OperationInProgressError } from "./operations";
@@ -155,6 +161,14 @@ export async function recordPayment(
 			if (!existing) throw error;
 		}
 	}
+	// Recorded before payments carried their purpose: fill it in.
+	if (!existing.purpose) {
+		await adapter.update({
+			model: "molliePayment",
+			where,
+			update: { purpose: paymentPurpose(payment) },
+		});
+	}
 	if (!canAdvancePayment(existing.status, status)) return;
 	// Guarded on the status that was read: a concurrent recorder that moved it
 	// further wins, and this call then changes nothing.
@@ -166,27 +180,7 @@ export async function recordPayment(
 	});
 }
 
-const PURPOSES: readonly PaymentPurpose[] = [
-	"checkout",
-	"verification",
-	"renewal",
-	"proration",
-	"recovery",
-];
-
-/** Why a payment exists, from the metadata we set (or its sequence type). */
-export function paymentPurpose(payment: MolliePayment): PaymentPurpose {
-	const metadata = metadataOf(payment);
-	if (
-		typeof metadata.purpose === "string" &&
-		PURPOSES.includes(metadata.purpose as PaymentPurpose)
-	) {
-		return metadata.purpose as PaymentPurpose;
-	}
-	if (payment.sequenceType === "first")
-		return metadata.trial === true ? "verification" : "checkout";
-	return "renewal";
-}
+export { paymentPurpose };
 
 /** What hooks (and sales invoices) receive about a payment. */
 export async function paymentHookData(

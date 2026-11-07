@@ -1,4 +1,5 @@
 import type { GenericEndpointContext as Ctx, Where } from "better-auth";
+import { gatewayFor, paymentPurpose } from "./gateway";
 import type { SubscriptionLock } from "./lock";
 import { LockLostError } from "./operations";
 import { DEFAULT_GRACE_PERIOD_DAYS } from "./status";
@@ -200,7 +201,19 @@ export async function settlePreviousPayment(
 		// applied it stopped before recording that), and a verification still
 		// gets its refund.
 		const record = await findPaymentRecord(ctx, previous);
-		const refund = !!record?.purpose && refundsVerification(options, record.purpose, record.amount);
+		let purpose = record?.purpose ?? null;
+		// Recorded before payments carried their purpose: a first payment may
+		// be a verification, so Mollie is asked (a failure leaves this payment,
+		// and the one settling it, to be processed again).
+		if (
+			record &&
+			!purpose &&
+			record.sequenceType === "first" &&
+			refundsVerification(options, "verification", record.amount)
+		) {
+			purpose = paymentPurpose(await gatewayFor(options).getPayment(previous));
+		}
+		const refund = !!record && !!purpose && refundsVerification(options, purpose, record.amount);
 		await setOutcome(ctx, previous, ["pending"], "applied", undefined, {
 			paidThrough: periodEndOf(subscription),
 			...(refund ? { refundDue: true } : {}),

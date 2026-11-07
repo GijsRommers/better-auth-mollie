@@ -141,4 +141,36 @@ describe("refundVerificationPayment", () => {
 		expect(env.fake.salesInvoices.size).toBe(0);
 		expect(getRecipient).not.toHaveBeenCalled();
 	});
+
+	describe("payments recorded before they carried a purpose", () => {
+		it("still refunds a verification that a renewal settles", async () => {
+			const env = await setup({ subscription: { refundVerificationPayment: true } });
+			env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+			const { payment, subscription } = await startTrial(env);
+			await env.context.adapter.update({
+				model: "molliePayment",
+				where: [{ field: "molliePaymentId", value: payment.id }],
+				update: { outcome: "pending", refundDue: false, purpose: null },
+			});
+			travel(new Date(subscription.trialEnd!).getTime() + 3_600_000);
+			const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+			await env.webhook(`id=${renewal.id}`);
+			expect(await record(env, payment.id)).toMatchObject({ outcome: "applied", refundDue: true });
+
+			await syncMollieSubscriptions(env.auth as never);
+			expect([...env.fake.refunds.values()].map((r) => r.paymentId)).toEqual([payment.id]);
+		});
+
+		it("get their purpose when they are processed again", async () => {
+			const env = await setup();
+			const { payment } = await startTrial(env);
+			await env.context.adapter.update({
+				model: "molliePayment",
+				where: [{ field: "molliePaymentId", value: payment.id }],
+				update: { purpose: null },
+			});
+			await env.webhook(`id=${payment.id}`);
+			expect((await record(env, payment.id)).purpose).toBe("verification");
+		});
+	});
 });
