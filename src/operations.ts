@@ -379,9 +379,10 @@ function newToken(): string {
  * never depends on timestamp equality.
  *
  * `fn` receives `fence`: call it right before any charge or write. It renews
- * the lease and throws if another caller took it over (possible only after a
- * pause longer than `LOCK_LEASE_MS`), so a stalled holder cannot act on a
- * stale view.
+ * the lease, and throws once the lease has expired (after a pause longer than
+ * `LOCK_LEASE_MS`), whether or not another caller took it over yet: a
+ * stalled holder never acts on a stale view, and what it did before the
+ * pause can be judged by others after the lease (see `applyProration`).
  */
 export async function withLock<T>(
 	context: AuthContext,
@@ -439,7 +440,10 @@ export async function withLock<T>(
 	const fence: Fence = async () => {
 		const renewed = await adapter.incrementOne({
 			model: "mollieOperation",
-			where: mine,
+			where: [
+				...mine,
+				{ field: "createdAt", operator: "gte", value: new Date(now().getTime() - LOCK_LEASE_MS) },
+			],
 			increment: {},
 			set: { createdAt: now() },
 		});

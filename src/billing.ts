@@ -465,9 +465,10 @@ async function applyPaidPayment(
 }
 
 /**
- * A pro-rata charge must not be processed before the upgrade that made it
- * had its chance to be recorded; after this, an upgrade that was never
- * recorded never will be (the lock lease is much shorter).
+ * A pro-rata charge must not be judged before the upgrade that made it had
+ * its chance to be recorded. After this, an upgrade that was not recorded
+ * never will be: its lock lease (renewed right before charging) expired long
+ * ago, and an expired lease cannot be renewed.
  */
 const PRORATION_GRACE_MS = 10 * 60 * 1000;
 
@@ -567,8 +568,10 @@ export async function refundUnappliedPayment(
 	subscription: Subscription,
 	payment: MolliePayment,
 ): Promise<BillingEvent[]> {
-	await setOutcome(ctx, payment.id, ["pending", "applied"], "duplicate");
-	if (payment.status !== "paid") return [];
+	// Only a charge nobody applied: each upgrade attempt charges its own
+	// payment, so an applied outcome means the upgrade did go through.
+	const marked = await setOutcome(ctx, payment.id, ["pending"], "duplicate");
+	if (!marked || payment.status !== "paid") return [];
 	return refundDuplicate(ctx, options, payment, subscription);
 }
 
@@ -741,6 +744,9 @@ async function applyRenewal(
 	for (let attempt = 0; attempt < APPLY_ATTEMPTS && subscription; attempt++) {
 		if (!BILLING_STATUSES.includes(subscription.status)) return { kind: "covered" };
 		if (remoteId !== subscription.mollieSubscriptionId) return { kind: "covered" };
+		// Canceled: a charge Mollie still made (e.g. stopping it failed) pays
+		// for a period the customer canceled, so it is refunded.
+		if (subscription.cancelAtPeriodEnd) return { kind: "covered" };
 		if (!cycle) {
 			const remote = await gatewayFor(options).getSubscription(customerId, remoteId);
 			cycle = billingCycle(
@@ -760,6 +766,7 @@ async function applyRenewal(
 		const switchPlan = !!subscription.pendingPlan && billedPlan === subscription.pendingPlan;
 		const guards: Where[] = [
 			{ field: "mollieSubscriptionId", value: remoteId },
+			{ field: "cancelAtPeriodEnd", value: false },
 			...sameAppliedPayment(subscription),
 		];
 		if (currentEnd) guards.push({ field: "periodEnd", value: currentEnd });
@@ -961,9 +968,9 @@ export async function settleRecentCharges(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
+	remoteId: string | null | undefined = subscription.mollieSubscriptionId,
 ): Promise<{ inProgress: boolean; processed: boolean }> {
 	const customerId = subscription.mollieCustomerId;
-	const remoteId = subscription.mollieSubscriptionId;
 	if (!customerId || !remoteId) return { inProgress: false, processed: false };
 	let recent: MolliePayment[];
 	try {
@@ -1011,23 +1018,25 @@ async function creationInFlight(ctx: Ctx, subscription: Subscription, now: Date)
 	);
 }
 
-/** Cancels every running Mollie subscription tagged for this row, except `keep`. */
+/** Cancels every running Mollie subscription tagged for this row; returns their ids. */
 async function cancelTagged(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
 	fence: Fence,
-	keep?: string,
-): Promise<void> {
+): Promise<string[]> {
 	const customerId = subscription.mollieCustomerId as string;
+	const canceled: string[] = [];
 	for (const remote of await gatewayFor(options).listLiveCustomerSubscriptions(customerId)) {
-		if (remote.id === keep || metadataOf(remote).subscriptionId !== subscription.id) continue;
+		if (metadataOf(remote).subscriptionId !== subscription.id) continue;
 		await fence();
 		await cancelMollieSubscription(ctx, options, {
 			...subscription,
 			mollieSubscriptionId: remote.id,
 		});
+		canceled.push(remote.id);
 	}
+	return canceled;
 }
 
 /**
@@ -1098,10 +1107,19 @@ export async function reconcileRemote(
 			await fence();
 			await cancelMollieSubscription(ctx, options, subscription);
 		}
-		await cancelTagged(ctx, options, subscription, fence);
-		// A creation that is still in flight could start billing after this
-		// sweep: look again later.
-		if (await creationInFlight(ctx, subscription, now)) return postpone();
+		const stopped = await cancelTagged(ctx, options, subscription, fence);
+		// Billing is stopped. Charges those Mollie subscriptions made that were
+		// never processed (no webhook) are processed now: a charge for a canceled
+		// period is refunded. One still in progress is looked at again later, as
+		// is a creation that is still in flight and could start billing.
+		let pending = false;
+		for (const remoteId of new Set([subscription.mollieSubscriptionId, ...stopped])) {
+			if (!remoteId) continue;
+			if ((await settleRecentCharges(ctx, options, subscription, remoteId)).inProgress) {
+				pending = true;
+			}
+		}
+		if (pending || (await creationInFlight(ctx, subscription, now))) return postpone();
 		return settled();
 	}
 
@@ -1347,7 +1365,11 @@ export async function applyTimeTransitions(
 			subscription.id,
 			BILLING_STATUSES,
 			{ status: "canceled", pendingPlan: null },
-			[],
+			// Only the cancellation that was read: not one restored meanwhile.
+			[
+				{ field: "cancelAtPeriodEnd", value: true },
+				{ field: "periodEnd", value: periodEnd },
+			],
 			{ mollieSync: true },
 		);
 		if (!canceled) return { subscription, events: [] };
@@ -1367,12 +1389,17 @@ export async function applyTimeTransitions(
 			subscription.id,
 			BILLING_STATUSES,
 			{ plan: subscription.pendingPlan, pendingPlan: null },
-			[{ field: "pendingPlan", value: subscription.pendingPlan }],
+			[
+				{ field: "pendingPlan", value: subscription.pendingPlan },
+				{ field: "periodEnd", value: periodEnd },
+			],
 		);
 		if (switched) return applyTimeTransitions(ctx, options, switched, now);
 	}
 	if (subscription.status === "past_due" && now >= addDays(periodEnd, gracePeriodDays(options))) {
-		const unpaid = await guardedUpdate(ctx, subscription.id, ["past_due"], { status: "unpaid" });
+		const unpaid = await guardedUpdate(ctx, subscription.id, ["past_due"], { status: "unpaid" }, [
+			{ field: "periodEnd", value: periodEnd },
+		]);
 		return { subscription: unpaid ?? subscription, events: [] };
 	}
 	return { subscription, events: [] };

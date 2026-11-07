@@ -4,6 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
+import { applyTimeTransitions } from "../../src/billing";
 import { toMollieDate } from "../../src/utils";
 import { PLANS, settle, setup, type TestEnv } from "../helpers/setup";
 
@@ -485,3 +486,142 @@ describe("re-check of 94c806f: cancellation, coverage and compensation", () => {
 function metadataPurpose(payment: { metadata?: unknown }) {
 	return (payment.metadata as { purpose?: string } | undefined)?.purpose;
 }
+
+describe("re-check of 36f27be: shared charges, unseen charges, stale transitions", () => {
+	const prorations = (env: TestEnv) =>
+		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
+
+	/** An upgrade to business that stalls right after charging, until released. */
+	async function stalledUpgrade(env: TestEnv) {
+		let reached!: () => void;
+		const charged = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		env.fake.afterNextCreate("payments.create", async () => {
+			reached();
+			await gate;
+		});
+		const upgrade = env.api
+			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await charged;
+		travel(Date.now() + 3 * 60_000);
+		return { upgrade, release };
+	}
+
+	async function settleAll(env: TestEnv) {
+		for (const payment of prorations(env)) {
+			if (payment.status === "open") env.fake.completePayment(payment.id, "paid");
+			await env.webhook(`id=${payment.id}`);
+		}
+		travel(Date.now() + 15 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+	}
+
+	it("never refunds the charge of an upgrade that took over a stalled one", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		const stalled = await stalledUpgrade(env);
+		// The same upgrade again, after the first one's lease expired.
+		const { headers } = await env.signInWithTestUser();
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers });
+		stalled.release();
+		await stalled.upgrade;
+		await settleAll(env);
+
+		const row = await env.subscription(subscription.id);
+		expect(row.plan).toBe("business");
+		const records = await env.payments();
+		const applied = records.find((r) => r.molliePaymentId === row.appliedPaymentId)!;
+		expect(applied.outcome).toBe("applied");
+		expect(refundedIds(env)).not.toContain(applied.molliePaymentId);
+		// Exactly one pro-rata charge is kept.
+		const kept = prorations(env).filter((p) => !refundedIds(env).includes(p.id));
+		expect(kept.map((p) => p.id)).toEqual([applied.molliePaymentId]);
+	});
+
+	it("never grants an upgrade on a charge that was refunded, however often it was retried", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		for (let i = 0; i < 3; i++) {
+			const stalled = await stalledUpgrade(env);
+			const { headers } = await env.signInWithTestUser();
+			await env.api.upgradeSubscription({ body: { plan: "yearly" }, headers });
+			stalled.release();
+			await stalled.upgrade;
+			// Undo the scheduled change, so the next attempt is an upgrade again.
+			await env.api.upgradeSubscription({ body: { plan: "starter" }, headers });
+		}
+		const compensated = prorations(env).map((p) => p.id);
+		const { headers } = await env.signInWithTestUser();
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers });
+
+		const row = await env.subscription(subscription.id);
+		expect(row.plan).toBe("business");
+		expect(compensated).not.toContain(row.appliedPaymentId);
+		const record = (await env.payments()).find((r) => r.molliePaymentId === row.appliedPaymentId);
+		expect(record?.outcome).not.toMatch(/duplicate|refunded/);
+	});
+
+	it("refunds a renewal Mollie collected after a failed cancellation, without a webhook", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		env.fake.failNext("subscriptions.cancel", new TypeError("fetch failed"));
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const charge = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([charge.id]);
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "canceled",
+			mollieSyncNeeded: false,
+		});
+	});
+
+	it("keeps watching a charge that is still pending when billing is cleaned up", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		env.fake.failNext("subscriptions.cancel", new TypeError("fetch failed"));
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const charge = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "open");
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "canceled",
+			mollieSyncNeeded: true,
+		});
+		env.fake.completePayment(charge.id, "paid");
+		travel(Date.now() + 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([charge.id]);
+		expect((await env.subscription(subscription.id)).mollieSyncNeeded).toBe(false);
+	});
+
+	it("does not end a subscription that was restored after it was read", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		const stale = await env.subscription(subscription.id);
+		await env.api.restoreSubscription({ body: {}, headers: env.headers });
+
+		// A request that read the canceling row resumes after the period ended.
+		await applyTimeTransitions(
+			{ context: env.context } as never,
+			{ mollieClient: env.fake.client, subscription: { enabled: true, plans: PLANS } } as never,
+			stale,
+			new Date(new Date(subscription.periodEnd!).getTime() + 3_600_000),
+		);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "active",
+			cancelAtPeriodEnd: false,
+		});
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
+	});
+});

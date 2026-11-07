@@ -6,7 +6,6 @@ import {
 	applyTimeTransitions,
 	findSubscription,
 	guardedUpdate,
-	paymentOutcome,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
@@ -208,7 +207,9 @@ export function prorationCents(
 
 /**
  * Charges the pro-rata difference of an upgrade right away, on the mandate
- * of the subscription (no checkout). One charge per plan per period.
+ * of the subscription (no checkout). The charge belongs to this upgrade
+ * attempt only: it counts once the upgrade records it as the applied payment,
+ * and is refunded otherwise (see `applyProration`).
  */
 async function chargeProration(
 	ctx: GenericEndpointContext,
@@ -233,16 +234,12 @@ async function chargeProration(
 	const gateway = gatewayFor(options);
 	// The tax callback may be slow: prove the lock is still ours right before charging.
 	await fence();
-	const baseScope = `proration:${current.id}:${planName}:${periodEnd}`;
+	// Each upgrade attempt charges its own payment, never one made by another
+	// attempt (that attempt may still refund it). An attempt that lost its
+	// lock leaves its charge unapplied, and it is refunded.
+	const attempt = globalThis.crypto.randomUUID().replaceAll("-", "").slice(0, 12);
 	try {
-		for (let attempt = 0, scope = baseScope; ; attempt++) {
-			const payment = await chargeOnce(scope);
-			// A replayed charge that was refunded (its upgrade did not go
-			// through) does not pay for this upgrade: charge anew.
-			const outcome = await paymentOutcome(ctx, payment.id);
-			if ((outcome !== "duplicate" && outcome !== "refunded") || attempt >= 2) return payment;
-			scope = `${baseScope}:after:${payment.id}`;
-		}
+		return await chargeOnce(`proration:${current.id}:${planName}:${periodEnd}:${attempt}`);
 	} catch (error) {
 		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
 	}
