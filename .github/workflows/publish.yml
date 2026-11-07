@@ -1,7 +1,9 @@
 name: Publish
 
-# Publishes to npm when a GitHub release is published (tag `v<version>`).
-# Needs the NPM_TOKEN secret, or npm trusted publishing for this workflow.
+# Publishes to npm when a GitHub release is published (tag `v<version>`),
+# through npm trusted publishing: npm trusts this workflow file in the `npm`
+# environment (OIDC, no token), and the package gets provenance. Add
+# required reviewers to the `npm` environment to approve each release.
 on:
   release:
     types: [published]
@@ -60,6 +62,5 @@ jobs:
           fi
           tag=latest
           case "$version" in *-*) pre="${version#*-}"; tag="${pre%%.*}" ;; esac
-          pnpm publish --provenance --access public --no-git-checks --tag "$tag"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Trusted publishing needs npm 11.5.1 or later.
+          npx -y npm@11 publish --provenance --access public --tag "$tag"
