@@ -226,7 +226,7 @@ For user billing, `authorizeReference` is only needed to let a user act on a `re
 
 Mollie's webhook only carries an id (`id=tr_…`). The plugin ignores everything else in the request and fetches the payment or subscription from the Mollie API, so a forged webhook cannot change anything. Processing is idempotent: a payment's status only moves forward, hooks run at most once per change, and repeated or out-of-order deliveries are harmless.
 
-Your hooks run in the background, after the response, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. The webhook itself makes a few Mollie requests, each limited by `requestTimeoutMs` (10 seconds by default). Mollie waits 15 seconds for an answer, so keep that timeout low; a webhook that times out or fails is retried by Mollie, and the sync catches up on anything left over. If something fails (Mollie unreachable, a concurrent operation), the endpoint answers with an error so that Mollie retries.
+Your hooks run in the background, after the response, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. The webhook itself makes a few Mollie requests, each limited by `requestTimeoutMs` (10 seconds by default). Mollie waits 15 seconds for an answer, so keep that timeout low; a webhook that times out or fails is retried by Mollie, and the sync catches up on anything left over. If something fails (Mollie unreachable), the endpoint answers with an error so that Mollie retries. Payments and changes to the same subscription are processed one at a time; a webhook that finds its subscription busy for more than two seconds gets `409`, and Mollie retries it.
 
 **Local development:** Mollie rejects webhook URLs it cannot reach, such as `localhost`. When `baseURL` is local, the plugin sends no webhook URL and logs a warning. The success redirect then syncs the first payment, and the cron syncs everything else. To receive webhooks locally, use a tunnel and point `webhookUrl` at it:
 
@@ -402,6 +402,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `customerType`                           | string?         | `user` or `organization`                                 |
 | `appliedPaymentId`                       | string?         | The payment that last activated, recovered or renewed it |
 | `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number | Internal: a change still to reach Mollie                 |
+| `lockToken`, `lockedUntil` | string, date | Internal: lease of whoever is changing the subscription |
 | `createdAt`, `updatedAt`                 | date            |                                                          |
 
 **`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`).
