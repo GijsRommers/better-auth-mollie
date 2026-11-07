@@ -221,7 +221,7 @@ betterAuth({
 });
 ```
 
-Requests bill `referenceId`, or else the session's `activeOrganizationId`. Without either, they fail with `ORGANIZATION_REFERENCE_ID_REQUIRED`; they never fall back to the user. An organization with a billed subscription (trialing, active, past_due or unpaid) cannot be deleted. Changes to an organization's name are synced to its Mollie customer.
+Requests bill `referenceId`, or else the session's `activeOrganizationId`. Without either, they fail with `ORGANIZATION_REFERENCE_ID_REQUIRED`; they never fall back to the user. An organization with a billed subscription (trialing, active, past_due or unpaid) cannot be deleted until that subscription is canceled; a pending cancellation (`cancelAtPeriodEnd`) does not block deletion. Changes to an organization's name are synced to its Mollie customer.
 
 For user billing, `authorizeReference` is only needed to let a user act on a `referenceId` other than their own id.
 
@@ -370,7 +370,7 @@ Invoice lines use the VAT that was actually charged, including reverse charge. E
 
 ```ts
 subscription: {
-	onSubscriptionActivated: async ({ subscription, plan, payment }) => {},
+	onSubscriptionActivated: async ({ subscription, plan, payment }) => {}, // first payment, or a recovery
 	onPaymentPaid: async (data) => {},       // every paid payment
 	onPaymentFailed: async (data) => {},     // failed or expired
 	onDuplicatePayment: async (data) => {},  // `data.refunded` tells whether it was refunded
