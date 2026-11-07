@@ -144,9 +144,11 @@ export interface Subscription {
  * - `applied`: it paid for the subscription;
  * - `duplicate`: it paid for something already paid; a refund is due;
  * - `refunded`: such a duplicate, refunded;
- * - `kept`: such a duplicate, kept (`refundDuplicatePayments: false`).
+ * - `kept`: such a duplicate, kept (`refundDuplicatePayments: false`);
+ * - `handled`: not paid (failed, expired, canceled), and what that means for
+ *   the subscription (past due, checkout over) has been applied.
  */
-export type PaymentOutcome = "pending" | "applied" | "duplicate" | "refunded" | "kept";
+export type PaymentOutcome = "pending" | "applied" | "duplicate" | "refunded" | "kept" | "handled";
 
 export interface MolliePaymentRecord {
 	id: string;

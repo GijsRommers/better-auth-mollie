@@ -1089,3 +1089,42 @@ describe("re-check of 933ba33: successive upgrades, hooks when a refund fails", 
 		expect(refundedIds(env)).toEqual([second.payment.id]);
 	});
 });
+
+describe("re-check of f77df6d: failures are applied even if processing stopped", () => {
+	const prorations = (env: TestEnv) =>
+		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
+
+	it("applies a failed charge recorded right before the process stopped", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		await env.api.upgradeSubscription({ body: { plan: "pro" }, headers: env.headers });
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		const [first, second] = prorations(env);
+		env.fake.completePayment(second!.id, "paid");
+		env.fake.completePayment(first!.id, "failed");
+
+		// No webhooks. The sync records the failure, then the process stops.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		adapter.incrementOne = async (args: any) => {
+			const result = await original(args);
+			if (args.model === "molliePayment" && args.set?.status === "failed") {
+				adapter.incrementOne = original;
+				throw new Error("process stopped");
+			}
+			return result;
+		};
+		await syncMollieSubscriptions(env.auth as never);
+		adapter.incrementOne = original;
+		const recorded = (await env.payments()).find((r) => r.molliePaymentId === first!.id);
+		expect(recorded?.status).toBe("failed");
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+		const handled = (await env.payments()).find((r) => r.molliePaymentId === first!.id);
+		expect(handled?.outcome).toBe("handled");
+		// Delivered again later: nothing changes twice.
+		await env.webhook(`id=${first!.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+	});
+});

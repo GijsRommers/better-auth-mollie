@@ -487,7 +487,9 @@ async function applyPayment(
 				duplicateEvents.push(...classified.events);
 			}
 		}
-	} else if (isFinalPaymentStatus(status) && status !== "paid") {
+	} else if (isFinalPaymentStatus(status) && status !== "paid" && isUnhandled(record)) {
+		// Not paid. Its consequence is applied first and recorded as handled
+		// after, so a stop in between is repaired by the next delivery or sync.
 		if (purpose === "checkout" || purpose === "verification") {
 			// Driven by the payment's state, not by who saw it change first, so
 			// a crash right after recording the payment is repaired next time.
@@ -504,6 +506,7 @@ async function applyPayment(
 			subscription = (await applyFailedRenewal(ctx, subscription, payment, lock)) ?? subscription;
 		}
 		// A failed recovery leaves the subscription as it was.
+		record = (await setOutcome(ctx, payment.id, UNHANDLED, "handled", claim)) ?? record;
 	}
 
 	if (recorded.transitioned && (status === "paid" || isFailedPaymentStatus(status))) {
@@ -1097,13 +1100,23 @@ export async function settleRecentCharges(
 	return { inProgress: false, processed: await processUnsettled(ctx, options, recent, lock) };
 }
 
+/**
+ * Outcomes of a payment that is not paid whose consequence was not applied
+ * yet (`applied`: a pro-rata charge a later upgrade recorded as applied).
+ */
+const UNHANDLED: readonly PaymentOutcome[] = ["pending", "applied"];
+
+function isUnhandled(record: MolliePaymentRecord): boolean {
+	return UNHANDLED.includes(record.outcome);
+}
+
 /** Whether a payment from Mollie still has to be processed locally. */
 async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
 	const record = await findPaymentRecord(ctx, payment.id);
-	return !(
-		record?.status === payment.status &&
-		(payment.status !== "paid" || (record.outcome !== "pending" && record.outcome !== "duplicate"))
-	);
+	if (record?.status !== payment.status) return true;
+	if (payment.status === "paid")
+		return record.outcome === "pending" || record.outcome === "duplicate";
+	return isFinalPaymentStatus(payment.status as string) && isUnhandled(record);
 }
 
 async function processUnsettled(
@@ -1638,6 +1651,13 @@ async function outstandingPayments(
 			...scope,
 			{ field: "status", value: "paid" },
 			{ field: "outcome", operator: "in", value: ["pending", "duplicate"] },
+		],
+		// Not paid, consequence not applied yet (e.g. a failed renewal recorded
+		// right before the process stopped).
+		[
+			...scope,
+			{ field: "status", operator: "in", value: ["failed", "expired", "canceled"] },
+			{ field: "outcome", operator: "in", value: [...UNHANDLED] },
 		],
 	];
 	queries.unshift([
