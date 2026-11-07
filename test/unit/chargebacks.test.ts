@@ -364,6 +364,50 @@ describe("chargebacks", () => {
 		expect(record.hooksDue).toBe(false);
 	});
 
+	it("does not skip recorded chargebacks when one leaves the selection while paging", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const ids = Array.from({ length: 101 }, (_, i) => `tr_page${String(i).padStart(3, "0")}`);
+		for (const molliePaymentId of ids) {
+			await env.context.adapter.create({
+				model: "molliePayment",
+				data: {
+					molliePaymentId,
+					subscriptionId: subscription.id,
+					amount: "1.00",
+					currency: "EUR",
+					status: "paid",
+					sequenceType: "recurring",
+					outcome: "applied",
+					claimSerial: 0,
+					paidAt: new Date(),
+					amountChargedBack: "1.00",
+				},
+			});
+		}
+		// A reversal of the first one is processed between the two pages.
+		const adapter = env.context.adapter as any;
+		const original = adapter.findMany.bind(adapter);
+		let pages = 0;
+		adapter.findMany = async (args: any) => {
+			const selection = args.where?.some((w: any) => w.field === "amountChargedBack");
+			if (args.model === "molliePayment" && selection && ++pages === 2) {
+				await env.context.adapter.update({
+					model: "molliePayment",
+					where: [{ field: "molliePaymentId", value: ids[0]! }],
+					update: { amountChargedBack: null },
+				});
+			}
+			return original(args);
+		};
+		await syncMollieSubscriptions(env.auth as never);
+		adapter.findMany = original;
+		const looked = env.fake
+			.callsTo("chargebacks.list")
+			.map((call) => (call.args[0] as { paymentId: string }).paymentId);
+		expect(looked).toContain(ids[100]);
+	});
+
 	it("keeps the grace period of a failed renewal when the period before is charged back", async () => {
 		const { env, onChargeback } = await withChargebackHook();
 		const subscription = await subscribe(env);

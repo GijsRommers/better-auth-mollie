@@ -489,24 +489,30 @@ async function settleRecentChargebacks(
 	}
 	// Each recorded chargeback, once a day. Few rows: the time is filtered
 	// here (a null one, from before this column existed, counts as due).
-	// `>= "0"` selects every recorded amount, as amounts are digit strings.
+	// Amounts are decimal strings and a payment without a chargeback has
+	// none, so `> "0"` selects exactly the recorded ones (in SQL, and in the
+	// memory adapter, where `null >= "0"` would hold). Paged by id, so rows
+	// leaving the selection meanwhile (a reversal) do not shift later pages.
 	const due = addDays(now, -1).getTime();
-	for (let offset = 0; ; offset += PAGE_SIZE) {
-		const page = await ctx.context.adapter.findMany<MolliePaymentRecord>({
+	for (let cursor: string | null = null; ; ) {
+		const page: MolliePaymentRecord[] = await ctx.context.adapter.findMany<MolliePaymentRecord>({
 			model: "molliePayment",
 			where: [
-				{ field: "amountChargedBack", operator: "gte", value: "0" },
+				{ field: "amountChargedBack", operator: "gt", value: "0" },
 				{ field: "paidAt", operator: "gte", value: addDays(now, -CHARGEBACK_RECHECK_DAYS) },
+				...(cursor ? [{ field: "molliePaymentId", operator: "gt" as const, value: cursor }] : []),
 			],
 			sortBy: { field: "molliePaymentId", direction: "asc" },
 			limit: PAGE_SIZE,
-			offset,
 		});
 		for (const record of page) {
+			if (!record.amountChargedBack) continue;
 			const checkedAt = record.chargebackCheckedAt;
 			if (!checkedAt || new Date(checkedAt).getTime() < due) candidates.add(record.molliePaymentId);
 		}
-		if (page.length < PAGE_SIZE) break;
+		const last = page.at(-1);
+		if (!last || page.length < PAGE_SIZE) break;
+		cursor = last.molliePaymentId;
 	}
 	for (const paymentId of candidates) {
 		const record = await findPaymentRecord(ctx, paymentId);
