@@ -2191,6 +2191,8 @@ export async function syncSubscription(
 		await step(record.molliePaymentId, async () => {
 			const payment = await gateway.getPayment(record.molliePaymentId);
 			events.push(...(await processPayment(ctx, options, payment)).events);
+			const due = await refundStillDue(ctx, payment.id);
+			if (due) errors.push(due);
 		});
 	}
 	const seen = (await reload(ctx, initial.id)) ?? initial;
@@ -2366,6 +2368,14 @@ async function recoverAbandonedCharges(
 	}
 }
 
+/** A sync error for a duplicate whose refund did not go through (yet), if so. */
+async function refundStillDue(ctx: Ctx, molliePaymentId: string): Promise<string | null> {
+	const record = await findPaymentRecord(ctx, molliePaymentId);
+	return record?.status === "paid" && record.outcome === "duplicate"
+		? `${molliePaymentId}: refund of a duplicate payment is still due`
+		: null;
+}
+
 export type SyncResult = {
 	checked: number;
 	remoteChecked: number;
@@ -2430,6 +2440,8 @@ export async function syncAllSubscriptions(
 		try {
 			const payment = await gatewayFor(options).getPayment(record.molliePaymentId);
 			input.onEvents((await processPayment(ctx, options, payment)).events);
+			const due = await refundStillDue(ctx, payment.id);
+			if (due) result.errors.push({ subscriptionId: record.subscriptionId, message: due });
 		} catch (error) {
 			if (error instanceof OperationInProgressError) continue;
 			result.errors.push({ subscriptionId: record.subscriptionId, message: errorMessage(error) });
@@ -2446,6 +2458,7 @@ export async function syncAllSubscriptions(
 			const payment = await gatewayFor(options).getPayment(record.molliePaymentId);
 			return paymentHookData(options, payment, record, subscription);
 		},
+		(record, message) => result.errors.push({ subscriptionId: record.subscriptionId, message }),
 	);
 	return result;
 }

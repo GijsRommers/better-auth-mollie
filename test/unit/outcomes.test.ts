@@ -2410,3 +2410,25 @@ describe("re-check of 4eb7113: late checkouts of removed plans", () => {
 		expect(refundedIds(env)).toEqual([payment.id]);
 	});
 });
+
+describe("sync reports what still needs attention", () => {
+	it("reports a duplicate whose refund keeps failing until it is refunded", async () => {
+		const env = await setup();
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		await env.webhook(`id=${second.payment.id}`);
+
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		const failing = await syncMollieSubscriptions(env.auth as never);
+		expect(failing.errors.map((e) => e.message)).toContain(
+			`${second.payment.id}: refund of a duplicate payment is still due`,
+		);
+		const fixed = await syncMollieSubscriptions(env.auth as never);
+		expect(fixed.errors).toEqual([]);
+		expect(refundedIds(env)).toEqual([second.payment.id]);
+	});
+});

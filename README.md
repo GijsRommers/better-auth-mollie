@@ -447,7 +447,7 @@ Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's n
 
 This is an alpha. The billing logic is tested against a stateful fake of the Mollie SDK (including crashes, lost responses, stalled processes and concurrent deliveries) and against Mollie test mode, but it has not run in production yet.
 
-- **Run the sync, and watch it.** Missed webhooks, refunds that failed, interrupted changes and unfinished hooks are completed by `syncMollieSubscriptions`. Run it at least hourly and alert on its `errors`: a payment that keeps failing needs a look.
+- **Run the sync, and watch it.** Missed webhooks, refunds that failed, interrupted changes, missed sales invoices and hooks still marked as due are completed by `syncMollieSubscriptions`. Run it at least hourly and alert on its `errors`, which include refunds that are still due and invoices that failed: one that keeps coming back needs a look. The plugin also logs every failure through Better Auth's logger.
 - **Eventually consistent, not instant.** A duplicate charge is refunded once it is detected (usually by its webhook, at the latest by the sync), so a customer can briefly be charged twice before the refund goes out.
 - **Hooks are best effort.** `onPaymentPaid` and the other hooks run at most once; a crash at the wrong moment loses one. Derive access from the subscription (`hasActiveSubscription`, `hasSubscriptionAccess`), and make your own invoicing idempotent or use `salesInvoices`, which the sync retries for 30 days. Older missed invoices need manual recovery.
 - **Keep the plugin's data.** Do not delete `subscription`, `molliePayment` or `mollieOperation` rows, and run the migration before deploying a new version (new columns are not backfilled).

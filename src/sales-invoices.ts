@@ -121,6 +121,7 @@ export async function catchUpSalesInvoices(
 		record: MolliePaymentRecord,
 		subscription: Subscription,
 	) => Promise<PaymentHookData | null>,
+	onError: (record: MolliePaymentRecord, message: string) => void = () => {},
 ): Promise<number> {
 	if (!options.salesInvoices?.enabled) return 0;
 	const { adapter } = ctx.context;
@@ -168,6 +169,7 @@ export async function catchUpSalesInvoices(
 			ctx.context.logger.error(
 				`[mollie] Sales invoice for ${record.molliePaymentId} failed: ${errorMessage(error)}`,
 			);
+			onError(record, `sales invoice for ${record.molliePaymentId}: ${errorMessage(error)}`);
 		}
 	}
 	return created;
