@@ -667,6 +667,9 @@ async function recoverSubscription(
 	return subscription ? { kind: "unresolved" } : { kind: "covered" };
 }
 
+/** A pending row without any checkout attempt is expired after this. */
+const ABANDONED_ROW_MS = 24 * 60 * 60 * 1000;
+
 /**
  * A first payment failed, expired or was canceled. The checkout is over
  * unless another attempt for this subscription is still open or paid.
@@ -685,7 +688,12 @@ export async function expireCheckout(
 		],
 		limit: 100,
 	});
-	if (attempts.length === 0) return null;
+	// No attempt at all: a checkout whose creation failed. After a day (one may
+	// still have been on its way), the row is expired.
+	if (attempts.length === 0) {
+		const age = Date.now() - new Date(subscription.createdAt).getTime();
+		if (age < ABANDONED_ROW_MS) return null;
+	}
 	if (attempts.some((a) => !isFinalPaymentStatus(a.status) || a.status === "paid")) return null;
 	return guardedUpdate(ctx, subscription.id, ["incomplete"], { status: "incomplete_expired" }, [], {
 		lock,

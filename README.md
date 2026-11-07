@@ -182,15 +182,15 @@ if (await hasActiveSubscription(auth, user.id)) {
 
 ### Statuses
 
-| Status               | Meaning                                                | Access |
-| -------------------- | ------------------------------------------------------ | ------ |
-| `incomplete`         | Checkout started, first payment not paid yet           | No     |
-| `incomplete_expired` | First payment failed, expired or was canceled          | No     |
-| `trialing`           | Free trial; mandate verified                           | Yes    |
-| `active`             | Paid up                                                | Yes    |
-| `past_due`           | A charge failed; within `gracePeriodDays` (default 14) | Yes    |
-| `unpaid`             | Grace period over                                      | No     |
-| `canceled`           | Ended                                                  | No     |
+| Status               | Meaning                                                                                  | Access |
+| -------------------- | ---------------------------------------------------------------------------------------- | ------ |
+| `incomplete`         | Checkout started, first payment not paid yet                                             | No     |
+| `incomplete_expired` | First payment failed, expired or was canceled; or no checkout could be created for a day | No     |
+| `trialing`           | Free trial; mandate verified                                                             | Yes    |
+| `active`             | Paid up                                                                                  | Yes    |
+| `past_due`           | A charge failed; within `gracePeriodDays` (default 14)                                   | Yes    |
+| `unpaid`             | Grace period over                                                                        | No     |
+| `canceled`           | Ended                                                                                    | No     |
 
 `past_due` and `unpaid` return to `active` when a charge or a recovery payment succeeds.
 

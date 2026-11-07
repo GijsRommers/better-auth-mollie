@@ -42,4 +42,20 @@ describe("efficient sync", () => {
 		expect(second.payment.id).not.toBe(first.payment.id);
 		expect(second.payment.amount.currency).toBe("USD");
 	});
+
+	it("expires a pending row whose checkout was never created, after a day", async () => {
+		const env = await setup();
+		env.fake.failNext("payments.create", Object.assign(new Error("invalid"), { statusCode: 422 }));
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		const [row] = await env.subscriptions();
+		expect(row?.status).toBe("incomplete");
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete");
+		travel(Date.now() + 25 * 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
+	});
 });
