@@ -85,7 +85,8 @@ describe("duplicate payments are refunded exactly when they are duplicates", () 
 
 		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
 		const response = await env.webhook(`id=${second.payment.id}`);
-		expect(response.status).toBeGreaterThanOrEqual(500);
+		// The payment itself was processed; the refund stays due for the sync.
+		expect(response.status).toBe(200);
 		expect(refundedIds(env)).toEqual([]);
 
 		await syncMollieSubscriptions(env.auth as never);
@@ -1044,5 +1045,47 @@ describe("re-check of 5d94fe8: older records, hooks of recovered charges, ended 
 		expect(record).toMatchObject({ status: "paid", outcome: "applied" });
 		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([proration!.id]);
 		expect(refundedIds(env)).toEqual([]);
+	});
+});
+
+describe("re-check of 933ba33: successive upgrades, hooks when a refund fails", () => {
+	const prorations = (env: TestEnv) =>
+		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
+
+	it("makes a subscription past due when an earlier upgrade's charge fails after a later upgrade", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		await env.api.upgradeSubscription({ body: { plan: "pro" }, headers: env.headers });
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		const [first, second] = prorations(env);
+		expect((await env.subscription(subscription.id)).appliedPaymentId).toBe(second!.id);
+
+		env.fake.completePayment(second!.id, "paid");
+		await env.webhook(`id=${second!.id}`);
+		env.fake.completePayment(first!.id, "failed");
+		await env.webhook(`id=${first!.id}`);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "past_due",
+			plan: "business",
+		});
+	});
+
+	it("still runs the paid hook of a duplicate whose refund fails", async () => {
+		const onPaymentPaid = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentPaid } });
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		await settle();
+		onPaymentPaid.mockClear();
+
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		await env.webhook(`id=${second.payment.id}`);
+		await settle();
+		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([second.payment.id]);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([second.payment.id]);
 	});
 });

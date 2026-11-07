@@ -495,8 +495,11 @@ async function applyPayment(
 		} else if (
 			isFailedPaymentStatus(status) &&
 			(purpose === "renewal" ||
-				// A failed pro-rata charge only matters for the upgrade it belongs to.
-				(purpose === "proration" && subscription.appliedPaymentId === payment.id))
+				// A failed pro-rata charge only matters for an upgrade that was
+				// applied: the current one, or an earlier one a later upgrade
+				// replaced (which recorded this charge as applied).
+				(purpose === "proration" &&
+					(subscription.appliedPaymentId === payment.id || record.outcome === "applied")))
 		) {
 			subscription = (await applyFailedRenewal(ctx, subscription, payment, lock)) ?? subscription;
 		}
@@ -513,7 +516,15 @@ async function applyPayment(
 	if (status === "paid") {
 		const current = (await findPaymentRecord(ctx, payment.id)) ?? record;
 		if (current.outcome === "duplicate") {
-			events.push(...(await refundDuplicate(ctx, options, payment, subscription, claim)));
+			try {
+				events.push(...(await refundDuplicate(ctx, options, payment, subscription, claim)));
+			} catch (error) {
+				// The refund stays due (outcome `duplicate`) and the sync retries it;
+				// the events of this delivery are not lost meanwhile.
+				ctx.context.logger.error(
+					`[mollie] Refund of ${payment.id} failed; the next sync retries it: ${errorMessage(error)}`,
+				);
+			}
 		}
 	}
 	// A new mandate, a new start or a postponed change: bring Mollie in line.
