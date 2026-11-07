@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
 import type { Subscription } from "../../src/types";
-import { setup, subscribe } from "../helpers/setup";
+import { settle, setup, subscribe } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -73,5 +73,86 @@ describe("syncMollieSubscriptions({ referenceId })", () => {
 		const result = await syncMollieSubscriptions(env.auth as never, { referenceId: "nobody" });
 		expect(result).toEqual({ checked: 0, remoteChecked: 0, invoicesCreated: 0, errors: [] });
 		expect(env.fake.calls.slice(before)).toEqual([]);
+	});
+
+	it("tells a user and an organization with the same id apart", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const organizationRow = await env.context.adapter.create<Partial<Subscription>, Subscription>({
+			model: "subscription",
+			data: {
+				referenceId: subscription.referenceId,
+				customerType: "organization",
+				plan: "starter",
+				status: "active",
+				mollieCustomerId: "cst_organization",
+				periodEnd: new Date(Date.now() + 10 * 24 * 3_600_000),
+				cancelAtPeriodEnd: false,
+				mollieSyncNeeded: true,
+			},
+		});
+		const before = env.fake.calls.length;
+		const result = await syncMollieSubscriptions(env.auth as never, {
+			referenceId: subscription.referenceId,
+			customerType: "user",
+		});
+		expect(result).toMatchObject({ checked: 1, errors: [] });
+		const touched = env.fake.calls
+			.slice(before)
+			.some((call) => JSON.stringify(call.args).includes("cst_organization"));
+		expect(touched).toBe(false);
+		expect((await env.subscription(organizationRow.id)).mollieSyncNeeded).toBe(true);
+	});
+
+	it("catches up a reference's invoices in bounded queries", async () => {
+		const getRecipient = vi.fn(async () => ({
+			type: "consumer" as const,
+			givenName: "Ada",
+			familyName: "Lovelace",
+			email: "ada@example.com",
+			streetAndNumber: "Keizersgracht 1",
+			postalCode: "1015 CJ",
+			city: "Amsterdam",
+			country: "NL",
+			locale: "nl_NL" as const,
+		}));
+		const env = await setup({
+			subscription: { tax: { calculate: () => ({ rate: "21.00", country: "NL" }) } },
+			options: { salesInvoices: { enabled: true, getRecipient } },
+		});
+		env.fake.failNext("salesInvoices.create", new TypeError("fetch failed"));
+		const subscription = await subscribe(env);
+		await settle();
+		expect(env.fake.salesInvoices.size).toBe(0);
+		// Many ended checkouts of the same reference.
+		for (let i = 0; i < 150; i++) {
+			await env.context.adapter.create({
+				model: "subscription",
+				data: {
+					referenceId: subscription.referenceId,
+					customerType: "user",
+					plan: "starter",
+					status: "incomplete_expired",
+					cancelAtPeriodEnd: false,
+				},
+			});
+		}
+		const adapter = env.context.adapter as any;
+		const original = adapter.findMany.bind(adapter);
+		let longest = 0;
+		adapter.findMany = async (args: any) => {
+			for (const clause of args.where ?? []) {
+				if (clause.operator === "in" && Array.isArray(clause.value)) {
+					longest = Math.max(longest, clause.value.length);
+				}
+			}
+			return original(args);
+		};
+		const result = await syncMollieSubscriptions(env.auth as never, {
+			referenceId: subscription.referenceId,
+		});
+		adapter.findMany = original;
+		expect(result.invoicesCreated).toBe(1);
+		expect(longest).toBeLessThanOrEqual(100);
 	});
 });

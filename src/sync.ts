@@ -12,6 +12,7 @@ import {
 import { PlanNotConfiguredError } from "./errors";
 import type { BillingEvent } from "./events";
 import { gatewayFor, type MolliePayment, metadataOf } from "./gateway";
+import { billsIdentity } from "./identity";
 import { type SubscriptionLock, withSubscriptionLock } from "./lock";
 import {
 	LOCK_LEASE_MS,
@@ -35,7 +36,7 @@ import {
 import { catchUpSalesInvoices } from "./sales-invoices";
 import { BILLING_STATUSES, SYNCABLE_STATUSES } from "./status";
 import { toCents } from "./tax";
-import type { MollieOptions, MolliePaymentRecord, Subscription } from "./types";
+import type { CustomerType, MollieOptions, MolliePaymentRecord, Subscription } from "./types";
 import { addDays, DAY_MS, errorMessage, getPlanByName } from "./utils";
 
 /**
@@ -595,7 +596,7 @@ async function recoverAbandonedCharges(
 	now: Date,
 	onEvents: (events: BillingEvent[]) => void,
 	errors: SyncResult["errors"],
-	referenceId?: string,
+	scope?: { referenceId: string; inScope: (subscription: Subscription) => boolean },
 ): Promise<void> {
 	const gateway = gatewayFor(options);
 	const abandoned = await pendingOperations(
@@ -604,12 +605,12 @@ async function recoverAbandonedCharges(
 		new Date(now.getTime() - LOCK_LEASE_MS),
 	);
 	for (const op of abandoned) {
-		if (referenceId !== undefined && op.referenceId !== referenceId) continue;
+		if (scope && op.referenceId !== scope.referenceId) continue;
 		// `proration:<subscriptionId>:<plan>:<period end>:<attempt>#<n>`
 		const subscriptionId = op.idempotencyKey.split(":")[1] ?? "";
 		const subscription = await reload(ctx, subscriptionId);
 		const customerId = subscription?.mollieCustomerId;
-		if (!subscription || !customerId) continue;
+		if (!subscription || !customerId || (scope && !scope.inScope(subscription))) continue;
 		try {
 			const createdAt = new Date(op.createdAt);
 			const found = await gateway.findCustomerPaymentByOperationKey(
@@ -698,12 +699,21 @@ export async function syncAllSubscriptions(
 		 * profile-wide chargeback listing, which the full sync does.
 		 */
 		referenceId?: string | undefined;
+		/** With `referenceId`: only a user's, or only an organization's (same id). */
+		customerType?: CustomerType | undefined;
 	},
 ): Promise<SyncResult> {
 	const now = input.now ?? new Date();
 	const { referenceId } = input;
 	const scope: Where[] =
 		referenceId === undefined ? [] : [{ field: "referenceId", value: referenceId }];
+	// The identity's rows, as the subscription endpoints match them.
+	const inScope = (row: Pick<Subscription, "referenceId" | "customerType">) =>
+		referenceId === undefined ||
+		billsIdentity(row as Subscription, {
+			referenceId,
+			customerType: input.customerType ?? null,
+		});
 	const ids = new Set<string>();
 	// Subscriptions that may still change, and any (also ended ones) with a
 	// change that still has to reach Mollie.
@@ -713,20 +723,29 @@ export async function syncAllSubscriptions(
 	];
 	for (const where of selections) {
 		for (let offset = 0; ; offset += PAGE_SIZE) {
-			const page = await ctx.context.adapter.findMany<Pick<Subscription, "id">>({
+			const page = await ctx.context.adapter.findMany<
+				Pick<Subscription, "id" | "referenceId" | "customerType">
+			>({
 				model: "subscription",
 				where,
-				select: ["id"],
+				select: ["id", "referenceId", "customerType"],
 				sortBy: { field: "id", direction: "asc" },
 				limit: PAGE_SIZE,
 				offset,
 			});
-			for (const row of page) ids.add(row.id);
+			for (const row of page) if (inScope(row)) ids.add(row.id);
 			if (page.length < PAGE_SIZE) break;
 		}
 	}
 	const result: SyncResult = { checked: 0, remoteChecked: 0, invoicesCreated: 0, errors: [] };
-	await recoverAbandonedCharges(ctx, options, now, input.onEvents, result.errors, referenceId);
+	await recoverAbandonedCharges(
+		ctx,
+		options,
+		now,
+		input.onEvents,
+		result.errors,
+		referenceId === undefined ? undefined : { referenceId, inScope },
+	);
 	if (referenceId === undefined) {
 		await settleRecentChargebacks(ctx, options, now, input.onEvents, result.errors);
 	}
@@ -755,31 +774,34 @@ export async function syncAllSubscriptions(
 	if (referenceId !== undefined) {
 		scoped = [];
 		for (let cursor: string | null = null; ; ) {
-			const page: Pick<Subscription, "id">[] = await ctx.context.adapter.findMany<
-				Pick<Subscription, "id">
-			>({
-				model: "subscription",
-				where: [
-					...scope,
-					...(cursor ? [{ field: "id", operator: "gt" as const, value: cursor }] : []),
-				],
-				select: ["id"],
-				sortBy: { field: "id", direction: "asc" },
-				limit: PAGE_SIZE,
-			});
-			scoped.push(...page.map((row) => row.id));
+			const page: Pick<Subscription, "id" | "referenceId" | "customerType">[] =
+				await ctx.context.adapter.findMany<
+					Pick<Subscription, "id" | "referenceId" | "customerType">
+				>({
+					model: "subscription",
+					where: [
+						...scope,
+						...(cursor ? [{ field: "id", operator: "gt" as const, value: cursor }] : []),
+					],
+					select: ["id", "referenceId", "customerType"],
+					sortBy: { field: "id", direction: "asc" },
+					limit: PAGE_SIZE,
+				});
+			scoped.push(...page.filter(inScope).map((row) => row.id));
 			const last = page.at(-1);
 			if (!last || page.length < PAGE_SIZE) break;
 			cursor = last.id;
 		}
 	}
-	const outstanding = scoped
-		? (
-				await Promise.all(
-					scoped.filter((id) => !synced.has(id)).map((id) => outstandingPayments(ctx, id)),
-				)
-			).flat()
-		: await outstandingPayments(ctx);
+	// One subscription at a time: a reference can have many ended rows.
+	let outstanding: MolliePaymentRecord[] = [];
+	if (scoped) {
+		for (const id of scoped) {
+			if (!synced.has(id)) outstanding.push(...(await outstandingPayments(ctx, id)));
+		}
+	} else {
+		outstanding = await outstandingPayments(ctx);
+	}
 	for (const record of outstanding) {
 		if (synced.has(record.subscriptionId)) continue;
 		try {

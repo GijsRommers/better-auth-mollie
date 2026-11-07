@@ -152,25 +152,31 @@ export async function catchUpSalesInvoices(
 	if (!options.salesInvoices?.enabled) return 0;
 	const { adapter } = ctx.context;
 	const paid: MolliePaymentRecord[] = [];
-	for (let offset = 0; ; offset += PAGE_SIZE) {
-		const page = await adapter.findMany<MolliePaymentRecord>({
-			model: "molliePayment",
-			where: [
-				{ field: "status", value: "paid" },
-				{ field: "outcome", operator: "in", value: [...INVOICED_OUTCOMES] },
-				// Not invoiced or skipped yet.
-				{ field: "invoice", value: null },
-				{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
-				...(subscriptionIds
-					? [{ field: "subscriptionId", operator: "in" as const, value: subscriptionIds }]
-					: []),
-			],
-			sortBy: { field: "molliePaymentId", direction: "asc" },
-			limit: PAGE_SIZE,
-			offset,
-		});
-		paid.push(...page);
-		if (page.length < PAGE_SIZE) break;
+	// Subscriptions in batches: databases limit the size of an `in` list.
+	const batches: (string[] | undefined)[] = subscriptionIds
+		? Array.from({ length: Math.ceil(subscriptionIds.length / PAGE_SIZE) }, (_, i) =>
+				subscriptionIds.slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE),
+			)
+		: [undefined];
+	for (const batch of batches) {
+		for (let offset = 0; ; offset += PAGE_SIZE) {
+			const page = await adapter.findMany<MolliePaymentRecord>({
+				model: "molliePayment",
+				where: [
+					{ field: "status", value: "paid" },
+					{ field: "outcome", operator: "in", value: [...INVOICED_OUTCOMES] },
+					// Not invoiced or skipped yet.
+					{ field: "invoice", value: null },
+					{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
+					...(batch ? [{ field: "subscriptionId", operator: "in" as const, value: batch }] : []),
+				],
+				sortBy: { field: "molliePaymentId", direction: "asc" },
+				limit: PAGE_SIZE,
+				offset,
+			});
+			paid.push(...page);
+			if (page.length < PAGE_SIZE) break;
+		}
 	}
 	let created = 0;
 	for (const record of paid) {

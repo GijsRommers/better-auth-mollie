@@ -25,7 +25,7 @@ import {
 } from "./schema";
 import { BILLING_STATUSES } from "./status";
 import type { SyncResult } from "./sync";
-import type { MollieOptions, Subscription, WithMollieCustomerId } from "./types";
+import type { CustomerType, MollieOptions, Subscription, WithMollieCustomerId } from "./types";
 import { errorMessage, isValidAmount, validatePlans } from "./utils";
 import { PACKAGE_VERSION } from "./version";
 
@@ -276,12 +276,13 @@ export async function hasActiveSubscription(
  */
 export function syncMollieSubscriptions(
 	auth: AuthWithMollie,
-	options: { now?: Date; referenceId?: string } = {},
+	options: { now?: Date; referenceId?: string; customerType?: CustomerType } = {},
 ): Promise<SyncResult> {
 	return auth.api.syncMollieSubscriptions({
 		body: {
 			...(options.now ? { now: options.now.toISOString() } : {}),
 			...(options.referenceId !== undefined ? { referenceId: options.referenceId } : {}),
+			...(options.customerType ? { customerType: options.customerType } : {}),
 		},
 	});
 }

@@ -274,6 +274,8 @@ To bring one user or organization up to date right away, for example from a "ref
 await syncMollieSubscriptions(auth, { referenceId: organizationId });
 ```
 
+If a user and an organization can share an id (custom ids), pass `customerType: "organization"` (or `"user"`) to sync only that one.
+
 ## Payment failures and recovery
 
 When a renewal fails, the subscription becomes `past_due` and keeps access for `gracePeriodDays`, then becomes `unpaid`. A later successful charge makes it `active` again. The customer can also recover by calling `upgrade` with their plan:
