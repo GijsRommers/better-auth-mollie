@@ -681,19 +681,27 @@ async function startedRecently(ctx: Ctx, subscription: Subscription): Promise<bo
 	const since = new Date(Date.now() - ABANDONED_ROW_MS);
 	if (new Date(subscription.createdAt) > since) return true;
 	const prefix = checkoutScope("checkout", subscription.id);
-	const recent = await ctx.context.adapter.findMany<MollieOperation>({
-		model: "mollieOperation",
-		where: [
-			{ field: "referenceId", value: subscription.referenceId },
-			{ field: "kind", value: "create_first_payment" },
-			// SQL adapters may over-match this (LIKE); filtered below.
-			{ field: "idempotencyKey", operator: "starts_with", value: prefix },
-			{ field: "createdAt", operator: "gt", value: since },
-		],
-		limit: 100,
-	});
-	return recent.some((op) => op.idempotencyKey.startsWith(prefix));
+	for (let offset = 0; ; offset += ATTEMPTS_PAGE) {
+		const page = await ctx.context.adapter.findMany<MollieOperation>({
+			model: "mollieOperation",
+			where: [
+				{ field: "referenceId", value: subscription.referenceId },
+				{ field: "kind", value: "create_first_payment" },
+				// SQL adapters may over-match this (an unescaped LIKE), so every
+				// page is filtered, and paging goes on until one matches.
+				{ field: "idempotencyKey", operator: "starts_with", value: prefix },
+				{ field: "createdAt", operator: "gt", value: since },
+			],
+			sortBy: { field: "idempotencyKey", direction: "asc" },
+			limit: ATTEMPTS_PAGE,
+			offset,
+		});
+		if (page.some((op) => op.idempotencyKey.startsWith(prefix))) return true;
+		if (page.length < ATTEMPTS_PAGE) return false;
+	}
 }
+
+const ATTEMPTS_PAGE = 100;
 
 /**
  * A first payment failed, expired or was canceled. The checkout is over

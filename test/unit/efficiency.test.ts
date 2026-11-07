@@ -142,4 +142,46 @@ describe("efficient sync", () => {
 		await syncMollieSubscriptions(env.auth as never);
 		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
 	});
+
+	it("finds a recent checkout attempt behind a page of lookalike journal keys", async () => {
+		const env = await setup();
+		env.fake.failNext("payments.create", Object.assign(new Error("invalid"), { statusCode: 422 }));
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		const [row] = await env.subscriptions();
+		travel(Date.now() + 25 * 3_600_000);
+		env.fake.loseNextResponse("payments.create");
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+
+		// SQL adapters implement starts_with as an unescaped LIKE: keys of other
+		// rows can match too, and fill the first page.
+		const adapter = env.context.adapter as any;
+		const original = adapter.findMany.bind(adapter);
+		adapter.findMany = async (args: any) => {
+			const prefix = args.where?.find((w: any) => w.operator === "starts_with")?.value;
+			const kind = args.where?.find((w: any) => w.field === "kind")?.value;
+			if (
+				args.model !== "mollieOperation" ||
+				kind !== "create_first_payment" ||
+				!prefix?.endsWith(":")
+			) {
+				return original(args);
+			}
+			const lookalikes = Array.from({ length: 100 }, (_, i) => ({
+				idempotencyKey: `${prefix.slice(0, -1)}x:starter:9.95:EUR#${i}`,
+				kind,
+				status: "failed",
+				createdAt: new Date(),
+			}));
+			const all = [...lookalikes, ...(await original({ ...args, limit: 1000, offset: 0 }))];
+			const offset = args.offset ?? 0;
+			return all.slice(offset, offset + (args.limit ?? all.length));
+		};
+		await syncMollieSubscriptions(env.auth as never);
+		adapter.findMany = original;
+		expect((await env.subscription(row!.id)).status).toBe("incomplete");
+	});
 });
