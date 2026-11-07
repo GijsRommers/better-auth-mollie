@@ -224,9 +224,9 @@ For user billing, `authorizeReference` is only needed to let a user act on a `re
 
 ## Webhooks
 
-Mollie's webhook only carries an id (`id=tr_…`). The plugin ignores everything else in the request and fetches the payment or subscription from the Mollie API, so a forged webhook cannot change anything. Processing is idempotent: a payment's status only moves forward, each hook runs once per change, and repeated or out-of-order deliveries are harmless.
+Mollie's webhook only carries an id (`id=tr_…`). The plugin ignores everything else in the request and fetches the payment or subscription from the Mollie API, so a forged webhook cannot change anything. Processing is idempotent: a payment's status only moves forward, hooks run at most once per change, and repeated or out-of-order deliveries are harmless.
 
-The endpoint answers within Mollie's 15-second limit and runs your hooks in the background, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. If something fails (Mollie unreachable, a concurrent operation), it answers with an error so that Mollie retries.
+Your hooks run in the background, after the response, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. The webhook itself makes a few Mollie requests, each limited by `requestTimeoutMs` (10 seconds by default). Mollie waits 15 seconds for an answer, so keep that timeout low; a webhook that times out or fails is retried by Mollie, and the sync catches up on anything left over. If something fails (Mollie unreachable, a concurrent operation), the endpoint answers with an error so that Mollie retries.
 
 **Local development:** Mollie rejects webhook URLs it cannot reach, such as `localhost`. When `baseURL` is local, the plugin sends no webhook URL and logs a warning. The success redirect then syncs the first payment, and the cron syncs everything else. To receive webhooks locally, use a tunnel and point `webhookUrl` at it:
 
@@ -378,7 +378,10 @@ onCustomerCreate: async ({ mollieCustomer, user }) => {},
 
 Payment hooks receive `{ payment, purpose, record, subscription, plan, isVerification, tax }`. `purpose` is one of `checkout`, `verification`, `renewal`, `proration` or `recovery`.
 
-Each hook runs once per change, after the change is stored. A failing hook is logged and not retried, and it does not stop other hooks.
+Hooks run at most once per change, after the change is stored. A failing hook is logged and not retried, and it does not stop other hooks. If the process stops between storing a change and running its hooks, those hooks do not run. Don't rely on a hook alone for anything that must happen:
+
+- **Invoices:** use `salesInvoices`, which the sync retries; or make your own invoicing idempotent, keyed by the payment id, and catch up from the `molliePayment` table (`status: "paid"`, `outcome: "applied"`).
+- **Access:** derive it from the `subscription` row, as `hasActiveSubscription` and `hasSubscriptionAccess` do, not from hook calls.
 
 ## Schema
 

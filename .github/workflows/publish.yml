@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     # Add required reviewers to this environment to approve each release.
     environment: npm
+    env:
+      MOLLIE_TEST_API_KEY: ${{ secrets.MOLLIE_TEST_API_KEY }}
+      MOLLIE_TEST_METHOD: ${{ vars.MOLLIE_TEST_METHOD }}
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v6
@@ -36,6 +39,12 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - name: Install Chromium
+        if: env.MOLLIE_TEST_API_KEY != ''
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run against Mollie test mode
+        if: env.MOLLIE_TEST_API_KEY != ''
+        run: pnpm test:integration
       - run: pnpm build
       - run: pnpm lint:package
       - run: pnpm publish --provenance --access public --no-git-checks
