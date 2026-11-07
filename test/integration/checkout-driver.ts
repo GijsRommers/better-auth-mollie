@@ -69,7 +69,7 @@ export async function completeCheckout(
 				page.waitForURL((u) => !u.pathname.includes("/select-method/"), { timeout: 60_000 }),
 				page.locator(`button[name="method"][value="${method}"]`).click(),
 			]);
-			await page.waitForLoadState("networkidle");
+			await page.waitForLoadState("load");
 		}
 		if (page.url().includes("/select-issuer/")) {
 			// iDEAL and similar: any test bank leads to the test-mode page.
