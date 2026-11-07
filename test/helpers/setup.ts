@@ -42,6 +42,21 @@ type SetupOptions = {
 	memory?: boolean;
 };
 
+/**
+ * The database tests run on: SQLite, or Better Auth's memory adapter with
+ * `TEST_DATABASE=memory` (or `memory`).
+ */
+export function testDatabase(memory = false): { database?: ReturnType<typeof memoryAdapter> } {
+	return memory || process.env.TEST_DATABASE === "memory" ? { database: memoryDatabase() } : {};
+}
+
+/** Fails a test that does not run on the database `TEST_DATABASE` asks for. */
+export function assertTestDatabase(context: AuthContext, memory = false) {
+	const expected = memory || process.env.TEST_DATABASE === "memory" ? "memory" : "kysely";
+	const actual = (context.adapter as { id?: string }).id;
+	if (actual !== expected) throw new Error(`Tests run on ${actual}, expected ${expected}`);
+}
+
 /** Tables for the memory adapter, which does not create them itself. */
 function memoryDatabase() {
 	const models = ["user", "session", "account", "verification", "organization", "member"];
@@ -76,10 +91,7 @@ export async function setup(input: SetupOptions = {}) {
 	const instance = await getTestInstance(
 		{
 			baseURL: BASE_URL,
-			// `TEST_DATABASE=memory` runs every test on the memory adapter.
-			...(input.memory || process.env.TEST_DATABASE === "memory"
-				? { database: memoryDatabase() }
-				: {}),
+			...testDatabase(input.memory),
 			...input.auth,
 			plugins: [...(input.organization ? [organization()] : []), mollie(pluginOptions)],
 		},
@@ -87,6 +99,7 @@ export async function setup(input: SetupOptions = {}) {
 	);
 	const signedIn = await instance.signInWithTestUser();
 	const context = (await instance.auth.$context) as unknown as AuthContext;
+	assertTestDatabase(context, input.memory);
 	const api = instance.auth.api as any;
 	const adapter = context.adapter;
 

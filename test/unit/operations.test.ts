@@ -10,18 +10,21 @@ import {
 	REPLAY_WINDOW_MS,
 	type RunOperationOptions,
 	runOperation,
+	withLock,
 } from "../../src/operations";
 import { mollieOperationSchema } from "../../src/schema";
 import type { MollieOperation } from "../../src/types";
 import { createFakeMollie, type FakeMollie, mollieError } from "../helpers/fake-mollie";
-import { gate } from "../helpers/setup";
+import { assertTestDatabase, gate, testDatabase } from "../helpers/setup";
 
 async function setup() {
 	const { auth } = await getTestInstance(
-		{ plugins: [{ id: "operations-test", schema: mollieOperationSchema }] },
+		{ ...testDatabase(), plugins: [{ id: "operations-test", schema: mollieOperationSchema }] },
 		{ disableTestUser: true },
 	);
-	return (await auth.$context) as unknown as AuthContext;
+	const context = (await auth.$context) as unknown as AuthContext;
+	assertTestDatabase(context);
+	return context;
 }
 
 function listOps(context: AuthContext) {
@@ -518,6 +521,27 @@ describe("runOperation", () => {
 		// The journal keeps the readable key.
 		expect((await listOps(context))[0]?.idempotencyKey).toBe(`${scope}#1`);
 	});
+});
+
+describe("withLock", () => {
+	// The memory adapter does not enforce unique fields, which this relies on
+	// (the plugin warns about it); real databases do.
+	it.skipIf(process.env.TEST_DATABASE === "memory")(
+		"lets only one caller hold a lock at a time",
+		async () => {
+			const context = await setup();
+			const input = { key: "lock:reference:ref_1", referenceId: "ref_1" };
+			const held = gate();
+			const first = withLock(context, input, () => held.hold());
+			await held.paused;
+			await expect(withLock(context, input, async () => "second")).rejects.toBeInstanceOf(
+				OperationInProgressError,
+			);
+			held.release();
+			await first;
+			await expect(withLock(context, input, async () => "after")).resolves.toBe("after");
+		},
+	);
 });
 
 describe("mollieKey", () => {

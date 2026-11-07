@@ -182,6 +182,11 @@ export const mollie = <O extends MollieOptions>(options: O) => {
 			? SubscriptionEndpoints
 			: Record<never, never>),
 		init(ctx: AuthContext) {
+			if ((ctx.adapter as { id?: string }).id === "memory") {
+				ctx.logger.warn(
+					"[mollie] The memory adapter does not enforce unique fields, which the plugin's locks rely on: concurrent requests are not safe. Use it for development and tests only.",
+				);
+			}
 			const subscription = options.subscription;
 			if (subscription?.enabled && typeof subscription.plans === "function") {
 				Promise.resolve(subscription.plans())
