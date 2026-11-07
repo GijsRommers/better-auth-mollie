@@ -172,6 +172,12 @@ export const molliePaymentSchema = {
 				defaultValue: 0,
 				input: false,
 			},
+			hooksDue: {
+				type: "boolean",
+				required: false,
+				defaultValue: false,
+				input: false,
+			},
 		},
 	},
 } satisfies BetterAuthPluginDBSchema;

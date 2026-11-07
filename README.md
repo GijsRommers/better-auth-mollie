@@ -407,7 +407,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), and internally `claimSerial`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), and internally `claimSerial` and `hooksDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 

@@ -317,6 +317,9 @@ export async function recordPayment(
 		paidAt: toDate(payment.paidAt),
 		failedAt: status === "paid" ? null : terminalTimestamp(payment),
 	};
+	// Recorded with the change itself, so whoever ends up processing the
+	// payment (not necessarily this caller) dispatches its hooks.
+	const hooksDue = status === "paid" || isFailedPaymentStatus(status);
 	let existing = await adapter.findOne<MolliePaymentRecord>({ model: "molliePayment", where });
 	if (!existing) {
 		try {
@@ -331,6 +334,7 @@ export async function recordPayment(
 					sequenceType: payment.sequenceType as MolliePaymentRecord["sequenceType"],
 					outcome: "pending",
 					claimSerial: 0,
+					hooksDue,
 					...timestamps,
 				},
 			});
@@ -348,7 +352,7 @@ export async function recordPayment(
 		model: "molliePayment",
 		where: [...where, { field: "status", value: existing.status }],
 		increment: {},
-		set: { status, ...timestamps },
+		set: { status, ...timestamps, ...(hooksDue ? { hooksDue: true } : {}) },
 	});
 	if (!updated) {
 		const current = await adapter.findOne<MolliePaymentRecord>({ model: "molliePayment", where });
@@ -661,7 +665,7 @@ async function applyPayment(
 	reconcile: boolean,
 ): Promise<ProcessResult> {
 	let subscription = initial;
-	const recorded = await recordPayment(ctx, payment, subscription.id);
+	await recordPayment(ctx, payment, subscription.id);
 	let record = await claimPayment(ctx, payment.id, lock);
 	const claim = lock.serial;
 	const purpose = paymentPurpose(payment);
@@ -671,27 +675,7 @@ async function applyPayment(
 	let activated = false;
 
 	if (status === "paid" && record.outcome === "pending") {
-		let result: Application;
-		try {
-			result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
-		} catch (error) {
-			// Told to come back (e.g. another pending row is busy): undo recording
-			// the change to paid, so the retry sees it and runs its hooks.
-			if (recorded.transitioned && error instanceof OperationInProgressError) {
-				await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
-					model: "molliePayment",
-					where: [
-						{ field: "molliePaymentId", value: payment.id },
-						{ field: "status", value: "paid" },
-						{ field: "outcome", value: "pending" },
-						{ field: "claimSerial", value: claim },
-					],
-					increment: {},
-					set: { status: recorded.previous ?? "open", paidAt: null },
-				});
-			}
-			throw error;
-		}
+		const result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
 		events.push(...(result.events ?? []));
 		if (result.kind === "applied") {
 			subscription = result.subscription;
@@ -738,11 +722,26 @@ async function applyPayment(
 		record = (await setOutcome(ctx, payment.id, UNHANDLED, "handled", claim)) ?? record;
 	}
 
-	if (recorded.transitioned && (status === "paid" || isFailedPaymentStatus(status))) {
-		const latest = (await reload(ctx, subscription.id)) ?? subscription;
-		const current = (await findPaymentRecord(ctx, payment.id)) ?? record;
-		const data = await paymentHookData(options, payment, current, latest);
-		events.push({ type: status === "paid" ? "payment.paid" : "payment.failed", data });
+	// Hooks after the decision, by the current claimant that clears them as
+	// due: once per payment, also if an earlier delivery recorded the change
+	// and then stopped or was told to come back.
+	if (status === "paid" || isFailedPaymentStatus(status)) {
+		const delivered = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+			model: "molliePayment",
+			where: [
+				{ field: "molliePaymentId", value: payment.id },
+				{ field: "hooksDue", value: true },
+				{ field: "status", value: status },
+				{ field: "claimSerial", value: claim },
+			],
+			increment: {},
+			set: { hooksDue: false },
+		});
+		if (delivered) {
+			const latest = (await reload(ctx, subscription.id)) ?? subscription;
+			const data = await paymentHookData(options, payment, delivered, latest);
+			events.push({ type: status === "paid" ? "payment.paid" : "payment.failed", data });
+		}
 	}
 	events.push(...duplicateEvents);
 	if (status === "paid") {
@@ -941,6 +940,9 @@ async function activateSubscription(
 	// nothing, so it is refunded rather than starting a second subscription.
 	// Checked and applied under the identity's lock, so two pending rows
 	// activated at the same time cannot both pass.
+	// No longer pending (activated by another payment, expired, ended): this
+	// payment pays for nothing, whatever other rows are doing.
+	if (initial.status !== "incomplete") return { kind: "covered" };
 	const identity = { referenceId: initial.referenceId, customerType: initial.customerType ?? null };
 	return withReferenceLock(ctx, options, identity, async (fence): Promise<Application> => {
 		const covered = await coverage(ctx, options, identity, initial.id, new Date());
@@ -1429,6 +1431,7 @@ function isUnhandled(record: MolliePaymentRecord): boolean {
 async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
 	const record = await findPaymentRecord(ctx, payment.id);
 	if (record?.status !== payment.status) return true;
+	if (record.hooksDue) return true;
 	if (payment.status === "paid")
 		return record.outcome === "pending" || record.outcome === "duplicate";
 	return isFinalPaymentStatus(payment.status as string) && isUnhandled(record);
@@ -2085,6 +2088,8 @@ async function outstandingPayments(
 			{ field: "status", value: "paid" },
 			{ field: "outcome", operator: "in", value: ["pending", "duplicate"] },
 		],
+		// Hooks still due (the delivery that recorded the change stopped).
+		[...scope, { field: "hooksDue", value: true }],
 		// Not paid, consequence not applied yet (e.g. a failed renewal recorded
 		// right before the process stopped). Across all subscriptions only
 		// charges: failed checkouts matter for incomplete rows, synced anyway.
@@ -2116,7 +2121,10 @@ async function outstandingPayments(
 			if (page.length < PAGE_SIZE) break;
 		}
 	}
-	return found;
+	const seen = new Set<string>();
+	return found.filter(
+		(record) => !seen.has(record.molliePaymentId) && !!seen.add(record.molliePaymentId),
+	);
 }
 
 /**

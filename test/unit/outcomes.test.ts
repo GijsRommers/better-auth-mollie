@@ -2296,3 +2296,80 @@ describe("re-check of a354581: hooks when an activation has to come back", () =>
 		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([payment.id]);
 	});
 });
+
+describe("re-check of b0681af: payment truth and hooks are tracked apart", () => {
+	it("refunds a late paid checkout of an ended subscription, even while another row is busy", async () => {
+		const env = await setup();
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		const [subscription] = await env.subscriptions();
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		travel(new Date(subscription!.periodEnd!).getTime() + 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(subscription!.id)).status).toBe("canceled");
+
+		// Another pending row of the same customer is being processed right now.
+		await env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				referenceId: subscription!.referenceId,
+				plan: "starter",
+				status: "incomplete",
+				mollieCustomerId: subscription!.mollieCustomerId,
+				customerType: "user",
+				cancelAtPeriodEnd: false,
+				lockToken: "someone-else",
+				lockedUntil: new Date(Date.now() + 60_000),
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		// The second checkout is paid late.
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${second.payment.id}`);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([second.payment.id]);
+	});
+
+	it("still runs the paid hook when a newer delivery takes over the payment", async () => {
+		const onPaymentPaid = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentPaid } });
+		const subscription = await subscribe(env);
+		await settle();
+		onPaymentPaid.mockClear();
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+
+		// Delivery A records the change to paid, then stalls before claiming it.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "molliePayment" && args.set && "claimSerial" in args.set) {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const deliveryA = env.webhook(`id=${renewal.id}`);
+		await paused;
+		travel(Date.now() + 3 * 60_000);
+		await env.webhook(`id=${renewal.id}`);
+		release();
+		await deliveryA;
+		adapter.incrementOne = original;
+		await settle();
+
+		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([renewal.id]);
+	});
+});

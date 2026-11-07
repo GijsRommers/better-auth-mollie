@@ -164,6 +164,8 @@ export interface MolliePaymentRecord {
 	outcome: PaymentOutcome;
 	/** Internal: the newest subscription lock that claimed this payment (see `claimPayment`). */
 	claimSerial?: number | null | undefined;
+	/** Internal: its `payment.paid` / `payment.failed` hooks are still to be dispatched. */
+	hooksDue?: boolean | null | undefined;
 }
 
 export type MollieOperationStatus = "pending" | "succeeded" | "failed";
