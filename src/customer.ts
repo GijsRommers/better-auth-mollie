@@ -150,3 +150,27 @@ export async function claimDelivery(
 		throw error;
 	}
 }
+
+/**
+ * Brings the Mollie customer's name (and, for users, email) in line with the
+ * current database row. Reads the latest row and only writes when Mollie
+ * differs, so overlapping runs converge on the newest values.
+ */
+export async function syncCustomerDetails(
+	context: GenericEndpointContext["context"],
+	options: MollieOptions,
+	customerType: CustomerType,
+	referenceId: string,
+): Promise<void> {
+	const row = await context.adapter.findOne<
+		{ name: string; email?: string | null } & WithMollieCustomerId
+	>({ model: customerType, where: [{ field: "id", value: referenceId }] });
+	if (!row?.mollieCustomerId) return;
+	const desired: { name: string; email?: string } = { name: row.name };
+	if (customerType === "user" && row.email) desired.email = row.email;
+	const gateway = gatewayFor(options);
+	const remote = await gateway.getCustomer(row.mollieCustomerId);
+	const same =
+		remote.name === desired.name && (desired.email === undefined || remote.email === desired.email);
+	if (!same) await gateway.updateCustomer(row.mollieCustomerId, desired);
+}

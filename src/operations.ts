@@ -328,3 +328,76 @@ export function findByOperationKey<T extends { id: string; metadata?: unknown }>
 	}
 	return null;
 }
+
+/** How long a lifecycle lock is held before others may take it over. */
+export const LOCK_LEASE_MS = 2 * 60 * 1000;
+
+/**
+ * Runs `fn` while holding a lease lock stored in the journal table (adapter
+ * only, no row locks). Throws `OperationInProgressError` when another caller
+ * holds it. A crashed holder's lease expires after `LOCK_LEASE_MS`.
+ */
+export async function withLock<T>(
+	context: AuthContext,
+	input: { key: string; referenceId: string; now?: (() => Date) | undefined },
+	fn: () => Promise<T>,
+): Promise<T> {
+	const now = input.now ?? (() => new Date());
+	const lease = now();
+	const { adapter } = context;
+	let claimed = false;
+	try {
+		await adapter.create({
+			model: "mollieOperation",
+			data: {
+				idempotencyKey: input.key,
+				kind: "lifecycle_lock",
+				referenceId: input.referenceId,
+				status: "pending",
+				mollieId: null,
+				createdAt: lease,
+			},
+		});
+		claimed = true;
+	} catch (error) {
+		const existing = await readOperation(context, input.key);
+		if (!existing) throw error;
+		const expired = lease.getTime() - new Date(existing.createdAt).getTime() > LOCK_LEASE_MS;
+		if (existing.status !== "pending" || expired) {
+			const taken = await adapter.incrementOne({
+				model: "mollieOperation",
+				where: [
+					{ field: "idempotencyKey", value: input.key },
+					{ field: "status", value: existing.status },
+					{ field: "createdAt", value: new Date(existing.createdAt) },
+				],
+				increment: {},
+				set: { status: "pending", createdAt: lease },
+			});
+			claimed = taken !== null;
+		}
+	}
+	if (!claimed) throw new OperationInProgressError(input.key);
+
+	const release = (status: "succeeded" | "failed") =>
+		adapter
+			.incrementOne({
+				model: "mollieOperation",
+				where: [
+					{ field: "idempotencyKey", value: input.key },
+					{ field: "status", value: "pending" },
+					{ field: "createdAt", value: lease },
+				],
+				increment: {},
+				set: { status },
+			})
+			.catch(() => null);
+	try {
+		const result = await fn();
+		await release("succeeded");
+		return result;
+	} catch (error) {
+		await release("failed");
+		throw error;
+	}
+}

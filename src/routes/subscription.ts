@@ -6,6 +6,7 @@ import {
 	applyTimeTransitions,
 	cancelMollieSubscription,
 	createScheduledSubscription,
+	findSubscription,
 	guardedUpdate,
 	paymentPurpose,
 	processPayment,
@@ -17,7 +18,7 @@ import { toAPIError } from "../errors";
 import { dispatchEvents } from "../events";
 import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
-import { runOperation } from "../operations";
+import { runOperation, withLock } from "../operations";
 import {
 	ACCESS_STATUSES,
 	BILLING_STATUSES,
@@ -38,6 +39,7 @@ import type {
 } from "../types";
 import {
 	ceilToUTCDate,
+	errorMessage,
 	getPlanByName,
 	getPlans,
 	getUrl,
@@ -131,6 +133,59 @@ async function findOpenCheckout(
 }
 
 /**
+ * Makes `mollieSubscriptionId` the subscription's Mollie subscription, but
+ * only if the row still points at the one this change started from. If a
+ * concurrent change won, the new Mollie subscription is canceled again,
+ * unless the winner adopted that very same one (identical request).
+ */
+async function adopt(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	current: Subscription,
+	mollieSubscriptionId: string,
+	set: Partial<Subscription>,
+): Promise<Subscription> {
+	const updated = await guardedUpdate(
+		ctx,
+		current.id,
+		ACCESS_STATUSES,
+		{ ...set, mollieSubscriptionId },
+		current.mollieSubscriptionId
+			? [{ field: "mollieSubscriptionId", value: current.mollieSubscriptionId }]
+			: [],
+	);
+	if (updated) return updated;
+	const latest = await findSubscription(ctx, [{ field: "id", value: current.id }]);
+	if (latest?.mollieSubscriptionId === mollieSubscriptionId) return latest;
+	await cancelMollieSubscription(ctx, options, { ...current, mollieSubscriptionId }).catch(
+		(error: unknown) =>
+			ctx.context.logger.error(
+				`[mollie] Could not cancel unadopted subscription ${mollieSubscriptionId}: ${errorMessage(error)}`,
+			),
+	);
+	throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+}
+
+/** Serializes changes to one subscription (plan change, cancel, restore). */
+function lockSubscription<T>(
+	ctx: GenericEndpointContext,
+	subscription: Subscription,
+	fn: (fresh: Subscription) => Promise<T>,
+): Promise<T> {
+	return withLock(
+		ctx.context,
+		{ key: `lock:subscription:${subscription.id}`, referenceId: subscription.referenceId },
+		async () => {
+			const fresh = await findSubscription(ctx, [{ field: "id", value: subscription.id }]);
+			if (!fresh) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
+			return fn(fresh);
+		},
+	).catch((error: unknown) => {
+		throw toAPIError(error, MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+	});
+}
+
+/**
  * Points billing at `plan` from `startAt`: stops the current Mollie
  * subscription (if still running) and creates a new one. If the new one
  * cannot be created, the subscription is marked to end at `periodEnd`,
@@ -168,10 +223,15 @@ async function reschedule(
 			scope: `subscription:${current.id}:${tag}:${plan.name.toLowerCase()}:${toMollieDate(startAt)}:${chargeAmount(plan, tax)}:${current.mollieSubscriptionId}`,
 		});
 	} catch (error) {
-		await guardedUpdate(ctx, current.id, BILLING_STATUSES, {
-			cancelAtPeriodEnd: true,
-			pendingPlan: null,
-		});
+		await guardedUpdate(
+			ctx,
+			current.id,
+			BILLING_STATUSES,
+			{ cancelAtPeriodEnd: true, pendingPlan: null },
+			current.mollieSubscriptionId
+				? [{ field: "mollieSubscriptionId", value: current.mollieSubscriptionId }]
+				: [],
+		);
 		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_SUBSCRIPTION);
 	}
 }
@@ -300,9 +360,8 @@ async function changePlan(
 			startAt,
 			tag: "change",
 		});
-		return guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
+		return adopt(ctx, options, current, mollieSubscriptionId, {
 			pendingPlan: planName,
-			mollieSubscriptionId,
 			cancelAtPeriodEnd: false,
 		});
 	}
@@ -325,10 +384,9 @@ async function changePlan(
 		}
 		throw error;
 	}
-	const updated = await guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
+	const updated = await adopt(ctx, options, current, mollieSubscriptionId, {
 		plan: planName,
 		pendingPlan: null,
-		mollieSubscriptionId,
 		cancelAtPeriodEnd: false,
 	});
 	if (proration) {
@@ -353,9 +411,8 @@ async function cancelPendingChange(
 		startAt: nextPeriodStart(current, new Date()),
 		tag: "keep",
 	});
-	return guardedUpdate(ctx, current.id, ACCESS_STATUSES, {
+	return adopt(ctx, options, current, mollieSubscriptionId, {
 		pendingPlan: null,
-		mollieSubscriptionId,
 		cancelAtPeriodEnd: false,
 	});
 }
@@ -403,22 +460,10 @@ async function restore(
 	} catch (error) {
 		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_SUBSCRIPTION);
 	}
-	const updated = await guardedUpdate(
-		ctx,
-		subscription.id,
-		ACCESS_STATUSES,
-		{ cancelAtPeriodEnd: false, mollieSubscriptionId },
-		[{ field: "cancelAtPeriodEnd", value: true }],
-	);
-	if (!updated) {
-		// Ended or restored concurrently: undo the new Mollie subscription.
-		await cancelMollieSubscription(ctx, options, {
-			...subscription,
-			mollieSubscriptionId,
-		}).catch(() => {});
-		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
-	}
-	return updated;
+	return adopt(ctx, options, subscription, mollieSubscriptionId, {
+		cancelAtPeriodEnd: false,
+		pendingPlan: null,
+	});
 }
 
 const upgradeSubscriptionBodySchema = z.object({
@@ -518,8 +563,28 @@ export const upgradeSubscription = (options: MollieOptions) =>
 				});
 				if (open.activated) return respond(body.successUrl);
 				if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
+				// Processing earlier attempts may have moved the row on.
+				let target = (await findSubscription(ctx, [{ field: "id", value: row.id }])) ?? row;
+				if (input.purpose === "recovery") {
+					if (target.status !== "past_due" && target.status !== "unpaid") {
+						return respond(body.successUrl);
+					}
+				} else if (target.status !== "incomplete") {
+					target = await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
+						model: "subscription",
+						data: {
+							referenceId,
+							plan: planName,
+							status: "incomplete",
+							mollieCustomerId: input.customerId,
+							cancelAtPeriodEnd: false,
+							createdAt: new Date(),
+							updatedAt: new Date(),
+						},
+					});
+				}
 				const url = await createCheckout(ctx, options, {
-					row,
+					row: target,
 					plan,
 					amount,
 					tax,
@@ -543,17 +608,18 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						(await getOrCreateCustomer(ctx, options, { customerType, referenceId }));
 					return checkout(current, { purpose: "recovery", trialDays: 0, customerId });
 				}
-				if (current.plan === planName) {
-					if (current.pendingPlan) {
-						await cancelPendingChange(ctx, options, current, customerType);
-					} else if (current.cancelAtPeriodEnd) {
-						await restore(ctx, options, current, customerType);
-					} else {
+				await lockSubscription(ctx, current, async (fresh) => {
+					if (!ACCESS_STATUSES.includes(fresh.status)) {
+						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
+					}
+					if (fresh.plan === planName) {
+						if (fresh.pendingPlan) return cancelPendingChange(ctx, options, fresh, customerType);
+						if (fresh.cancelAtPeriodEnd) return restore(ctx, options, fresh, customerType);
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ALREADY_SUBSCRIBED_PLAN);
 					}
-				} else if (current.pendingPlan !== planName || current.cancelAtPeriodEnd) {
-					await changePlan(ctx, options, current, plan, customerType);
-				}
+					if (fresh.pendingPlan === planName && !fresh.cancelAtPeriodEnd) return fresh;
+					return changePlan(ctx, options, fresh, plan, customerType);
+				});
 				return respond(body.returnUrl ?? body.successUrl);
 			}
 
@@ -746,14 +812,22 @@ export const cancelSubscription = (options: MollieOptions) =>
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
 			if (!subscription.cancelAtPeriodEnd) {
-				try {
-					await cancelMollieSubscription(ctx, options, subscription);
-				} catch (error) {
-					throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
-				}
-				await guardedUpdate(ctx, subscription.id, BILLING_STATUSES, {
-					cancelAtPeriodEnd: true,
-					pendingPlan: null,
+				await lockSubscription(ctx, subscription, async (fresh) => {
+					if (fresh.cancelAtPeriodEnd || !BILLING_STATUSES.includes(fresh.status)) return;
+					try {
+						await cancelMollieSubscription(ctx, options, fresh);
+					} catch (error) {
+						throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CANCEL_SUBSCRIPTION);
+					}
+					await guardedUpdate(
+						ctx,
+						fresh.id,
+						BILLING_STATUSES,
+						{ cancelAtPeriodEnd: true, pendingPlan: null },
+						fresh.mollieSubscriptionId
+							? [{ field: "mollieSubscriptionId", value: fresh.mollieSubscriptionId }]
+							: [],
+					);
 				});
 			}
 			return ctx.json({
@@ -804,7 +878,9 @@ export const restoreSubscription = (options: MollieOptions) =>
 			if (!subscription) {
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
-			const restored = await restore(ctx, options, subscription, customerType);
+			const restored = await lockSubscription(ctx, subscription, (fresh) =>
+				restore(ctx, options, fresh, customerType),
+			);
 			return ctx.json(withLimits(restored, await getPlans(options)));
 		},
 	);

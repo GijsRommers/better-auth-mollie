@@ -1,9 +1,8 @@
 import type { AuthContext, BetterAuthPlugin, GenericEndpointContext, User } from "better-auth";
 import { APIError } from "better-auth/api";
 import type { SyncResult } from "./billing";
-import { getOrCreateCustomer } from "./customer";
+import { getOrCreateCustomer, syncCustomerDetails } from "./customer";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
-import { gatewayFor } from "./gateway";
 import {
 	hasActiveSubscriptionEndpoint,
 	mollieWebhook,
@@ -60,8 +59,16 @@ function validateOptions(options: MollieOptions): void {
 			);
 		}
 	}
-	if (options.salesInvoices?.enabled && !options.salesInvoices.getRecipient) {
-		fail("`salesInvoices.getRecipient` is required when sales invoices are enabled.");
+	if (options.salesInvoices?.enabled) {
+		if (!options.salesInvoices.getRecipient) {
+			fail("`salesInvoices.getRecipient` is required when sales invoices are enabled.");
+		}
+		const taxed = options.subscription?.enabled && !!options.subscription.tax;
+		if (!taxed && !options.salesInvoices.vatRate) {
+			fail(
+				'Sales invoices need a VAT rate: configure `subscription.tax` (e.g. euVat()) or set `salesInvoices.vatRate` (e.g. "21.00").',
+			);
+		}
 	}
 }
 
@@ -110,11 +117,9 @@ function installOrganizationHooks(ctx: AuthContext, options: MollieOptions) {
 		const { organization } = data;
 		if (!organization?.mollieCustomerId) return;
 		ctx.runInBackground(
-			gatewayFor(options)
-				.updateCustomer(organization.mollieCustomerId, { name: organization.name })
-				.catch((error: unknown) =>
-					ctx.logger.error(`[mollie] Could not sync organization name: ${errorMessage(error)}`),
-				),
+			syncCustomerDetails(ctx, options, "organization", organization.id).catch((error: unknown) =>
+				ctx.logger.error(`[mollie] Could not sync organization name: ${errorMessage(error)}`),
+			),
 		);
 	};
 
@@ -209,16 +214,13 @@ export const mollie = <O extends MollieOptions>(options: O) => {
 							},
 							update: {
 								async after(updated: User & WithMollieCustomerId) {
-									const customerId = updated.mollieCustomerId;
-									if (!customerId) return;
+									if (!updated.mollieCustomerId) return;
 									ctx.runInBackground(
-										gatewayFor(options)
-											.updateCustomer(customerId, { name: updated.name, email: updated.email })
-											.catch((error: unknown) =>
-												ctx.logger.error(
-													`[mollie] Could not sync customer details: ${errorMessage(error)}`,
-												),
+										syncCustomerDetails(ctx, options, "user", updated.id).catch((error: unknown) =>
+											ctx.logger.error(
+												`[mollie] Could not sync customer details: ${errorMessage(error)}`,
 											),
+										),
 									);
 								},
 							},

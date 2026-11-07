@@ -1,9 +1,15 @@
 import type { GenericEndpointContext } from "better-auth";
 import type { SalesInvoiceRequest, SalesInvoiceResponse } from "mollie-api-typescript/models";
 import { gatewayFor } from "./gateway";
-import { runOperation } from "./operations";
-import type { MollieOptions, PaymentHookData } from "./types";
-import { mergeMetadata } from "./utils";
+import { OperationInProgressError, runOperation } from "./operations";
+import type {
+	MollieOperation,
+	MollieOptions,
+	MolliePaymentRecord,
+	PaymentHookData,
+	Subscription,
+} from "./types";
+import { addDays, errorMessage, mergeMetadata } from "./utils";
 
 /**
  * The default invoice for a paid payment: one line for the plan, marked as
@@ -21,16 +27,18 @@ export function defaultInvoiceRequest(
 	return {
 		status: "paid",
 		recipientIdentifier: subscription.referenceId,
-		vatMode: tax ? "exclusive" : "inclusive",
+		vatMode: tax && !tax.inclusive ? "exclusive" : "inclusive",
 		paymentDetails: { source: "payment", sourceReference: payment.id },
 		lines: [
 			{
 				description,
 				quantity: 1,
 				vatRate: tax ? tax.rate : (config?.vatRate ?? "0.00"),
+				// Inclusive prices are invoiced as charged, so the invoice total
+				// always equals the payment, whatever rounding Mollie applies.
 				unitPrice: {
 					currency: payment.amount.currency,
-					value: tax ? tax.net : payment.amount.value,
+					value: tax && !tax.inclusive ? tax.net : payment.amount.value,
 				},
 			},
 		],
@@ -86,4 +94,64 @@ export async function createSalesInvoice(
 	if (!operation.result) return null;
 	await config.onInvoiceCreated?.({ ...data, invoice: operation.result }, ctx);
 	return operation.result;
+}
+
+/** How far back the sync looks for paid payments without an invoice. */
+const CATCH_UP_DAYS = 30;
+
+/**
+ * Creates the sales invoices that were missed, e.g. because the invoice API
+ * failed or the process stopped after the payment was recorded. Looks at
+ * payments paid in the last 30 days; the per-payment journal makes this safe
+ * to run alongside the webhook. Returns the number of invoices created.
+ */
+export async function catchUpSalesInvoices(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	now: Date,
+	hookData: (
+		record: MolliePaymentRecord,
+		subscription: Subscription,
+	) => Promise<PaymentHookData | null>,
+): Promise<number> {
+	if (!options.salesInvoices?.enabled) return 0;
+	const { adapter } = ctx.context;
+	const paid = await adapter.findMany<MolliePaymentRecord>({
+		model: "molliePayment",
+		where: [
+			{ field: "status", value: "paid" },
+			{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
+		],
+		sortBy: { field: "paidAt", direction: "desc" },
+		limit: 200,
+	});
+	let created = 0;
+	for (const record of paid) {
+		const prefix = `sales-invoice:${record.molliePaymentId}#`;
+		const done = await adapter.findMany<MollieOperation>({
+			model: "mollieOperation",
+			where: [
+				{ field: "kind", value: "create_sales_invoice" },
+				{ field: "idempotencyKey", operator: "starts_with", value: prefix },
+				{ field: "status", value: "succeeded" },
+			],
+			limit: 1,
+		});
+		if (done.some((op) => op.idempotencyKey.startsWith(prefix))) continue;
+		const subscription = await adapter.findOne<Subscription>({
+			model: "subscription",
+			where: [{ field: "id", value: record.subscriptionId }],
+		});
+		if (!subscription) continue;
+		try {
+			const data = await hookData(record, subscription);
+			if (data && (await createSalesInvoice(ctx, options, data))) created++;
+		} catch (error) {
+			if (error instanceof OperationInProgressError) continue;
+			ctx.context.logger.error(
+				`[mollie] Sales invoice for ${record.molliePaymentId} failed: ${errorMessage(error)}`,
+			);
+		}
+	}
+	return created;
 }

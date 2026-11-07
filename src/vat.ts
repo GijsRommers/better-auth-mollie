@@ -56,9 +56,10 @@ export type EuVatOptions = {
 	/** Plan amounts include VAT. @default false */
 	pricesIncludeVat?: boolean | undefined;
 	/**
-	 * Check VAT numbers online with VIES (Node.js only) instead of only their
-	 * format. If VIES is unreachable, VAT is charged and a warning is logged.
-	 * @default false
+	 * Check VAT numbers online with VIES (Node.js only), not just their format,
+	 * before reverse charging: you are liable for VAT on invalid numbers. If
+	 * VIES is unreachable, VAT is charged and a warning is logged.
+	 * @default true
 	 */
 	vies?: boolean | undefined;
 	/**
@@ -115,7 +116,7 @@ export function euVat(options: EuVatOptions): TaxOptions {
 		async calculate({ referenceId, customerType }, ctx): Promise<TaxDecision> {
 			salesTax.setTaxOriginCountry(origin);
 			salesTax.toggleEnabledTaxNumberValidation(true);
-			salesTax.toggleEnabledTaxNumberFraudCheck(options.vies === true);
+			salesTax.toggleEnabledTaxNumberFraudCheck(options.vies !== false);
 
 			const customer = await options.getCustomer({ referenceId, customerType }, ctx);
 			const country = (customer?.country ?? origin).toUpperCase();

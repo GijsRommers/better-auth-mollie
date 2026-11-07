@@ -150,7 +150,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 	const calls: FakeCall[] = [];
 	const failures = new Map<string, unknown[]>();
 	/** Called after a create succeeds but before the response returns. */
-	const afterCreate = new Map<string, () => void>();
+	const afterCreate = new Map<string, () => void | Promise<void>>();
 	/** Methods whose next response (success or error) is lost on the way back. */
 	const lostResponses = new Set<string>();
 	const loseResponse = (method: string) => {
@@ -216,7 +216,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			await takeHold(method, "processing");
 			const created = create();
 			if (key) idempotency.set(key, { fingerprint, value: structuredClone(created) });
-			afterCreate.get(method)?.();
+			await afterCreate.get(method)?.();
 			loseResponse(method);
 			return structuredClone(created);
 		} catch (error) {
@@ -457,11 +457,15 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			queue.push(error);
 			failures.set(method, queue);
 		},
-		/** Run `fn` after the next successful create of `method`, e.g. to lose the response. */
-		afterNextCreate(method: string, fn: () => void) {
+		/**
+		 * Run `fn` after the next successful create of `method` (Mollie has
+		 * stored the result), before the response returns: throw to lose the
+		 * response, or await something to pause the caller.
+		 */
+		afterNextCreate(method: string, fn: () => void | Promise<void>) {
 			afterCreate.set(method, () => {
 				afterCreate.delete(method);
-				fn();
+				return fn();
 			});
 		},
 		/**

@@ -164,8 +164,34 @@ export function isMollieConflict(error: unknown): boolean {
 const UNSAFE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 /**
- * Merges flat metadata objects for Mollie. `internal` (keys the plugin relies
- * on) always wins; prototype-polluting keys are dropped.
+ * Metadata keys the plugin reads back from Mollie. Caller-supplied metadata
+ * can never set them, whether or not the plugin sets them itself (e.g. the
+ * tax keys when no tax is configured).
+ */
+export const RESERVED_METADATA_KEYS: ReadonlySet<string> = new Set([
+	"subscriptionId",
+	"referenceId",
+	"plan",
+	"purpose",
+	"trial",
+	"trialDays",
+	"operationKey",
+	"molliePaymentId",
+	"customerType",
+	"userId",
+	"organizationId",
+	"vatRate",
+	"netAmount",
+	"vatAmount",
+	"grossAmount",
+	"reverseCharge",
+	"vatCountry",
+	"vatInclusive",
+]);
+
+/**
+ * Merges flat metadata objects for Mollie. Caller sources cannot set
+ * reserved or prototype-polluting keys; `internal` is applied last.
  */
 export function mergeMetadata(
 	internal: Record<string, unknown>,
@@ -175,7 +201,7 @@ export function mergeMetadata(
 	for (const source of sources) {
 		if (!source) continue;
 		for (const [key, value] of Object.entries(source)) {
-			if (!UNSAFE_KEYS.has(key)) merged[key] = value;
+			if (!UNSAFE_KEYS.has(key) && !RESERVED_METADATA_KEYS.has(key)) merged[key] = value;
 		}
 	}
 	return { ...merged, ...internal };

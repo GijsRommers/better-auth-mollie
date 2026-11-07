@@ -146,7 +146,9 @@ export type MollieOperationKind =
 	| "create_proration_payment"
 	| "create_sales_invoice"
 	/** Marks a hook as delivered, so it runs at most once. */
-	| "hook_delivery";
+	| "hook_delivery"
+	/** Lease lock serializing changes to one subscription. */
+	| "lifecycle_lock";
 
 /**
  * Write-ahead journal entry. Written before every mutating Mollie call so a
@@ -229,6 +231,8 @@ export type TaxBreakdown = {
 	currency: string;
 	country?: string | undefined;
 	reverseCharge: boolean;
+	/** The price was VAT-inclusive (VAT was computed out of `gross`). */
+	inclusive: boolean;
 };
 
 export type TaxOptions = {
@@ -386,8 +390,7 @@ export type SalesInvoicesOptions = {
 	) => SalesInvoiceRecipient | null | Promise<SalesInvoiceRecipient | null>;
 	/**
 	 * VAT rate for invoice lines when `subscription.tax` is not configured
-	 * (prices are then treated as VAT-inclusive).
-	 * @default "0.00"
+	 * (prices are then treated as VAT-inclusive). Required in that case.
 	 */
 	vatRate?: string | undefined;
 	/** Deliver invoices through Peppol (Belgium, Germany and the Netherlands). */

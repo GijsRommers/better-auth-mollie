@@ -125,6 +125,14 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			);
 		},
 
+		async listCustomerSubscriptions(customerId: string): Promise<ListSubscriptionResponse[]> {
+			const page = await client.subscriptions.list(
+				{ customerId, limit: 50, sort: "desc" },
+				options,
+			);
+			return page.result.embedded?.subscriptions ?? [];
+		},
+
 		async listSubscriptionPayments(
 			customerId: string,
 			subscriptionId: string,

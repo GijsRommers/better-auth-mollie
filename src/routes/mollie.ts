@@ -141,12 +141,31 @@ export const subscriptionSuccess = (options: MollieOptions) =>
 		async (ctx) => {
 			const callbackURL = ctx.query?.callbackURL || "/";
 			const subscriptionId = ctx.query?.subscriptionId;
-			if (subscriptionId && (await getSessionFromCtx(ctx))) {
+			const session = await getSessionFromCtx(ctx);
+			if (subscriptionId && session) {
 				try {
 					const subscription = await findSubscription(ctx, [
 						{ field: "id", value: subscriptionId },
 					]);
-					if (subscription?.status === "incomplete") {
+					// Only for subscriptions the signed-in user may act on.
+					const allowed =
+						!!subscription &&
+						(subscription.referenceId === session.user.id ||
+							(options.subscription?.enabled &&
+								(await options.subscription.authorizeReference?.(
+									{
+										user: session.user,
+										session: session.session,
+										referenceId: subscription.referenceId,
+										action: "upgrade-subscription",
+									},
+									ctx,
+								))) === true);
+					if (
+						subscription &&
+						allowed &&
+						["incomplete", "past_due", "unpaid"].includes(subscription.status)
+					) {
 						const { events } = await syncSubscription(ctx, options, subscription, new Date());
 						dispatchEvents(ctx, options, events);
 					}

@@ -57,6 +57,7 @@ export function computeTax(
 		currency,
 		country: decision.country,
 		reverseCharge,
+		inclusive: pricesIncludeVat,
 	};
 }
 
@@ -95,6 +96,7 @@ export function taxMetadata(tax: TaxBreakdown | null): Record<string, unknown> {
 		vatAmount: tax.vat,
 		grossAmount: tax.gross,
 		reverseCharge: tax.reverseCharge,
+		vatInclusive: tax.inclusive,
 		...(tax.country ? { vatCountry: tax.country } : {}),
 	};
 }
@@ -120,5 +122,20 @@ export function taxFromMetadata(
 		currency,
 		country: typeof metadata.vatCountry === "string" ? metadata.vatCountry : undefined,
 		reverseCharge: metadata.reverseCharge === true,
+		inclusive: metadata.vatInclusive === true,
 	};
+}
+
+/**
+ * The tax breakdown a payment or Mollie subscription was charged with, read
+ * from the metadata the plugin set. Ignored when no `subscription.tax` is
+ * configured, so stray metadata can never change prices.
+ */
+export function trustedTax(
+	options: MollieOptions,
+	metadata: Record<string, unknown>,
+	currency: string,
+): TaxBreakdown | null {
+	const configured = options.subscription?.enabled && !!options.subscription.tax;
+	return configured ? taxFromMetadata(metadata, currency) : null;
 }
