@@ -289,3 +289,199 @@ describe("Mollie follows every change, and never collects twice for the same tim
 		]);
 	});
 });
+
+describe("re-check of 94c806f: cancellation, coverage and compensation", () => {
+	it("keeps retrying a failed cancellation after the period has ended", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		env.fake.failNext("subscriptions.cancel", new TypeError("fetch failed"));
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		expect(env.fake.subscriptions.get(subscription.mollieSubscriptionId!)?.status).toBe("active");
+
+		// The first sync only runs after the period ended.
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+		const row = await env.subscription(subscription.id);
+		expect(row).toMatchObject({ status: "canceled", mollieSyncNeeded: false });
+	});
+
+	it("stops a lost replacement when the customer cancels", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "business");
+		env.fake.afterNextCreate("subscriptions.create", () => {
+			throw new TypeError("socket hang up");
+		});
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
+
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+	});
+
+	it("applies a renewal whose webhook is late before replacing billing", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		// Mollie charged the renewal; its webhook has not arrived.
+		env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		const { headers } = await env.signInWithTestUser();
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers });
+
+		const row = await env.subscription(subscription.id);
+		expect(row.plan).toBe("business");
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active.map((s) => s.id)).toEqual([row.mollieSubscriptionId]);
+		expect(active[0]?.startDate).toBe(toMollieDate(new Date(row.periodEnd!)));
+		expect(refundedIds(env)).toEqual([]);
+	});
+
+	it("does not adopt a replacement made for a period a renewal just extended", async () => {
+		let rate = "21.00";
+		let pause: (() => Promise<void>) | null = null;
+		const env = await setup({
+			subscription: {
+				tax: {
+					calculate: async () => {
+						const current = pause;
+						pause = null;
+						if (current) await current();
+						return { rate };
+					},
+				},
+			},
+		});
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		rate = "9.00";
+
+		let release!: () => void;
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		pause = () =>
+			new Promise<void>((resolve) => {
+				release = resolve;
+				reached();
+			});
+		const sync = syncMollieSubscriptions(env.auth as never);
+		await paused;
+		// While the sync works out the new price, the renewal is paid.
+		const charge = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${charge.id}`);
+		release();
+		await sync;
+
+		const row = await env.subscription(subscription.id);
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+		const active = env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!);
+		expect(active.map((s) => s.id)).toEqual([row.mollieSubscriptionId]);
+		expect(active[0]).toMatchObject({
+			amount: { value: "10.85" },
+			startDate: toMollieDate(new Date(row.periodEnd!)),
+		});
+		expect(refundedIds(env)).toEqual([]);
+	});
+
+	it("refunds a pro-rata charge whose upgrade lost its lock, even if the refund fails at first", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		let reached!: () => void;
+		const charged = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		env.fake.afterNextCreate("payments.create", async () => {
+			reached();
+			await gate;
+		});
+		const upgrade = env.api
+			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await charged;
+		// The upgrade stalls after charging, past its lease; another change takes over.
+		travel(Date.now() + 3 * 60_000);
+		const { headers } = await env.signInWithTestUser();
+		await env.api.upgradeSubscription({ body: { plan: "yearly" }, headers });
+		release();
+		await upgrade;
+
+		const proration = [...env.fake.payments.values()].find(
+			(p) => (p.metadata as { purpose?: string }).purpose === "proration",
+		)!;
+		expect(refundedIds(env)).toEqual([]);
+		// The charge settles later; its first refund attempt fails.
+		if (proration.status !== "paid") env.fake.completePayment(proration.id, "paid");
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		await env.webhook(`id=${proration.id}`);
+		expect(refundedIds(env)).toEqual([]);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([proration.id]);
+		expect((await env.subscription(subscription.id)).plan).toBe("starter");
+	});
+
+	it("refunds a pro-rata charge whose upgrade was never recorded (process stopped)", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env, "starter");
+		// Charged by an upgrade whose process stopped before changing the plan.
+		const proration = await env.fake.client.payments.create({
+			idempotencyKey: "crashed-upgrade",
+			paymentRequest: {
+				amount: { currency: "EUR", value: "39.05" },
+				description: "business: upgrade for the rest of this period",
+				sequenceType: "recurring",
+				customerId: subscription.mollieCustomerId!,
+				mandateId: subscription.mollieMandateId!,
+				metadata: { subscriptionId: subscription.id, plan: "business", purpose: "proration" },
+			},
+		} as never);
+		env.fake.completePayment(proration.id, "paid");
+		await env.webhook(`id=${proration.id}`);
+		expect(refundedIds(env)).toEqual([]);
+
+		travel(Date.now() + 15 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(refundedIds(env)).toEqual([proration.id]);
+		expect((await env.subscription(subscription.id)).plan).toBe("starter");
+	});
+
+	it("does not let a recovery payment undo a later cancellation", async () => {
+		const env = await setup();
+		const { subscription, headers } = await delinquent(env);
+		const recovery = await recoveryPayment(env, headers);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers });
+
+		env.fake.completePayment(recovery.id, "paid");
+		await env.webhook(`id=${recovery.id}`);
+		const row = await env.subscription(subscription.id);
+		expect(row.cancelAtPeriodEnd).toBe(true);
+		expect(row.status).not.toBe("active");
+		expect(refundedIds(env)).toEqual([recovery.id]);
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+	});
+
+	it("starts a new subscription, not a recovery, after a delinquent one was canceled", async () => {
+		const env = await setup();
+		const { subscription, headers } = await delinquent(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers });
+		await env.api.upgradeSubscription({ body: { plan: "starter" }, headers });
+
+		expect((await env.subscription(subscription.id)).status).toBe("canceled");
+		const latest = [...env.fake.payments.values()].at(-1)!;
+		expect(metadataPurpose(latest)).toBe("checkout");
+		expect((latest.metadata as { subscriptionId: string }).subscriptionId).not.toBe(
+			subscription.id,
+		);
+	});
+});
+
+function metadataPurpose(payment: { metadata?: unknown }) {
+	return (payment.metadata as { purpose?: string } | undefined)?.purpose;
+}

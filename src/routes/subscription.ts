@@ -6,12 +6,15 @@ import {
 	applyTimeTransitions,
 	findSubscription,
 	guardedUpdate,
-	hasPaymentInProgress,
+	paymentOutcome,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
 	recordPayment,
 	refundUnappliedPayment,
+	sameAppliedPayment,
+	settlePreviousPayment,
+	settleRecentCharges,
 } from "../billing";
 import { getOrCreateCustomer } from "../customer";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
@@ -230,11 +233,25 @@ async function chargeProration(
 	const gateway = gatewayFor(options);
 	// The tax callback may be slow: prove the lock is still ours right before charging.
 	await fence();
+	const baseScope = `proration:${current.id}:${planName}:${periodEnd}`;
 	try {
+		for (let attempt = 0, scope = baseScope; ; attempt++) {
+			const payment = await chargeOnce(scope);
+			// A replayed charge that was refunded (its upgrade did not go
+			// through) does not pay for this upgrade: charge anew.
+			const outcome = await paymentOutcome(ctx, payment.id);
+			if ((outcome !== "duplicate" && outcome !== "refunded") || attempt >= 2) return payment;
+			scope = `${baseScope}:after:${payment.id}`;
+		}
+	} catch (error) {
+		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
+	}
+
+	async function chargeOnce(scope: string) {
 		const operation = await runOperation(ctx.context, {
 			kind: "create_proration_payment",
 			referenceId: current.referenceId,
-			scope: `proration:${current.id}:${planName}:${periodEnd}`,
+			scope,
 			reuseSucceeded: true,
 			execute: (idempotencyKey) =>
 				gateway.createPayment(
@@ -263,8 +280,6 @@ async function chargeProration(
 		const payment = operation.result ?? (await gateway.getPayment(operation.mollieId));
 		await recordPayment(ctx, payment, current.id);
 		return payment;
-	} catch (error) {
-		throw toAPIError(error, MOLLIE_ERROR_CODES.UNABLE_TO_CREATE_PAYMENT);
 	}
 }
 
@@ -281,13 +296,22 @@ async function chargeProration(
 async function changePlan(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
-	current: Subscription,
+	initial: Subscription,
 	plan: MolliePlan,
 	customerType: CustomerType,
 	fence: Fence,
 ) {
-	if (await hasPaymentInProgress(options, current)) {
+	// Charges Mollie finished but whose webhook is late (a renewal) change
+	// the period this change is priced and scheduled from: apply them first.
+	const charges = await settleRecentCharges(ctx, options, initial);
+	if (charges.inProgress) {
 		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.PAYMENT_IN_PROGRESS);
+	}
+	const current = charges.processed
+		? await findSubscription(ctx, [{ field: "id", value: initial.id }])
+		: initial;
+	if (!current || !ACCESS_STATUSES.includes(current.status)) {
+		throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
 	}
 	const now = new Date();
 	const planName = plan.name.toLowerCase();
@@ -324,25 +348,37 @@ async function changePlan(
 		cents > 0
 			? await chargeProration(ctx, options, current, plan, customerType, cents, fence)
 			: null;
+	const compensate = async () => {
+		if (!proration) return;
+		dispatchEvents(ctx, options, await refundUnappliedPayment(ctx, options, current, proration));
+	};
 	await fence().catch(async (error: unknown) => {
-		if (proration) await refundUnappliedPayment(ctx, options, current, proration);
+		await compensate();
 		throw error;
 	});
+	// The charge is recorded as the applied payment in the same update as the
+	// new plan: a charge without its upgrade is refunded (see processPayment).
+	if (proration) await settlePreviousPayment(ctx, current, proration);
 	const updated = await guardedUpdate(
 		ctx,
 		current.id,
 		ACCESS_STATUSES,
-		{ plan: planName, pendingPlan: null, cancelAtPeriodEnd: false },
-		sameRemote(current),
+		{
+			plan: planName,
+			pendingPlan: null,
+			cancelAtPeriodEnd: false,
+			...(proration ? { appliedPaymentId: proration.id } : {}),
+		},
+		[...sameRemote(current), ...(proration ? sameAppliedPayment(current) : [])],
 		{ mollieSync: true },
 	);
+	if (!updated) {
+		await compensate();
+		throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+	}
 	if (proration) {
 		const result = await processPayment(ctx, options, proration);
 		dispatchEvents(ctx, options, result.events);
-	}
-	if (!updated) {
-		if (proration) await refundUnappliedPayment(ctx, options, current, proration);
-		throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
 	}
 	return applyToMollie(ctx, options, updated, fence);
 }
@@ -480,10 +516,19 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			if (body.subscriptionId && !target) {
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
-			const current =
+			let current =
 				target && BILLING_STATUSES.includes(target.status)
 					? target
 					: subscriptions.find((s) => BILLING_STATUSES.includes(s.status));
+			if (current) {
+				// A period that ended (e.g. after a cancellation) ends the subscription
+				// first; then this request starts a new one.
+				const timed = await applyTimeTransitions(ctx, options, current, new Date());
+				dispatchEvents(ctx, options, timed.events);
+				current = BILLING_STATUSES.includes(timed.subscription.status)
+					? timed.subscription
+					: undefined;
+			}
 
 			const checkout = async (
 				row: Subscription,
@@ -545,10 +590,20 @@ export const upgradeSubscription = (options: MollieOptions) =>
 				// Payment failed and was not recovered: pay again with a new card or
 				// mandate to restart the subscription.
 				if (current.status === "past_due" || current.status === "unpaid") {
-					// Mollie may still be retrying the failed charge; paying twice for
-					// the same period is never right.
-					if (await hasPaymentInProgress(options, current)) {
+					if (current.cancelAtPeriodEnd) {
+						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
+					}
+					// Mollie may still be retrying the failed charge, or a retry was
+					// paid but not processed yet; paying twice is never right.
+					const charges = await settleRecentCharges(ctx, options, current);
+					if (charges.inProgress) {
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.PAYMENT_IN_PROGRESS);
+					}
+					if (charges.processed) {
+						const latest = await findSubscription(ctx, [{ field: "id", value: current.id }]);
+						if (latest?.status !== "past_due" && latest?.status !== "unpaid") {
+							return respond(body.successUrl);
+						}
 					}
 					const customerId =
 						current.mollieCustomerId ??
