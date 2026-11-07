@@ -6,6 +6,7 @@ import {
 	isPubliclyReachable,
 	isRejectedMollieRequest,
 	isValidAmount,
+	mergeMetadata,
 	parseInterval,
 	toMollieDate,
 	validatePlans,
@@ -144,5 +145,17 @@ describe("isPubliclyReachable", () => {
 		]) {
 			expect(isPubliclyReachable(url), url).toBe(true);
 		}
+	});
+});
+
+describe("mergeMetadata", () => {
+	it("keeps caller metadata of any shape Mollie allows, with internal keys winning", () => {
+		expect(mergeMetadata({ plan: "pro" }, { campaign: "spring", plan: "free" })).toEqual({
+			campaign: "spring",
+			plan: "pro",
+		});
+		expect(mergeMetadata({ plan: "pro" }, ["campaign"])).toEqual({ "0": "campaign", plan: "pro" });
+		expect(mergeMetadata({ plan: "pro" }, "ab")).toEqual({ "0": "a", "1": "b", plan: "pro" });
+		expect(mergeMetadata({ plan: "pro" }, null, undefined)).toEqual({ plan: "pro" });
 	});
 });

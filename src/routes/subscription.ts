@@ -873,7 +873,7 @@ async function createCheckout(
 								...taxMetadata(tax),
 							},
 							body.metadata,
-							metadataOf(extra),
+							extra.metadata,
 						),
 					},
 					idempotencyKey,

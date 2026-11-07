@@ -267,11 +267,13 @@ export const RESERVED_METADATA_KEYS: ReadonlySet<string> = new Set([
  */
 export function mergeMetadata(
 	internal: Record<string, unknown>,
-	...sources: (Record<string, unknown> | null | undefined)[]
+	// Caller metadata as Mollie allows it (an object, but also a string or an
+	// array, whose entries are kept by index).
+	...sources: unknown[]
 ): Record<string, unknown> {
 	const merged: Record<string, unknown> = {};
 	for (const source of sources) {
-		if (!source) continue;
+		if (source === null || source === undefined) continue;
 		for (const [key, value] of Object.entries(source)) {
 			if (!UNSAFE_KEYS.has(key) && !RESERVED_METADATA_KEYS.has(key)) merged[key] = value;
 		}

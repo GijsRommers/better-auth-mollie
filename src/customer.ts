@@ -4,7 +4,7 @@ import type { Organization } from "better-auth/plugins/organization";
 import type { CustomerResponse, EntityCustomer } from "mollie-api-typescript/models";
 import { MOLLIE_ERROR_CODES } from "./error-codes";
 import { toAPIError } from "./errors";
-import { gatewayFor, metadataOf } from "./gateway";
+import { gatewayFor } from "./gateway";
 import { OperationInProgressError, runOperation, withLock } from "./operations";
 import type { CustomerType, MollieOptions, WithMollieCustomerId } from "./types";
 import { mergeMetadata } from "./utils";
@@ -71,7 +71,7 @@ export async function getOrCreateCustomer(
 									: { userId: referenceId }),
 								operationKey: idempotencyKey,
 							},
-							metadataOf(extra),
+							extra.metadata,
 						),
 					},
 					idempotencyKey,
