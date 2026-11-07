@@ -7,7 +7,7 @@ It follows the API of [`@better-auth/stripe`](https://www.better-auth.com/docs/p
 Mollie Billing is simpler than Stripe Billing. Mollie charges a mandate on a schedule; it has no proration, no dunning logic, no VAT engine and no customer portal. The plugin fills in these gaps:
 
 - **Your database is the source of truth.** The `subscription` row holds plan, status and period. Mollie is kept in line with it, and is never trusted blindly.
-- **No customer is charged twice.** Mutating Mollie calls go through a write-ahead journal with idempotency keys, so retries and crashes are safe. A payment that pays for something already paid is refunded automatically.
+- **Duplicate charges are refunded.** Mutating Mollie calls go through a write-ahead journal with idempotency keys, so retries and crashes are safe. A payment that pays for something already paid is detected and refunded automatically (see [Known limits](#known-limits)).
 - **Upgrades are charged pro rata right away; downgrades start at the next period.**
 - **Failed payments get a grace period**, and customers can recover with a new card or bank account.
 - **VAT per customer:** a hook, plus an EU VAT helper (`better-auth-mollie/vat`).
@@ -29,6 +29,7 @@ Mollie Billing is simpler than Stripe Billing. Mollie charges a mandate on a sch
 - [Hooks](#hooks)
 - [Schema](#schema)
 - [Options](#options)
+- [Known limits](#known-limits)
 - [Compared with @better-auth/stripe](#compared-with-better-authstripe)
 - [Testing](#testing)
 
@@ -441,6 +442,17 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `schema`                                                                |                             | Rename tables and fields                                                                                                        |
 
 Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND`, `SUBSCRIPTION_PERIOD_ENDED` and `ANOTHER_SUBSCRIPTION_ACTIVE`.
+
+## Known limits
+
+This is an alpha. The billing logic is tested against a stateful fake of the Mollie SDK (including crashes, lost responses, stalled processes and concurrent deliveries) and against Mollie test mode, but it has not run in production yet.
+
+- **Run the sync, and watch it.** Missed webhooks, refunds that failed, interrupted changes and unfinished hooks are completed by `syncMollieSubscriptions`. Run it at least hourly and alert on its `errors`: a payment that keeps failing needs a look.
+- **Eventually consistent, not instant.** A duplicate charge is refunded once it is detected (usually by its webhook, at the latest by the sync), so a customer can briefly be charged twice before the refund goes out.
+- **Hooks are best effort.** `onPaymentPaid` and the other hooks run at most once; a crash at the wrong moment loses one. Derive access from the subscription (`hasActiveSubscription`, `hasSubscriptionAccess`), and make your own invoicing idempotent or use `salesInvoices`, which the sync retries for 30 days. Older missed invoices need manual recovery.
+- **Keep the plugin's data.** Do not delete `subscription`, `molliePayment` or `mollieOperation` rows, and run the migration before deploying a new version (new columns are not backfilled).
+- **Your database must support atomic guarded updates.** The plugin relies on Better Auth's `incrementOne` with conditions and on unique fields. It is tested with SQLite (Kysely); other adapters should behave the same but are not tested here.
+- **Clocks.** Lock leases and deadlines use the application servers' clocks; keep them in sync (NTP).
 
 ## Compared with @better-auth/stripe
 
