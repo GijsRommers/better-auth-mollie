@@ -146,6 +146,8 @@ export async function catchUpSalesInvoices(
 		subscription: Subscription,
 	) => Promise<PaymentHookData | null>,
 	onError: (record: MolliePaymentRecord, message: string) => void = () => {},
+	/** Only payments of these subscriptions. */
+	subscriptionIds?: string[],
 ): Promise<number> {
 	if (!options.salesInvoices?.enabled) return 0;
 	const { adapter } = ctx.context;
@@ -159,6 +161,9 @@ export async function catchUpSalesInvoices(
 				// Not invoiced or skipped yet.
 				{ field: "invoice", value: null },
 				{ field: "paidAt", operator: "gte", value: addDays(now, -CATCH_UP_DAYS) },
+				...(subscriptionIds
+					? [{ field: "subscriptionId", operator: "in" as const, value: subscriptionIds }]
+					: []),
 			],
 			sortBy: { field: "molliePaymentId", direction: "asc" },
 			limit: PAGE_SIZE,

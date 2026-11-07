@@ -268,6 +268,12 @@ It is cheap: a stable subscription is only fetched from Mollie in the day before
 
 Running it concurrently with webhooks or with itself is safe.
 
+To bring one user or organization up to date right away, for example from a "refresh" button in your support tools or after changing something by hand, pass its id. Its subscriptions are then checked at Mollie whatever their schedule; the profile-wide chargeback listing is left to the regular sync:
+
+```ts
+await syncMollieSubscriptions(auth, { referenceId: organizationId });
+```
+
 ## Payment failures and recovery
 
 When a renewal fails, the subscription becomes `past_due` and keeps access for `gracePeriodDays`, then becomes `unpaid`. A later successful charge makes it `active` again. The customer can also recover by calling `upgrade` with their plan:

@@ -205,12 +205,15 @@ export const syncMollieSubscriptionsEndpoint = (options: MollieOptions) =>
 		"/mollie/sync",
 		{
 			method: "POST",
-			body: z.object({ now: z.string().datetime().optional() }).optional(),
+			body: z
+				.object({ now: z.string().datetime().optional(), referenceId: z.string().optional() })
+				.optional(),
 			metadata: { SERVER_ONLY: true as const },
 		},
 		async (ctx) => {
 			const result = await syncAllSubscriptions(ctx, options, {
 				now: ctx.body?.now ? new Date(ctx.body.now) : undefined,
+				referenceId: ctx.body?.referenceId,
 				onEvents: (events) => dispatchEvents(ctx, options, events),
 			});
 			return ctx.json(result);

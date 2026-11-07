@@ -269,13 +269,20 @@ export async function hasActiveSubscription(
  * Re-checks subscriptions against Mollie and the clock. Run it from your own
  * cron, e.g. hourly. Stable subscriptions are only fetched from Mollie around
  * their next payment date.
+ *
+ * With `referenceId`, only that user's or organization's subscriptions are
+ * synced, and each is checked at Mollie right away: for a "refresh" button
+ * in your support tools, or after changing something by hand.
  */
 export function syncMollieSubscriptions(
 	auth: AuthWithMollie,
-	options: { now?: Date } = {},
+	options: { now?: Date; referenceId?: string } = {},
 ): Promise<SyncResult> {
 	return auth.api.syncMollieSubscriptions({
-		body: options.now ? { now: options.now.toISOString() } : {},
+		body: {
+			...(options.now ? { now: options.now.toISOString() } : {}),
+			...(options.referenceId !== undefined ? { referenceId: options.referenceId } : {}),
+		},
 	});
 }
 

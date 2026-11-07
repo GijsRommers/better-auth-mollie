@@ -285,8 +285,14 @@ export async function syncSubscription(
 	options: MollieOptions,
 	initial: Subscription,
 	now: Date,
+	how: { force?: boolean } = {},
 ): Promise<{ events: BillingEvent[]; checkedRemote: boolean; errors: string[] }> {
 	const gateway = gatewayFor(options);
+	// `force`: look at Mollie now, whatever the schedule (a manual refresh).
+	const checkRemote = (subscription: Subscription) =>
+		how.force
+			? BILLING_STATUSES.includes(subscription.status)
+			: needsRemoteCheck(subscription, now);
 	const events: BillingEvent[] = [];
 	const errors: string[] = [];
 	let checkedRemote = false;
@@ -356,7 +362,7 @@ export async function syncSubscription(
 	// Customer charges found here; handed to reconciling below so it does not
 	// look them up again while holding the subscription.
 	let charges: Settlement | undefined;
-	if (seen.mollieCustomerId && needsRemoteCheck(seen, now)) {
+	if (seen.mollieCustomerId && checkRemote(seen)) {
 		checkedRemote = true;
 		const remoteId = seen.mollieSubscriptionId;
 		// Processing only: Mollie is brought in line below, under the lock.
@@ -396,7 +402,7 @@ export async function syncSubscription(
 				return;
 			}
 			const customerId = current.mollieCustomerId;
-			if (!customerId || !needsRemoteCheck(current, now)) return;
+			if (!customerId || !checkRemote(current)) return;
 			checkedRemote = true;
 			const remoteId = current.mollieSubscriptionId;
 			if (remoteId) {
@@ -589,6 +595,7 @@ async function recoverAbandonedCharges(
 	now: Date,
 	onEvents: (events: BillingEvent[]) => void,
 	errors: SyncResult["errors"],
+	referenceId?: string,
 ): Promise<void> {
 	const gateway = gatewayFor(options);
 	const abandoned = await pendingOperations(
@@ -597,6 +604,7 @@ async function recoverAbandonedCharges(
 		new Date(now.getTime() - LOCK_LEASE_MS),
 	);
 	for (const op of abandoned) {
+		if (referenceId !== undefined && op.referenceId !== referenceId) continue;
 		// `proration:<subscriptionId>:<plan>:<period end>:<attempt>#<n>`
 		const subscriptionId = op.idempotencyKey.split(":")[1] ?? "";
 		const subscription = await reload(ctx, subscriptionId);
@@ -681,15 +689,27 @@ export type SyncResult = {
 export async function syncAllSubscriptions(
 	ctx: Ctx,
 	options: MollieOptions,
-	input: { now?: Date | undefined; onEvents: (events: BillingEvent[]) => void },
+	input: {
+		now?: Date | undefined;
+		onEvents: (events: BillingEvent[]) => void;
+		/**
+		 * Only this user's or organization's subscriptions, each checked at
+		 * Mollie right away (e.g. a support "refresh" button). Skips the
+		 * profile-wide chargeback listing, which the full sync does.
+		 */
+		referenceId?: string | undefined;
+	},
 ): Promise<SyncResult> {
 	const now = input.now ?? new Date();
+	const { referenceId } = input;
+	const scope: Where[] =
+		referenceId === undefined ? [] : [{ field: "referenceId", value: referenceId }];
 	const ids = new Set<string>();
 	// Subscriptions that may still change, and any (also ended ones) with a
 	// change that still has to reach Mollie.
 	const selections: Where[][] = [
-		[{ field: "status", operator: "in", value: [...SYNCABLE_STATUSES] }],
-		[{ field: "mollieSyncNeeded", value: true }],
+		[...scope, { field: "status", operator: "in", value: [...SYNCABLE_STATUSES] }],
+		[...scope, { field: "mollieSyncNeeded", value: true }],
 	];
 	for (const where of selections) {
 		for (let offset = 0; ; offset += PAGE_SIZE) {
@@ -706,14 +726,18 @@ export async function syncAllSubscriptions(
 		}
 	}
 	const result: SyncResult = { checked: 0, remoteChecked: 0, invoicesCreated: 0, errors: [] };
-	await recoverAbandonedCharges(ctx, options, now, input.onEvents, result.errors);
-	await settleRecentChargebacks(ctx, options, now, input.onEvents, result.errors);
+	await recoverAbandonedCharges(ctx, options, now, input.onEvents, result.errors, referenceId);
+	if (referenceId === undefined) {
+		await settleRecentChargebacks(ctx, options, now, input.onEvents, result.errors);
+	}
 	for (const id of ids) {
 		const subscription = await reload(ctx, id);
 		if (!subscription) continue;
 		result.checked++;
 		try {
-			const synced = await syncSubscription(ctx, options, subscription, now);
+			const synced = await syncSubscription(ctx, options, subscription, now, {
+				force: referenceId !== undefined,
+			});
 			if (synced.checkedRemote) result.remoteChecked++;
 			input.onEvents(synced.events);
 			for (const message of synced.errors) result.errors.push({ subscriptionId: id, message });
@@ -726,7 +750,37 @@ export async function syncAllSubscriptions(
 	// Paid payments of subscriptions that are not synced (e.g. canceled) whose
 	// outcome is not settled: typically a refund of a duplicate still due.
 	const synced = new Set(ids);
-	for (const record of await outstandingPayments(ctx)) {
+	// All of the reference's subscriptions, also ended ones.
+	let scoped: string[] | undefined;
+	if (referenceId !== undefined) {
+		scoped = [];
+		for (let cursor: string | null = null; ; ) {
+			const page: Pick<Subscription, "id">[] = await ctx.context.adapter.findMany<
+				Pick<Subscription, "id">
+			>({
+				model: "subscription",
+				where: [
+					...scope,
+					...(cursor ? [{ field: "id", operator: "gt" as const, value: cursor }] : []),
+				],
+				select: ["id"],
+				sortBy: { field: "id", direction: "asc" },
+				limit: PAGE_SIZE,
+			});
+			scoped.push(...page.map((row) => row.id));
+			const last = page.at(-1);
+			if (!last || page.length < PAGE_SIZE) break;
+			cursor = last.id;
+		}
+	}
+	const outstanding = scoped
+		? (
+				await Promise.all(
+					scoped.filter((id) => !synced.has(id)).map((id) => outstandingPayments(ctx, id)),
+				)
+			).flat()
+		: await outstandingPayments(ctx);
+	for (const record of outstanding) {
 		if (synced.has(record.subscriptionId)) continue;
 		try {
 			const payment = await gatewayFor(options).getPayment(record.molliePaymentId);
@@ -741,6 +795,7 @@ export async function syncAllSubscriptions(
 			);
 		}
 	}
+	if (scoped?.length === 0) return result;
 	result.invoicesCreated = await catchUpSalesInvoices(
 		ctx,
 		options,
@@ -750,6 +805,7 @@ export async function syncAllSubscriptions(
 			return paymentHookData(options, payment, record, subscription);
 		},
 		(record, message) => result.errors.push({ subscriptionId: record.subscriptionId, message }),
+		scoped,
 	);
 	return result;
 }
