@@ -39,10 +39,25 @@ async function chooseFinalState(page: Page, state: FinalState) {
 	]);
 }
 
-/** Completes a checkout URL (first payment) with the given final state. */
-export async function completeCheckout(url: string, state: FinalState): Promise<void> {
+/**
+ * Completes a checkout URL (first payment) with the given final state. When
+ * the payment has no fixed method, `method` is picked on Mollie's method
+ * selection page.
+ */
+export async function completeCheckout(
+	url: string,
+	state: FinalState,
+	method = "creditcard",
+): Promise<void> {
 	const page = await open(url);
 	try {
+		if (page.url().includes("/select-method/")) {
+			await Promise.all([
+				page.waitForURL((u) => !u.pathname.includes("/select-method/"), { timeout: 60_000 }),
+				page.locator(`button[name="method"][value="${method}"]`).click(),
+			]);
+			await page.waitForLoadState("networkidle");
+		}
 		if (page.url().includes("/credit-card/")) {
 			const card = page.frameLocator('iframe[src*="components/card"]');
 			await card.locator("#cardNumber").fill(TEST_CARD.number);
