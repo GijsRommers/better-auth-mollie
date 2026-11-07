@@ -4,6 +4,7 @@ import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
 	applyDueTransitions,
+	billsIdentity,
 	findSubscription,
 	guardedUpdate,
 	lockWaitMs,
@@ -15,6 +16,7 @@ import {
 	sameAppliedPayment,
 	settlePreviousPayment,
 	settleRecentCharges,
+	withReferenceLock,
 } from "../billing";
 import { getOrCreateCustomer } from "../customer";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
@@ -23,7 +25,7 @@ import { dispatchEvents } from "../events";
 import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
 import { type SubscriptionLock, withSubscriptionLock } from "../lock";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
-import { type Fence, OperationInProgressError, runOperation, withLock } from "../operations";
+import { type Fence, runOperation } from "../operations";
 import {
 	ACCESS_STATUSES,
 	BILLING_STATUSES,
@@ -63,13 +65,18 @@ function subscriptionOptions(options: MollieOptions): SubscriptionOptions {
 }
 
 /** Subscriptions of a reference, newest first. */
-async function referenceSubscriptions(ctx: GenericEndpointContext, referenceId: string) {
-	return ctx.context.adapter.findMany<Subscription>({
+/** Subscriptions of a billing identity (reference and customer type), newest first. */
+async function referenceSubscriptions(
+	ctx: GenericEndpointContext,
+	identity: { referenceId: string; customerType: CustomerType },
+) {
+	const rows = await ctx.context.adapter.findMany<Subscription>({
 		model: "subscription",
-		where: [{ field: "referenceId", value: referenceId }],
+		where: [{ field: "referenceId", value: identity.referenceId }],
 		sortBy: { field: "createdAt", direction: "desc" },
 		limit: 100,
 	});
+	return rows.filter((row) => billsIdentity(row, identity));
 }
 
 /**
@@ -80,34 +87,25 @@ async function referenceSubscriptions(ctx: GenericEndpointContext, referenceId: 
 async function pendingRow(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
-	data: Omit<Subscription, "id" | "status" | "createdAt" | "updatedAt">,
+	data: Omit<Subscription, "id" | "status" | "createdAt" | "updatedAt"> & {
+		customerType: CustomerType;
+	},
 ): Promise<Subscription> {
-	const create = async () => {
-		const existing = (await referenceSubscriptions(ctx, data.referenceId)).find(
+	const identity = { referenceId: data.referenceId, customerType: data.customerType };
+	return withReferenceLock(ctx, options, identity, async (fence) => {
+		const existing = (await referenceSubscriptions(ctx, identity)).find(
 			(s) => s.status === "incomplete",
 		);
 		if (existing) return existing;
+		// Only while the lease holds: another request may create the row otherwise.
+		await fence();
 		return ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
 			model: "subscription",
 			data: { ...data, status: "incomplete", createdAt: new Date(), updatedAt: new Date() },
 		});
-	};
-	const key = `lock:checkout:${data.referenceId}`;
-	for (let attempt = 0; ; attempt++) {
-		let entered = false;
-		try {
-			return await withLock(ctx.context, { key, referenceId: data.referenceId }, () => {
-				entered = true;
-				return create();
-			});
-		} catch (error) {
-			const busy = !entered && error instanceof OperationInProgressError;
-			if (!busy || attempt * 100 >= lockWaitMs(options)) {
-				throw toAPIError(error, MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
-			}
-			await new Promise((resolve) => setTimeout(resolve, 100));
-		}
-	}
+	}).catch((error: unknown) => {
+		throw toAPIError(error, MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+	});
 }
 
 /** `subscriptionId` may be the local id or the Mollie subscription id. */
@@ -143,7 +141,7 @@ async function findOpenCheckout(
 	ctx: GenericEndpointContext,
 	options: MollieOptions,
 	subscription: Subscription,
-	match: { plan: string; amount: string; purpose: PaymentPurpose },
+	match: { plan: string; amount: string; purpose: PaymentPurpose; customerId: string },
 	lock: SubscriptionLock,
 ): Promise<{ url?: string; activated?: boolean }> {
 	const gateway = gatewayFor(options);
@@ -163,6 +161,7 @@ async function findOpenCheckout(
 			payment.status === "open" &&
 			url &&
 			payment.amount.value === match.amount &&
+			payment.customerId === match.customerId &&
 			metadataOf(payment).plan === match.plan &&
 			paymentPurpose(payment) === match.purpose
 		) {
@@ -555,7 +554,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			if (!plan) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
 			const planName = plan.name.toLowerCase();
 
-			const subscriptions = await referenceSubscriptions(ctx, referenceId);
+			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const target = findTarget(subscriptions, body.subscriptionId);
 			if (body.subscriptionId && !target) {
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
@@ -628,7 +627,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 							ctx,
 							options,
 							row,
-							{ plan: planName, amount, purpose: input.purpose },
+							{ plan: planName, amount, purpose: input.purpose, customerId: input.customerId },
 							lock,
 						);
 						if (open.activated) return respond(body.successUrl);
@@ -876,8 +875,8 @@ export const cancelSubscription = (options: MollieOptions) =>
 			],
 		},
 		async (ctx) => {
-			const { referenceId } = ctx.context as unknown as ReferenceContext;
-			const subscriptions = await referenceSubscriptions(ctx, referenceId);
+			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const subscription = ctx.body.subscriptionId
 				? findTarget(subscriptions, ctx.body.subscriptionId)
 				: (subscriptions.find((s) => BILLING_STATUSES.includes(s.status) && !s.cancelAtPeriodEnd) ??
@@ -943,8 +942,8 @@ export const restoreSubscription = (options: MollieOptions) =>
 			use: [mollieSessionMiddleware, referenceMiddleware(options, "restore-subscription")],
 		},
 		async (ctx) => {
-			const { referenceId } = ctx.context as unknown as ReferenceContext;
-			const subscriptions = await referenceSubscriptions(ctx, referenceId);
+			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
+			const subscriptions = await referenceSubscriptions(ctx, { referenceId, customerType });
 			const subscription = ctx.body.subscriptionId
 				? findTarget(subscriptions, ctx.body.subscriptionId)
 				: (subscriptions.find((s) => ACCESS_STATUSES.includes(s.status) && s.cancelAtPeriodEnd) ??
@@ -989,12 +988,12 @@ export const listActiveSubscriptions = (options: MollieOptions) =>
 			use: [mollieSessionMiddleware, referenceMiddleware(options, "list-subscription")],
 		},
 		async (ctx) => {
-			const { referenceId } = ctx.context as unknown as ReferenceContext;
+			const { referenceId, customerType } = ctx.context as unknown as ReferenceContext;
 			const now = new Date();
 			const subscriptions: Subscription[] = [];
 			// Apply clock-based changes (period ended, scheduled plan change) so
 			// the answer is right even before the app's cron has run.
-			for (const subscription of await referenceSubscriptions(ctx, referenceId)) {
+			for (const subscription of await referenceSubscriptions(ctx, { referenceId, customerType })) {
 				// Without waiting: a busy subscription is listed as it is.
 				const timed = await applyDueTransitions(ctx, options, subscription, now, 0);
 				dispatchEvents(ctx, options, timed.events);

@@ -1702,3 +1702,135 @@ describe("re-check of 313584a: stale Mollie status, concurrent replacements, lis
 		expect(await env.api.listActiveSubscriptions({ headers })).toEqual([]);
 	});
 });
+
+describe("re-check of 569026d: one subscription per identity, under concurrency", () => {
+	async function secondPendingRow(
+		env: TestEnv,
+		base: { referenceId: string; mollieCustomerId: string },
+		plan: string,
+		extra = {},
+	) {
+		return env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				referenceId: base.referenceId,
+				plan,
+				status: "incomplete",
+				mollieCustomerId: base.mollieCustomerId,
+				customerType: "user",
+				cancelAtPeriodEnd: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				...extra,
+			},
+		});
+	}
+
+	async function firstPayment(
+		env: TestEnv,
+		row: { id: string; mollieCustomerId: string },
+		plan: string,
+		key: string,
+	) {
+		const payment = await env.fake.client.payments.create({
+			idempotencyKey: key,
+			paymentRequest: {
+				amount: { currency: "EUR", value: "9.95" },
+				description: plan,
+				sequenceType: "first",
+				customerId: row.mollieCustomerId,
+				redirectUrl: "https://app.example.com/done",
+				metadata: { subscriptionId: row.id, plan, purpose: "checkout" },
+			},
+		} as never);
+		return payment;
+	}
+
+	it("activates only one of two pending rows paid at the same time", async () => {
+		const env = await setup();
+		const { payment } = await env.checkout("starter");
+		const [rowA] = await env.subscriptions();
+		const rowB = await secondPendingRow(env, rowA as never, "starter");
+		const other = await firstPayment(env, rowB, "starter", "row-b");
+		env.fake.completePayment(payment.id, "paid");
+		env.fake.completePayment(other.id, "paid");
+
+		// A's activation is in progress when B's payment arrives.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "subscription" && args.set?.status === "active") {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const deliveryA = env.webhook(`id=${payment.id}`);
+		await paused;
+		const deliveryB = env.webhook(`id=${other.id}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		release();
+		await deliveryA;
+		await deliveryB;
+		adapter.incrementOne = original;
+		await env.webhook(`id=${other.id}`);
+
+		const active = (await env.subscriptions()).filter((s) => s.status === "active");
+		expect(active).toHaveLength(1);
+		expect(refundedIds(env)).toHaveLength(1);
+		expect(env.fake.activeSubscriptionsFor(rowA!.mollieCustomerId!)).toHaveLength(1);
+	});
+
+	it("keeps pending rows and open checkouts of another billing identity apart", async () => {
+		const env = await setup();
+		// An organization's pending checkout under the same reference string.
+		const orgCustomer = await env.fake.client.customers.create({
+			idempotencyKey: "org-customer",
+			entityCustomer: { name: "Org" },
+		} as never);
+		const orgRow = await secondPendingRow(
+			env,
+			{ referenceId: env.user.id, mollieCustomerId: orgCustomer.id },
+			"starter",
+			{ customerType: "organization" },
+		);
+		const orgPayment = await firstPayment(
+			env,
+			{ id: orgRow.id, mollieCustomerId: orgCustomer.id },
+			"starter",
+			"org-payment",
+		);
+
+		const { payment } = await env.checkout("starter");
+		expect(payment.id).not.toBe(orgPayment.id);
+		expect(payment.customerId).not.toBe(orgCustomer.id);
+		expect(await env.subscription(orgRow.id)).toMatchObject({
+			customerType: "organization",
+			mollieCustomerId: orgCustomer.id,
+		});
+	});
+
+	it("does not refund a checkout because of a subscription whose cancellation date has passed", async () => {
+		const env = await setup();
+		const first = await subscribe(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		// A pending checkout from before; the first subscription's period has ended.
+		const pending = await secondPendingRow(env, first as never, "starter");
+		const payment = await firstPayment(env, pending as never, "starter", "after-cancel");
+		travel(new Date(first.periodEnd!).getTime() + 3_600_000);
+		env.fake.completePayment(payment.id, "paid");
+		await env.webhook(`id=${payment.id}`);
+
+		expect(refundedIds(env)).toEqual([]);
+		expect((await env.subscription(pending.id)).status).toBe("active");
+	});
+});

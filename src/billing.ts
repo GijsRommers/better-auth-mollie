@@ -11,6 +11,7 @@ import {
 	REPLAY_WINDOW_MS,
 	resolveOperation,
 	runOperation,
+	withLock,
 } from "./operations";
 import { catchUpSalesInvoices } from "./sales-invoices";
 import {
@@ -448,6 +449,58 @@ export async function processPayment(
 	);
 }
 
+/**
+ * Whether a subscription row bills this identity: the reference id and the
+ * customer type (a user and an organization can have the same id string,
+ * e.g. with custom references). Rows from before `customerType` existed match
+ * any type.
+ */
+export function billsIdentity(
+	subscription: Subscription,
+	identity: { referenceId: string; customerType: CustomerType },
+): boolean {
+	return (
+		subscription.referenceId === identity.referenceId &&
+		(!subscription.customerType || subscription.customerType === identity.customerType)
+	);
+}
+
+/**
+ * Runs `fn` under a lock per billing identity, which serializes creating a
+ * pending subscription row and activating one: so an identity never gets two.
+ * Acquisition is retried for up to `lockWaitMs`. Lock order: a subscription
+ * lock (if any) is taken before this one, never after.
+ */
+export async function withReferenceLock<T>(
+	ctx: Ctx,
+	options: MollieOptions,
+	identity: { referenceId: string; customerType: CustomerType },
+	fn: (fence: () => Promise<void>) => Promise<T>,
+): Promise<T> {
+	const key = `lock:reference:${identity.customerType}:${identity.referenceId}`;
+	for (let attempt = 0; ; attempt++) {
+		let entered = false;
+		try {
+			return await withLock(ctx.context, { key, referenceId: identity.referenceId }, (fence) => {
+				entered = true;
+				return fn(fence);
+			});
+		} catch (error) {
+			const busy = !entered && error instanceof OperationInProgressError;
+			if (!busy || attempt * 100 >= lockWaitMs(options)) throw error;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	}
+}
+
+/** Whether another subscription still covers this identity, by its state and the clock. */
+function stillCovers(other: Subscription, now: Date): boolean {
+	if (!BILLING_STATUSES.includes(other.status)) return false;
+	const periodEnd = other.periodEnd ? new Date(other.periodEnd) : null;
+	// A cancellation whose date has passed ends it, even before the sync records that.
+	return !(other.cancelAtPeriodEnd && periodEnd && periodEnd <= now);
+}
+
 /** How long a payment (or a request) waits for a subscription that is busy. */
 export function lockWaitMs(options: MollieOptions): number {
 	return options.lockWaitMs ?? 5000;
@@ -716,18 +769,53 @@ async function activateSubscription(
 	const isTrial = metadata.trial === true && trialDays > 0;
 	const trialEnd = isTrial ? ceilToUTCDate(addDays(anchor, trialDays)) : null;
 	const periodEnd = trialEnd ?? ceilToUTCDate(addInterval(anchor, plan.interval));
-	// A reference has one billing subscription: a checkout paid while another
-	// one is already running (e.g. two tabs, or a second pending row) pays for
+	// An identity has one billing subscription: a checkout paid while another
+	// one still covers it (e.g. two tabs, or a second pending row) pays for
 	// nothing, so it is refunded rather than starting a second subscription.
-	const others = await ctx.context.adapter.findMany<Subscription>({
-		model: "subscription",
-		where: [
-			{ field: "referenceId", value: initial.referenceId },
-			{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
-		],
-		limit: 10,
+	// Checked and applied under the identity's lock, so two pending rows
+	// activated at the same time cannot both pass.
+	const identity = {
+		referenceId: initial.referenceId,
+		customerType: await customerTypeOf(ctx, initial),
+	};
+	return withReferenceLock(ctx, options, identity, async (fence) => {
+		const others = await ctx.context.adapter.findMany<Subscription>({
+			model: "subscription",
+			where: [
+				{ field: "referenceId", value: initial.referenceId },
+				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+			],
+			limit: 20,
+		});
+		const now = new Date();
+		if (
+			others.some(
+				(other) =>
+					other.id !== initial.id && billsIdentity(other, identity) && stillCovers(other, now),
+			)
+		) {
+			return { kind: "covered" };
+		}
+		await fence();
+		return activateRow(ctx, initial, payment, plan, customerId, anchor, lock, {
+			isTrial,
+			trialEnd,
+			periodEnd,
+		});
 	});
-	if (others.some((other) => other.id !== initial.id)) return { kind: "covered" };
+}
+
+async function activateRow(
+	ctx: Ctx,
+	initial: Subscription,
+	payment: MolliePayment,
+	plan: MolliePlan,
+	customerId: string,
+	anchor: Date,
+	lock: SubscriptionLock,
+	period: { isTrial: boolean; trialEnd: Date | null; periodEnd: Date },
+): Promise<Application> {
+	const { isTrial, trialEnd, periodEnd } = period;
 	let subscription: Subscription | null = initial;
 	for (let attempt = 0; attempt < APPLY_ATTEMPTS && subscription; attempt++) {
 		if (subscription.status !== "incomplete") return { kind: "covered" };
@@ -1983,7 +2071,8 @@ export async function syncSubscription(
 				// that failed at Mollie, or a replacement whose creation was lost).
 				if (current.mollieSyncNeeded) {
 					checkedRemote = true;
-					await reconcileRemote(ctx, options, current, now, lock);
+					const known = certain ? charges : undefined;
+					await reconcileRemote(ctx, options, current, now, lock, { charges: known });
 				}
 				return;
 			}
