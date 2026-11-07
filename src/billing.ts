@@ -746,8 +746,17 @@ async function activateSubscription(
 	}
 	const anchor = toDate(payment.paidAt) ?? new Date(payment.createdAt);
 	const trialDays = typeof metadata.trialDays === "number" ? metadata.trialDays : 0;
-	const isTrial = metadata.trial === true && trialDays > 0;
-	const trialEnd = isTrial ? ceilToUTCDate(addDays(anchor, trialDays)) : null;
+	// A trial with a fixed end (`getTrialEnd`); paid after it, Mollie still
+	// charges from the next UTC date on.
+	const fixedEnd = typeof metadata.trialEnd === "string" ? toDate(metadata.trialEnd) : null;
+	const isTrial = metadata.trial === true && (trialDays > 0 || !!fixedEnd);
+	const trialEnd = !isTrial
+		? null
+		: ceilToUTCDate(
+				fixedEnd
+					? new Date(Math.max(fixedEnd.getTime(), anchor.getTime()))
+					: addDays(anchor, trialDays),
+			);
 	const periodEnd = trialEnd ?? ceilToUTCDate(addInterval(anchor, plan.interval));
 	// An identity has one billing subscription: a checkout paid while another
 	// one still covers it (e.g. two tabs, or a second pending row) pays for

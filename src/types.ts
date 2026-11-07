@@ -396,6 +396,27 @@ export type SubscriptionOptions = {
 	 */
 	gracePeriodDays?: number | undefined;
 	/**
+	 * When a new subscription's trial ends, decided by the app, e.g. a trial
+	 * that started when the organization was created:
+	 * - a future `Date`: a trial until then (rounded up to a UTC date, when
+	 *   Mollie charges first): the checkout only verifies the payment method;
+	 * - `null` (or a past date): no trial, the checkout pays the first period;
+	 * - `undefined`: the plan's `freeTrial`, once per reference.
+	 * A returned date or `null` overrides `freeTrial` and the one-trial rule.
+	 */
+	getTrialEnd?:
+		| ((
+				data: {
+					referenceId: string;
+					customerType: CustomerType;
+					plan: MolliePlan;
+					user: User & Record<string, any>;
+					session: Session & Record<string, any>;
+				},
+				ctx: GenericEndpointContext,
+		  ) => Date | null | undefined | Promise<Date | null | undefined>)
+		| undefined;
+	/**
 	 * Customize the first (mandate) payment, e.g. restrict `method`.
 	 */
 	getFirstPaymentParams?:

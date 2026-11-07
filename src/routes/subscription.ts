@@ -52,6 +52,7 @@ import type {
 } from "../types";
 import {
 	ceilToUTCDate,
+	DAY_MS,
 	errorMessage,
 	getPlanByName,
 	getPlans,
@@ -649,7 +650,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			 */
 			const checkout = async (
 				candidate: Subscription,
-				input: { purpose: PaymentPurpose; trialDays: number; customerId: string },
+				input: {
+					purpose: PaymentPurpose;
+					trialDays: number;
+					trialEnd?: Date | undefined;
+					customerId: string;
+				},
 			): ReturnType<typeof respond> => {
 				const tax = await resolveTax(ctx, options, { referenceId, customerType, plan });
 				const amount =
@@ -731,6 +737,7 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						tax,
 						purpose: input.purpose,
 						trialDays: input.trialDays,
+						trialEnd: input.trialEnd,
 						customerId: input.customerId,
 						referenceId,
 						body,
@@ -811,15 +818,52 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					cancelAtPeriodEnd: false,
 				});
 			}
-			const hadTrial = subscriptions.some((s) => s.trialEnd || s.status === "trialing");
-			const trialDays = plan.freeTrial && !hadTrial ? plan.freeTrial.days : 0;
+			const trial = await trialFor(ctx, config, {
+				referenceId,
+				customerType,
+				plan,
+				user,
+				session,
+				hadTrial: subscriptions.some((s) => s.trialEnd || s.status === "trialing"),
+			});
 			return checkout(row, {
-				purpose: trialDays ? "verification" : "checkout",
-				trialDays,
+				purpose: trial ? "verification" : "checkout",
+				trialDays: trial?.days ?? 0,
+				trialEnd: trial?.end,
 				customerId,
 			});
 		},
 	);
+
+/**
+ * The trial of a new subscription: `getTrialEnd` when it decides, or the
+ * plan's `freeTrial` once per reference. `null` for none.
+ */
+async function trialFor(
+	ctx: GenericEndpointContext,
+	config: SubscriptionOptions,
+	input: {
+		referenceId: string;
+		customerType: CustomerType;
+		plan: MolliePlan;
+		user: MollieCtxSession["user"];
+		session: MollieCtxSession["session"];
+		hadTrial: boolean;
+	},
+): Promise<{ days: number; end?: Date } | null> {
+	const { hadTrial, ...data } = input;
+	const decided = await config.getTrialEnd?.(data, ctx);
+	if (decided === undefined) {
+		return input.plan.freeTrial && !hadTrial ? { days: input.plan.freeTrial.days } : null;
+	}
+	if (decided === null) return null;
+	if (!(decided instanceof Date) || Number.isNaN(decided.getTime())) {
+		throw new Error("subscription.getTrialEnd must return a Date, null or undefined");
+	}
+	const remaining = decided.getTime() - Date.now();
+	if (remaining <= 0) return null;
+	return { days: Math.ceil(remaining / DAY_MS), end: decided };
+}
 
 /**
  * Creates the first payment (`sequenceType: "first"`, so it creates a
@@ -837,6 +881,8 @@ async function createCheckout(
 		tax: TaxBreakdown | null;
 		purpose: PaymentPurpose;
 		trialDays: number;
+		/** A trial that ends at this date (`getTrialEnd`), instead of after `trialDays`. */
+		trialEnd?: Date | undefined;
 		customerId: string;
 		referenceId: string;
 		body: z.infer<typeof upgradeSubscriptionBodySchema>;
@@ -844,7 +890,8 @@ async function createCheckout(
 		session: MollieCtxSession["session"];
 	},
 ): Promise<string> {
-	const { row, plan, amount, tax, purpose, trialDays, customerId, referenceId, body } = input;
+	const { row, plan, amount, tax, purpose, trialDays, trialEnd, customerId, referenceId, body } =
+		input;
 	const config = subscriptionOptions(options);
 	const planName = plan.name.toLowerCase();
 	const extra: FirstPaymentParams = {
@@ -907,6 +954,7 @@ async function createCheckout(
 								purpose,
 								trial: purpose === "verification",
 								trialDays,
+								...(trialEnd ? { trialEnd: trialEnd.toISOString() } : {}),
 								operationKey: idempotencyKey,
 								...taxMetadata(tax),
 							},

@@ -140,6 +140,14 @@ A new subscription starts with a **first payment** at Mollie's hosted checkout. 
 
 - **No trial:** the customer pays the first period. Once paid, the subscription is `active`, and a Mollie subscription is scheduled from the end of that period.
 - **Trial:** the first payment only verifies the payment method (`verificationAmount`, default `"0.02"`). The subscription is `trialing`, and Mollie starts charging when the trial ends. A reference gets one trial. With `refundVerificationPayment: true` the verification payment is refunded once it created the mandate (what is left of it, if part was refunded by hand; the sync retries a refund that failed), and it is not invoiced, even with `invoiceVerificationPayments`.
+- **Trial with a fixed end:** when your app decides the trial, for example one that started when the organization was created, return its end from `subscription.getTrialEnd`. A future `Date` gives a trial until then (rounded up to the next UTC date, when Mollie charges first), also on a plan without `freeTrial`; `null` or a past date gives none; `undefined` keeps the plan's `freeTrial`:
+
+  ```ts
+  subscription: {
+  	getTrialEnd: async ({ referenceId, customerType, plan }) =>
+  		customerType === "organization" ? await trialEndOf(referenceId) : undefined,
+  },
+  ```
 
 A reference has one billing subscription at a time. Concurrent checkouts share one pending subscription, and a checkout that is paid while another subscription is already running is refunded instead of starting a second one.
 
@@ -457,6 +465,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `subscription.tax`                                                      |                             | See [VAT](#vat)                                                                                                                 |
 | `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                                                                                 |
 | `subscription.refundVerificationPayment`                                | `false`                     | Refund a trial's verification payment once the mandate exists                                                                   |
+| `subscription.getTrialEnd`                                              |                             | When a new subscription's trial ends, decided by your app (see [Subscribe](#subscribe))                                         |
 | `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                                                                             |
 | `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                       |
 | `schema`                                                                |                             | Rename tables and fields                                                                                                        |

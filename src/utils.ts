@@ -250,6 +250,7 @@ export const RESERVED_METADATA_KEYS: ReadonlySet<string> = new Set([
 	"purpose",
 	"trial",
 	"trialDays",
+	"trialEnd",
 	"operationKey",
 	"molliePaymentId",
 	"customerType",
