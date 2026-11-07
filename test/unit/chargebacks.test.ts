@@ -218,6 +218,69 @@ describe("chargebacks", () => {
 		expect((await env.subscription(subscription.id)).status).toBe("active");
 	});
 
+	it("still sees a reversal long after the chargeback, checking once a day", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		await renew(env, subscription);
+		const chargeback = env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		travel(Date.now() + 130 * 24 * 3_600_000);
+		env.fake.reverseChargeback(chargeback.id);
+
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(2);
+		expect(onChargeback.mock.calls[1]![0]).toMatchObject({ chargeback: { reversed: true } });
+	});
+
+	it("looks at a recorded chargeback once a day, not on every sync", async () => {
+		const { env } = await withChargebackHook();
+		const subscription = await subscribe(env);
+		const [first] = [...env.fake.payments.values()];
+		await renew(env, subscription);
+		env.fake.chargeBack(first!.id);
+		await env.webhook(`id=${first!.id}`);
+		const listings = () => env.fake.callsTo("chargebacks.list").length;
+
+		travel(Date.now() + 30 * 24 * 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		const checked = listings();
+		travel(Date.now() + 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(listings()).toBe(checked);
+		travel(Date.now() + 24 * 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect(listings()).toBeGreaterThan(checked);
+	});
+
+	it("does not keep reprocessing a payment when Mollie's total counts reversed chargebacks", async () => {
+		const { env, onChargeback } = await withChargebackHook();
+		env.fake.reportReversedChargebacks();
+		const subscription = await subscribe(env);
+		const { payment } = await renew(env, subscription);
+		const one = env.fake.chargeBack(payment.id, "4.00");
+		await env.webhook(`id=${payment.id}`);
+		env.fake.chargeBack(payment.id, "4.00");
+		await env.webhook(`id=${payment.id}`);
+		env.fake.reverseChargeback(one.id);
+		await env.webhook(`id=${payment.id}`);
+		const record = async () =>
+			(await env.payments()).find((r) => r.molliePaymentId === payment.id)!;
+		expect((await record()).amountChargedBack).toBe("4.00");
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(3);
+
+		// The past-due subscription is checked at Mollie on every sync, which
+		// lists this payment with Mollie's (gross) total of 8.00.
+		const claimed = (await record()).claimSerial;
+		await syncMollieSubscriptions(env.auth as never);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await record()).claimSerial).toBe(claimed);
+		await settle();
+		expect(onChargeback).toHaveBeenCalledTimes(3);
+	});
+
 	it("keeps the grace period of a failed renewal when the period before is charged back", async () => {
 		const { env, onChargeback } = await withChargebackHook();
 		const subscription = await subscribe(env);

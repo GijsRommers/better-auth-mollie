@@ -178,6 +178,8 @@ export interface MolliePaymentRecord {
 	amountChargedBack?: string | null | undefined;
 	/** Internal: its `onChargeback` hook is still to be dispatched. */
 	chargebackDue?: boolean | null | undefined;
+	/** Internal: when the sync last checked a recorded chargeback for a reversal. */
+	chargebackCheckedAt?: Date | null | undefined;
 	/**
 	 * Its Mollie sales invoice: `created`, or `skipped` (not to be invoiced:
 	 * a verification payment, a duplicate, or `getRecipient` returned `null`).

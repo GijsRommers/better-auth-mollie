@@ -159,12 +159,14 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 		{ id: string; paymentId: string; amount: Amount; metadata: unknown; createdAt: string }
 	>();
 	const chargebacks = new Map<string, FakeChargeback>();
-	/** What Mollie reports on the payment: charged back and not reversed. */
+	/** Whether `amountChargedBack` still counts reversed chargebacks (Mollie does not say). */
+	let grossChargebacks = false;
+	/** What Mollie reports on the payment: charged back (and not reversed, by default). */
 	const updateChargedBack = (paymentId: string) => {
 		const payment = payments.get(paymentId);
 		if (!payment) return;
 		const cents = [...chargebacks.values()]
-			.filter((c) => c.paymentId === paymentId && !c.reversedAt)
+			.filter((c) => c.paymentId === paymentId && (grossChargebacks || !c.reversedAt))
 			.reduce((sum, c) => sum + Math.round(Number(c.amount.value) * 100), 0);
 		if (cents > 0) {
 			payment.amountChargedBack = {
@@ -626,6 +628,9 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			chargebacks.set(chargeback.id, chargeback);
 			updateChargedBack(paymentId);
 			return clone(chargeback);
+		},
+		reportReversedChargebacks() {
+			grossChargebacks = true;
 		},
 		reverseChargeback(chargebackId: string) {
 			const chargeback = chargebacks.get(chargebackId);

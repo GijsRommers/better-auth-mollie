@@ -571,7 +571,12 @@ async function settleChargeback(
 						{ field: "claimSerial", value: claim },
 					],
 					increment: {},
-					set: { amountChargedBack: cents > 0 ? fromCents(cents) : null, chargebackDue: true },
+					set: {
+						amountChargedBack: cents > 0 ? fromCents(cents) : null,
+						chargebackDue: true,
+						// Looked at again daily for a reversal; not after one.
+						chargebackCheckedAt: cents > 0 ? new Date() : null,
+					},
 				})) ?? record;
 		}
 	}
@@ -1057,15 +1062,23 @@ export type SettleOptions = {
 };
 
 /** Whether a payment from Mollie still has to be processed locally. */
-async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
+async function isUnsettled(
+	ctx: Ctx,
+	options: MollieOptions,
+	payment: MolliePayment,
+): Promise<boolean> {
 	const record = await findPaymentRecord(ctx, payment.id);
 	if (record?.status !== payment.status) return true;
 	if (record.hooksDue || record.chargebackDue) return true;
 	if (payment.status === "paid") {
 		if (record.outcome === "pending" || record.outcome === "duplicate") return true;
-		// A chargeback (or its reversal) not processed yet.
+		// A chargeback (or its reversal) not processed yet. Mollie's total may
+		// still count reversed chargebacks, so a difference is confirmed with
+		// the amount that is actually charged back.
 		const reported = payment.amountChargedBack ? toCents(payment.amountChargedBack.value) : 0;
-		return reported !== (record.amountChargedBack ? toCents(record.amountChargedBack) : 0);
+		const recorded = record.amountChargedBack ? toCents(record.amountChargedBack) : 0;
+		if (reported === recorded) return false;
+		return (await gatewayFor(options).chargedBackCents(payment.id)) !== recorded;
 	}
 	return isFinalPaymentStatus(payment.status) && isUnhandled(record);
 }
@@ -1080,7 +1093,7 @@ async function processUnsettled(
 	const reconcile = how.reconcile ?? !lock;
 	const settlement: Settlement = { inProgress: false, processed: false, errors: [] };
 	for (const payment of payments) {
-		if (!(await isUnsettled(ctx, payment))) continue;
+		if (!(await isUnsettled(ctx, options, payment))) continue;
 		// Each payment on its own: one that cannot be processed now does not
 		// stop the others. It stays outstanding (and counts as in progress).
 		try {

@@ -448,14 +448,22 @@ function unprocessed(payment: MolliePayment): MolliePayment {
 const CHARGEBACK_LIST_DAYS = 120;
 /** A chargeback created or reversed this recently may not have been processed. */
 const CHARGEBACK_ACTIVITY_DAYS = 14;
+/**
+ * How long after a payment a recorded chargeback of it is still looked at
+ * daily for a reversal (SEPA allows claims for unauthorized debits for 13
+ * months).
+ */
+const CHARGEBACK_RECHECK_DAYS = 540;
 
 /**
  * Chargebacks and reversals whose webhook was never processed (Mollie calls
- * the payment's webhook for each; this is the fallback). The profile's
- * chargebacks are listed, newest first (one request per page); for each of
- * our payments with one created or reversed recently, the complete amount
- * charged back is compared with what was recorded, and the payment is
- * processed again when they differ.
+ * the payment's webhook for each; this is the fallback). Looked at:
+ * - our payments with a chargeback created or reversed recently, from the
+ *   profile's chargebacks, listed newest first (one request per page);
+ * - once a day, payments with a recorded chargeback, whose reversal can
+ *   come after the listing no longer reaches it.
+ * For each, the complete amount charged back is compared with what was
+ * recorded, and the payment is processed again when they differ.
  */
 async function settleRecentChargebacks(
 	ctx: Ctx,
@@ -465,28 +473,51 @@ async function settleRecentChargebacks(
 	errors: SyncResult["errors"],
 ): Promise<void> {
 	const gateway = gatewayFor(options);
-	const active = new Set<string>();
+	const candidates = new Set<string>();
 	try {
 		const since = addDays(now, -CHARGEBACK_ACTIVITY_DAYS).getTime();
 		const listed = await gateway.listRecentChargebacks(addDays(now, -CHARGEBACK_LIST_DAYS));
 		for (const chargeback of listed) {
 			const reversedAt = chargeback.reversedAt ? Date.parse(chargeback.reversedAt) : 0;
 			if (Math.max(Date.parse(chargeback.createdAt), reversedAt) >= since) {
-				active.add(chargeback.paymentId);
+				candidates.add(chargeback.paymentId);
 			}
 		}
 	} catch (error) {
 		errors.push({ subscriptionId: "", message: `chargebacks: ${errorMessage(error)}` });
 		ctx.context.logger.error(`[mollie] Listing chargebacks failed: ${errorMessage(error)}`);
-		return;
 	}
-	for (const paymentId of active) {
+	// Collected first: checking moves a row out of this selection.
+	for (let offset = 0; ; offset += PAGE_SIZE) {
+		const page = await ctx.context.adapter.findMany<MolliePaymentRecord>({
+			model: "molliePayment",
+			where: [
+				{ field: "chargebackCheckedAt", operator: "lt", value: addDays(now, -1) },
+				{ field: "paidAt", operator: "gte", value: addDays(now, -CHARGEBACK_RECHECK_DAYS) },
+			],
+			sortBy: { field: "molliePaymentId", direction: "asc" },
+			limit: PAGE_SIZE,
+			offset,
+		});
+		for (const record of page) candidates.add(record.molliePaymentId);
+		if (page.length < PAGE_SIZE) break;
+	}
+	for (const paymentId of candidates) {
 		const record = await findPaymentRecord(ctx, paymentId);
 		// Not one of ours.
 		if (!record) continue;
 		try {
 			const recorded = record.amountChargedBack ? toCents(record.amountChargedBack) : 0;
-			if ((await gateway.chargedBackCents(paymentId)) === recorded) continue;
+			if ((await gateway.chargedBackCents(paymentId)) === recorded) {
+				if (recorded > 0) {
+					await ctx.context.adapter.update({
+						model: "molliePayment",
+						where: [{ field: "molliePaymentId", value: paymentId }],
+						update: { chargebackCheckedAt: now },
+					});
+				}
+				continue;
+			}
 			const payment = await gateway.getPayment(paymentId);
 			onEvents((await processPayment(ctx, options, payment)).events);
 		} catch (error) {
