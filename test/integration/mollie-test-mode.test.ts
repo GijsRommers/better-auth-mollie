@@ -72,7 +72,11 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 						subscription: {
 							enabled: true,
 							customerType: "user",
-							plans: [{ name: "starter", amount: "9.95", interval: "1 month" }],
+							plans: [
+								{ name: "starter", amount: "9.95", interval: "1 month" },
+								{ name: "trial", amount: "9.95", interval: "1 month", freeTrial: { days: 14 } },
+							],
+							refundVerificationPayment: true,
 							getFirstPaymentParams: () => ({ method: method as never }),
 						},
 					}),
@@ -180,10 +184,10 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 	}
 
 	/** Starts a checkout for a new user and completes it with `state`. */
-	async function subscribe(state: "paid" | "failed") {
+	async function subscribe(state: "paid" | "failed", plan = "starter") {
 		const { headers, userId } = await env.newUser();
 		const { url } = await env.api.upgradeSubscription({
-			body: { plan: "starter", successUrl: "/dashboard", cancelUrl: "/pricing" },
+			body: { plan, successUrl: "/dashboard", cancelUrl: "/pricing" },
 			headers,
 		});
 		expect(url).toMatch(/^https:\/\/www\.mollie\.com\/checkout\//);
@@ -326,6 +330,27 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		const result = await syncMollieSubscriptions(env.auth as never);
 		expect(result.errors).toEqual([]);
 		expect((await env.subscriptionOf(subscription.referenceId)).status).toBe("past_due");
+	});
+
+	it("refunds the verification payment of a real trial, and keeps the mandate", async () => {
+		const { subscription, firstPaymentId } = await subscribe("paid", "trial");
+		expect(subscription).toMatchObject({ status: "trialing", plan: "trial" });
+		const payment = await env.real.payments.get({ paymentId: firstPaymentId });
+		expect(payment).toMatchObject({ sequenceType: "first", amount: { value: "0.02" } });
+		const refunds = await env.real.refunds.list({ paymentId: firstPaymentId });
+		expect(refunds.result.embedded?.refunds).toEqual([
+			expect.objectContaining({ amount: { currency: "EUR", value: "0.02" } }),
+		]);
+		const mandate = await env.real.mandates.get({
+			customerId: subscription.mollieCustomerId as string,
+			mandateId: subscription.mollieMandateId as string,
+		});
+		expect(mandate.status).toMatch(/valid|pending/);
+		const remote = await env.real.subscriptions.get({
+			customerId: subscription.mollieCustomerId as string,
+			subscriptionId: subscription.mollieSubscriptionId as string,
+		});
+		expect(remote.startDate).toBe(toMollieDate(new Date(subscription.trialEnd as Date)));
 	});
 
 	it("cancels the Mollie subscription at period end, and the cron leaves it consistent", async () => {

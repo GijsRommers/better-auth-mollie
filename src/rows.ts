@@ -139,7 +139,7 @@ export async function setOutcome(
 	from: readonly PaymentOutcome[],
 	to: PaymentOutcome,
 	claim?: number,
-	extra: Partial<Pick<MolliePaymentRecord, "paidThrough">> = {},
+	extra: Partial<Pick<MolliePaymentRecord, "paidThrough" | "refundDue">> = {},
 ): Promise<MolliePaymentRecord | null> {
 	return ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 		model: "molliePayment",

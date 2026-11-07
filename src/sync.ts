@@ -208,6 +208,7 @@ async function outstandingPayments(
 		// Hooks still due (the delivery that recorded the change stopped).
 		[...scope, { field: "hooksDue", value: true }],
 		[...scope, { field: "chargebackDue", value: true }],
+		[...scope, { field: "refundDue", value: true }],
 		// Not paid, consequence not applied yet (e.g. a failed renewal recorded
 		// right before the process stopped). Across all subscriptions only
 		// charges: failed checkouts matter for incomplete rows, synced anyway.
@@ -649,7 +650,9 @@ const REFUND_IN_FLIGHT_MS = 15 * 60 * 1000;
  */
 async function refundStillDue(ctx: Ctx, molliePaymentId: string): Promise<string | null> {
 	const record = await findPaymentRecord(ctx, molliePaymentId);
-	if (record?.status !== "paid" || record.outcome !== "duplicate") return null;
+	if (record?.status !== "paid") return null;
+	const verification = !!record.refundDue;
+	if (record.outcome !== "duplicate" && !verification) return null;
 	const prefix = `refund:${molliePaymentId}#`;
 	const attempts = await ctx.context.adapter.findMany<{
 		idempotencyKey: string;
@@ -670,7 +673,7 @@ async function refundStillDue(ctx: Ctx, molliePaymentId: string): Promise<string
 			Date.now() - new Date(op.createdAt).getTime() < REFUND_IN_FLIGHT_MS,
 	);
 	if (inFlight) return null;
-	const message = `${molliePaymentId}: refund of a duplicate payment is still due`;
+	const message = `${molliePaymentId}: refund of a ${verification ? "verification" : "duplicate"} payment is still due`;
 	ctx.context.logger.error(`[mollie] ${message}`);
 	return message;
 }

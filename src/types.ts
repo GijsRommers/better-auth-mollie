@@ -188,6 +188,8 @@ export interface MolliePaymentRecord {
 	amountChargedBack?: string | null | undefined;
 	/** Internal: its `onChargeback` hook is still to be dispatched. */
 	chargebackDue?: boolean | null | undefined;
+	/** Internal: a refund of this verification payment is still to be made. */
+	refundDue?: boolean | null | undefined;
 	/** Internal: when the sync last checked a recorded chargeback for a reversal. */
 	chargebackCheckedAt?: Date | null | undefined;
 	/**
@@ -441,6 +443,13 @@ export type SubscriptionOptions = {
 	 * @default true
 	 */
 	refundDuplicatePayments?: boolean | undefined;
+	/**
+	 * Refund a trial's verification payment once it created the mandate, so
+	 * the customer pays nothing until the trial ends. Journaled like other
+	 * refunds, and retried by the sync if it fails.
+	 * @default false
+	 */
+	refundVerificationPayment?: boolean | undefined;
 	/**
 	 * Runs once when a payment turns out to pay for something already paid,
 	 * after it was refunded (unless `refundDuplicatePayments` is false).

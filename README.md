@@ -139,7 +139,7 @@ const { data, error } = await authClient.subscription.upgrade({
 A new subscription starts with a **first payment** at Mollie's hosted checkout. That payment creates the **mandate** that later charges use.
 
 - **No trial:** the customer pays the first period. Once paid, the subscription is `active`, and a Mollie subscription is scheduled from the end of that period.
-- **Trial:** the first payment only verifies the payment method (`verificationAmount`, default `"0.02"`). The subscription is `trialing`, and Mollie starts charging when the trial ends. A reference gets one trial.
+- **Trial:** the first payment only verifies the payment method (`verificationAmount`, default `"0.02"`). The subscription is `trialing`, and Mollie starts charging when the trial ends. A reference gets one trial. With `refundVerificationPayment: true` the verification payment is refunded once it created the mandate (the sync retries a refund that failed).
 
 A reference has one billing subscription at a time. Concurrent checkouts share one pending subscription, and a checkout that is paid while another subscription is already running is refunded instead of starting a second one.
 
@@ -427,7 +427,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue` and `chargebackCheckedAt`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue`, `chargebackCheckedAt` and `refundDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 
@@ -456,6 +456,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `subscription.getFirstPaymentParams`                                    |                             | For example `{ method: "creditcard" }`                                                                                          |
 | `subscription.tax`                                                      |                             | See [VAT](#vat)                                                                                                                 |
 | `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                                                                                 |
+| `subscription.refundVerificationPayment`                                | `false`                     | Refund a trial's verification payment once the mandate exists                                                                   |
 | `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                                                                             |
 | `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                       |
 | `schema`                                                                |                             | Rename tables and fields                                                                                                        |

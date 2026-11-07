@@ -292,6 +292,7 @@ async function applyPayment(
 			record =
 				(await setOutcome(ctx, payment.id, ["pending"], "applied", claim, {
 					paidThrough: paidThroughOf(purpose, subscription),
+					...verificationRefund(options, purpose, payment),
 				})) ?? record;
 		} else {
 			subscription = (await reload(ctx, subscription.id)) ?? subscription;
@@ -300,6 +301,7 @@ async function applyPayment(
 				record =
 					(await setOutcome(ctx, payment.id, ["pending"], "applied", claim, {
 						paidThrough: paidThroughOf(purpose, subscription),
+						...verificationRefund(options, purpose, payment),
 					})) ?? record;
 			} else if (result.kind === "covered") {
 				const classified = await classifyDuplicate(ctx, options, payment, subscription, claim);
@@ -374,6 +376,7 @@ async function applyPayment(
 		}
 	}
 	if (status === "paid") {
+		await refundVerification(ctx, options, payment, subscription, claim);
 		const chargeback = await settleChargeback(ctx, options, payment, subscription, lock, claim);
 		subscription = chargeback.subscription;
 		events.push(...chargeback.events);
@@ -527,6 +530,67 @@ export async function refundUnappliedPayment(
 	const marked = await setOutcome(ctx, payment.id, ["pending"], "duplicate");
 	if (!marked || payment.status !== "paid") return [];
 	return refundDuplicate(ctx, options, payment, subscription);
+}
+
+/**
+ * With `refundVerificationPayment`, a verification payment that applied is
+ * refunded: marked as due in the same update that records it as applied.
+ */
+function verificationRefund(
+	options: MollieOptions,
+	purpose: PaymentPurpose,
+	payment: MolliePayment,
+): { refundDue?: true } {
+	const enabled = options.subscription?.enabled && options.subscription.refundVerificationPayment;
+	if (!enabled || purpose !== "verification") return {};
+	return toCents(payment.amount.value) > 0 ? { refundDue: true } : {};
+}
+
+/**
+ * Makes a verification refund that is due (journaled, so at most once),
+ * then clears it, while this claimant still holds the payment. A failure
+ * leaves it due for the next delivery or sync. Nothing is refunded when
+ * nothing is left (charged back, or refunded by hand).
+ */
+async function refundVerification(
+	ctx: Ctx,
+	options: MollieOptions,
+	payment: MolliePayment,
+	subscription: Subscription,
+	claim: number,
+): Promise<void> {
+	const record = await findPaymentRecord(ctx, payment.id);
+	if (!record?.refundDue) return;
+	try {
+		const remaining = payment.amountRemaining;
+		if (!remaining || toCents(remaining.value) > 0) {
+			await refundPayment(
+				ctx,
+				options,
+				subscription,
+				payment,
+				"Refund of the payment method verification",
+			);
+		}
+		await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+			model: "molliePayment",
+			where: [
+				{ field: "molliePaymentId", value: payment.id },
+				{ field: "refundDue", value: true },
+				{ field: "claimSerial", value: claim },
+			],
+			increment: {},
+			set: { refundDue: false },
+		});
+	} catch (error) {
+		if (error instanceof OperationInProgressError) {
+			ctx.context.logger.info(`[mollie] Refund of ${payment.id} is in progress`);
+		} else {
+			ctx.context.logger.error(
+				`[mollie] Refund of verification payment ${payment.id} failed; the next sync retries it: ${errorMessage(error)}`,
+			);
+		}
+	}
 }
 
 /** The end of the period a payment paid for, recorded when it applies. */
@@ -1068,7 +1132,7 @@ async function isUnsettled(
 ): Promise<boolean> {
 	const record = await findPaymentRecord(ctx, payment.id);
 	if (record?.status !== payment.status) return true;
-	if (record.hooksDue || record.chargebackDue) return true;
+	if (record.hooksDue || record.chargebackDue || record.refundDue) return true;
 	if (payment.status === "paid") {
 		if (record.outcome === "pending" || record.outcome === "duplicate") return true;
 		// A chargeback (or its reversal) not processed yet. Mollie's total may

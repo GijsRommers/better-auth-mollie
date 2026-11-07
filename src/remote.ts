@@ -151,6 +151,7 @@ export async function refundPayment(
 	options: MollieOptions,
 	subscription: Subscription,
 	payment: MolliePayment,
+	description = "Refund of a subscription payment that could not be applied",
 ): Promise<void> {
 	const gateway = gatewayFor(options);
 	await runOperation(ctx.context, {
@@ -163,7 +164,7 @@ export async function refundPayment(
 				payment.id,
 				{
 					amount: { currency: payment.amount.currency, value: payment.amount.value },
-					description: "Refund of a subscription payment that could not be applied",
+					description,
 					metadata: { subscriptionId: subscription.id, operationKey: idempotencyKey },
 				},
 				idempotencyKey,
