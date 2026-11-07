@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
 import { applyTimeTransitions } from "../../src/billing";
 import { addDays, toMollieDate } from "../../src/utils";
+import { mollieError } from "../helpers/fake-mollie";
 import { PLANS, settle, setup, type TestEnv } from "../helpers/setup";
 
 afterEach(() => {
@@ -2422,6 +2423,9 @@ describe("sync reports what still needs attention", () => {
 		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
 		await env.webhook(`id=${second.payment.id}`);
 
+		// A refund whose outcome is unknown (network error) counts as in progress
+		// for a while; after that, the sync reports it until it goes through.
+		travel(Date.now() + 16 * 60_000);
 		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
 		const failing = await syncMollieSubscriptions(env.auth as never);
 		expect(failing.errors.map((e) => e.message)).toContain(
@@ -2429,6 +2433,26 @@ describe("sync reports what still needs attention", () => {
 		);
 		const fixed = await syncMollieSubscriptions(env.auth as never);
 		expect(fixed.errors).toEqual([]);
+		expect(refundedIds(env)).toEqual([second.payment.id]);
+	});
+});
+
+describe("sync does not report refunds that are still in progress", () => {
+	it("does not report a refund Mollie is still processing", async () => {
+		const env = await setup();
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		// Mollie is still working on the refund (409 for the same key).
+		env.fake.failNext("refunds.create", mollieError(409, "Request in progress"));
+		await env.webhook(`id=${second.payment.id}`);
+
+		env.fake.failNext("refunds.create", mollieError(409, "Request in progress"));
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors).toEqual([]);
+		await syncMollieSubscriptions(env.auth as never);
 		expect(refundedIds(env)).toEqual([second.payment.id]);
 	});
 });

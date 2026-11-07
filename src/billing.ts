@@ -752,9 +752,13 @@ async function applyPayment(
 			} catch (error) {
 				// The refund stays due (outcome `duplicate`) and the sync retries it;
 				// the events of this delivery are not lost meanwhile.
-				ctx.context.logger.error(
-					`[mollie] Refund of ${payment.id} failed; the next sync retries it: ${errorMessage(error)}`,
-				);
+				if (error instanceof OperationInProgressError) {
+					ctx.context.logger.info(`[mollie] Refund of ${payment.id} is in progress`);
+				} else {
+					ctx.context.logger.error(
+						`[mollie] Refund of ${payment.id} failed; the next sync retries it: ${errorMessage(error)}`,
+					);
+				}
 			}
 		}
 	}
@@ -2175,13 +2179,19 @@ export async function syncSubscription(
 			certain = false;
 			if (!(error instanceof OperationInProgressError)) {
 				errors.push(`${label}: ${errorMessage(error)}`);
+				ctx.context.logger.error(
+					`[mollie] Sync of ${initial.id} (${label}) failed: ${errorMessage(error)}`,
+				);
 			}
 		}
 	};
 	const settle = (label: string, fn: () => Promise<Settlement>) =>
 		step(label, async () => {
 			const settlement = await fn();
-			errors.push(...settlement.errors);
+			for (const message of settlement.errors) {
+				errors.push(message);
+				ctx.context.logger.error(`[mollie] Sync of ${initial.id} (${label}): ${message}`);
+			}
 			if (settlement.inProgress || settlement.errors.length > 0) certain = false;
 		});
 
@@ -2368,12 +2378,36 @@ async function recoverAbandonedCharges(
 	}
 }
 
-/** A sync error for a duplicate whose refund did not go through (yet), if so. */
+/** A refund attempt younger than this is taken to be still in progress. */
+const REFUND_IN_FLIGHT_MS = 15 * 60 * 1000;
+
+/**
+ * A sync error for a duplicate whose refund did not go through, if so: not
+ * for one whose refund is still in progress (a recent pending attempt).
+ */
 async function refundStillDue(ctx: Ctx, molliePaymentId: string): Promise<string | null> {
 	const record = await findPaymentRecord(ctx, molliePaymentId);
-	return record?.status === "paid" && record.outcome === "duplicate"
-		? `${molliePaymentId}: refund of a duplicate payment is still due`
-		: null;
+	if (record?.status !== "paid" || record.outcome !== "duplicate") return null;
+	const prefix = `refund:${molliePaymentId}#`;
+	const attempts = await ctx.context.adapter.findMany<{
+		idempotencyKey: string;
+		status: string;
+		createdAt: Date;
+	}>({
+		model: "mollieOperation",
+		where: [
+			{ field: "kind", value: "create_refund" },
+			{ field: "idempotencyKey", operator: "starts_with", value: prefix },
+			{ field: "status", value: "pending" },
+		],
+		limit: 10,
+	});
+	const inFlight = attempts.some(
+		(op) =>
+			op.idempotencyKey.startsWith(prefix) &&
+			Date.now() - new Date(op.createdAt).getTime() < REFUND_IN_FLIGHT_MS,
+	);
+	return inFlight ? null : `${molliePaymentId}: refund of a duplicate payment is still due`;
 }
 
 export type SyncResult = {
