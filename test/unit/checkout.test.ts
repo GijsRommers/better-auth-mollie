@@ -125,6 +125,39 @@ describe("subscription.upgrade (new subscription)", () => {
 		expect(forRow).toEqual([]);
 	});
 
+	it("creates no checkout for a row that changed while its journal entry was written", async () => {
+		const env = await setup();
+		env.fake.failNext("payments.create", Object.assign(new Error("invalid"), { statusCode: 422 }));
+		await expect(env.checkout("starter")).rejects.toBeTruthy();
+		const [row] = await env.subscriptions();
+		travel(Date.now() + 25 * 3_600_000);
+
+		const adapter = env.context.adapter as any;
+		const original = adapter.create.bind(adapter);
+		const stall = gate();
+		let armed = true;
+		adapter.create = async (args: any) => {
+			if (armed && args.model === "mollieOperation" && args.data?.kind === "create_first_payment") {
+				armed = false;
+				await stall.hold();
+			}
+			return original(args);
+		};
+		const retry = env.checkout("starter").catch((error: unknown) => error);
+		await stall.paused;
+		travel(Date.now() + 5 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+		expect((await env.subscription(row!.id)).status).toBe("incomplete_expired");
+		stall.release();
+		expect(await retry).toBeInstanceOf(Error);
+		adapter.create = original;
+
+		const forRow = [...env.fake.payments.values()].filter(
+			(payment) => (payment.metadata as { subscriptionId?: string }).subscriptionId === row!.id,
+		);
+		expect(forRow).toEqual([]);
+	});
+
 	it("rejects unknown plans", async () => {
 		const env = await setup();
 		await expect(env.checkout("platinum")).rejects.toMatchObject({

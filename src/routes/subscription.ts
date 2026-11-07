@@ -862,8 +862,9 @@ async function createCheckout(
 	const locale = body.locale ?? extra.locale;
 	const gateway = gatewayFor(options);
 
-	// `getFirstPaymentParams` may have taken long enough for the lock to be
-	// lost (and the row to change, e.g. expire): then no checkout for it.
+	// `getFirstPaymentParams` or the journal may have taken long enough for
+	// the lock to be lost (and the row to change, e.g. expire): then no
+	// checkout for it. Checked before the journal and right before Mollie.
 	await input.fence();
 	let payment: Awaited<ReturnType<typeof gateway.getPayment>>;
 	try {
@@ -874,8 +875,9 @@ async function createCheckout(
 			// journal must be for this very price.
 			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}:${planCurrency(plan)}`,
 			reuseSucceeded: false,
-			execute: (idempotencyKey) =>
-				gateway.createPayment(
+			execute: async (idempotencyKey) => {
+				await input.fence();
+				return gateway.createPayment(
 					{
 						...extra,
 						description,
@@ -902,7 +904,8 @@ async function createCheckout(
 						),
 					},
 					idempotencyKey,
-				),
+				);
+			},
 			getId: (created) => created.id,
 			recover: (idempotencyKey, attempt) =>
 				gateway.findCustomerPaymentByOperationKey(customerId, idempotencyKey, attempt.createdAt),
