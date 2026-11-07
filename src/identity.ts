@@ -1,7 +1,7 @@
 import type { GenericEndpointContext as Ctx, Where } from "better-auth";
 import { dispatchEvents } from "./events";
 import { type Fence, OperationInProgressError, withLock } from "./operations";
-import { lockWaitMs, PAGE_SIZE, periodEndOf, reload } from "./rows";
+import { lockWaitMs, PAGE_SIZE, periodEndOf, reload, sameDate } from "./rows";
 import { BILLING_STATUSES } from "./status";
 import type { CustomerType, MollieOptions, Subscription } from "./types";
 import { getPlanByName } from "./utils";
@@ -155,7 +155,7 @@ async function endDueCancellation(
 				{ field: "id", value: subscription.id },
 				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
 				{ field: "cancelAtPeriodEnd", value: true },
-				{ field: "periodEnd", value: periodEnd },
+				...sameDate("periodEnd", periodEnd),
 				unlocked,
 			],
 			increment: { mollieSyncRevision: 1, lockSerial: 1 },

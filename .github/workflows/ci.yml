@@ -32,6 +32,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm test:memory
       - run: pnpm build
       - run: pnpm lint:package
       - name: Check the example app

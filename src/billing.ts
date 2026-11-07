@@ -24,6 +24,7 @@ import {
 	periodEndOf,
 	reload,
 	sameAppliedPayment,
+	sameDate,
 	setOutcome,
 	settlePreviousPayment,
 	UNHANDLED,
@@ -652,10 +653,7 @@ async function chargeBackPeriod(
 		subscription.id,
 		BILLING_STATUSES,
 		{ status, periodEnd: periodStart },
-		[
-			{ field: "periodEnd", value: periodEnd },
-			{ field: "periodStart", value: periodStart },
-		],
+		[...sameDate("periodEnd", periodEnd), ...sameDate("periodStart", periodStart)],
 		{ lock },
 	);
 }
@@ -805,7 +803,7 @@ async function recoverSubscription(
 			},
 			[
 				{ field: "cancelAtPeriodEnd", value: false },
-				...(periodStart ? [{ field: "periodStart", value: periodStart }] : []),
+				...(periodStart ? [...sameDate("periodStart", periodStart)] : []),
 				...sameAppliedPayment(subscription),
 			],
 			{ mollieSync: true, lock },
@@ -949,7 +947,7 @@ async function applyRenewal(
 			{ field: "cancelAtPeriodEnd", value: false },
 			...sameAppliedPayment(subscription),
 		];
-		if (currentEnd) guards.push({ field: "periodEnd", value: currentEnd });
+		if (currentEnd) guards.push(...sameDate("periodEnd", currentEnd));
 		if (switchPlan) guards.push({ field: "pendingPlan", value: pendingPlan });
 		await settlePreviousPayment(ctx, subscription, payment);
 		const updated = await guardedUpdate(
@@ -1015,7 +1013,7 @@ async function applyFailedRenewal(
 		subscription.id,
 		["trialing", "active"],
 		{ status: "past_due" },
-		subscription.periodEnd ? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }] : [],
+		subscription.periodEnd ? [...sameDate("periodEnd", new Date(subscription.periodEnd))] : [],
 		{ lock },
 	);
 }
@@ -1386,7 +1384,7 @@ export async function reconcileRemote(
 		[
 			...(previous ? [{ field: "mollieSubscriptionId", value: previous }] : []),
 			{ field: "mollieSyncRevision", value: subscription.mollieSyncRevision ?? 0 },
-			...(periodEnd ? [{ field: "periodEnd", value: periodEnd }] : []),
+			...(periodEnd ? [...sameDate("periodEnd", periodEnd)] : []),
 		],
 		{ lock },
 	);

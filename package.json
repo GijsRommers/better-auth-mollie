@@ -71,6 +71,7 @@
 		"lint:fix": "biome check --write .",
 		"lint:package": "publint --strict && attw --pack . --profile esm-only",
 		"test": "vitest run --project unit",
+		"test:memory": "TEST_DATABASE=memory vitest run --project unit",
 		"test:watch": "vitest --project unit",
 		"test:integration": "vitest run --project integration",
 		"prepublishOnly": "pnpm run build"

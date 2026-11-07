@@ -455,7 +455,7 @@ This is an alpha. The billing logic is tested against a stateful fake of the Mol
 - **Eventually consistent, not instant.** A duplicate charge is refunded once it is detected (usually by its webhook, at the latest by the sync), so a customer can briefly be charged twice before the refund goes out.
 - **Hooks are best effort.** `onPaymentPaid` and the other hooks run at most once; a crash at the wrong moment loses one. Derive access from the subscription (`hasActiveSubscription`, `hasSubscriptionAccess`), and make your own invoicing idempotent or use `salesInvoices`, which the sync retries for 30 days. Older missed invoices need manual recovery.
 - **Keep the plugin's data.** Do not delete `subscription`, `molliePayment` or `mollieOperation` rows, and run the migration before deploying a new version (new columns are not backfilled).
-- **Your database must support atomic guarded updates.** The plugin relies on Better Auth's `incrementOne` with conditions and on unique fields. It is tested with SQLite (Kysely); other adapters should behave the same but are not tested here.
+- **Your database must support atomic guarded updates.** The plugin relies on Better Auth's `incrementOne` with conditions and on unique fields. Every test runs on SQLite (Kysely) and on Better Auth's memory adapter; other adapters should behave the same but are not tested here. (The memory adapter keeps everything in one process, so use it for development only.)
 - **Clocks.** Lock leases and deadlines use the application servers' clocks; keep them in sync (NTP).
 
 ## Compared with @better-auth/stripe
@@ -484,6 +484,7 @@ This is an alpha. The billing logic is tested against a stateful fake of the Mol
 
 ```bash
 pnpm test                 # unit tests, against a stateful fake of the Mollie SDK
+pnpm test:memory          # the same, on Better Auth's memory adapter
 pnpm test:integration     # against Mollie test mode
 ```
 

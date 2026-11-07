@@ -28,6 +28,7 @@ import {
 	PAGE_SIZE,
 	periodEndOf,
 	reload,
+	sameDate,
 	UNHANDLED,
 } from "./rows";
 import { catchUpSalesInvoices } from "./sales-invoices";
@@ -68,10 +69,7 @@ export async function applyTimeTransitions(
 			BILLING_STATUSES,
 			{ status: "canceled", pendingPlan: null },
 			// Only the cancellation that was read: not one restored meanwhile.
-			[
-				{ field: "cancelAtPeriodEnd", value: true },
-				{ field: "periodEnd", value: periodEnd },
-			],
+			[{ field: "cancelAtPeriodEnd", value: true }, ...sameDate("periodEnd", periodEnd)],
 			{ mollieSync: true, lock },
 		);
 		if (!canceled) return { subscription, events: [] };
@@ -93,7 +91,7 @@ export async function applyTimeTransitions(
 			{ plan: subscription.pendingPlan, pendingPlan: null },
 			[
 				{ field: "pendingPlan", value: subscription.pendingPlan },
-				{ field: "periodEnd", value: periodEnd },
+				...sameDate("periodEnd", periodEnd),
 			],
 			{ lock },
 		);
@@ -109,7 +107,7 @@ export async function applyTimeTransitions(
 			subscription.id,
 			["past_due"],
 			{ status: "unpaid" },
-			[{ field: "periodEnd", value: periodEnd }],
+			[...sameDate("periodEnd", periodEnd)],
 			{ lock },
 		);
 		return { subscription: unpaid ?? subscription, events: [] };
@@ -412,7 +410,7 @@ export async function syncSubscription(
 						["trialing", "active"],
 						{ status: "past_due" },
 						[
-							{ field: "periodEnd", value: new Date(latest.periodEnd) },
+							...sameDate("periodEnd", new Date(latest.periodEnd)),
 							{ field: "cancelAtPeriodEnd", value: false },
 						],
 						{ lock },

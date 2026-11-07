@@ -364,6 +364,27 @@ describe("chargebacks", () => {
 		expect(record.hooksDue).toBe(false);
 	});
 
+	it("does not look at reversed chargebacks again, also with the memory adapter", async () => {
+		const onChargeback = vi.fn(async (..._args: any[]) => {});
+		const env = await setup({ subscription: { onChargeback }, memory: true });
+		const subscription = await subscribe(env);
+		const { payment } = await renew(env, subscription);
+		const chargeback = env.fake.chargeBack(payment.id);
+		await env.webhook(`id=${payment.id}`);
+		env.fake.reverseChargeback(chargeback.id);
+		await env.webhook(`id=${payment.id}`);
+
+		// Past the window in which the listing rechecks recent reversals.
+		travel(Date.now() + 15 * 24 * 3_600_000);
+		const before = env.fake.callsTo("chargebacks.list").length;
+		await syncMollieSubscriptions(env.auth as never);
+		const forPayment = env.fake
+			.callsTo("chargebacks.list")
+			.slice(before)
+			.filter((call) => (call.args[0] as { paymentId: string }).paymentId === payment.id);
+		expect(forPayment).toEqual([]);
+	});
+
 	it("does not skip recorded chargebacks when one leaves the selection while paging", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env);

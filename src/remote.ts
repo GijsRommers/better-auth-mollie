@@ -9,6 +9,7 @@ import {
 	lockWaitMs,
 	periodEndOf,
 	reload,
+	sameDate,
 	subscriptionDescription,
 } from "./rows";
 import { mapMollieSubscriptionStatus } from "./status";
@@ -223,7 +224,7 @@ export async function reconcileMollieSubscription(
 				...sameRemote,
 				{ field: "cancelAtPeriodEnd", value: false },
 				...(subscription.periodEnd
-					? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }]
+					? [...sameDate("periodEnd", new Date(subscription.periodEnd))]
 					: []),
 			],
 			{ lock },

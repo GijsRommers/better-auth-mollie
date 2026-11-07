@@ -1,4 +1,5 @@
 import type { AuthContext } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
 import { organization } from "better-auth/plugins/organization";
 import { getTestInstance } from "better-auth/test";
 import { vi } from "vitest";
@@ -37,7 +38,16 @@ type SetupOptions = {
 	fake?: FakeMollie;
 	/** Extra Better Auth options. */
 	auth?: Record<string, unknown>;
+	/** Run on Better Auth's memory adapter instead of SQLite. */
+	memory?: boolean;
 };
+
+/** Tables for the memory adapter, which does not create them itself. */
+function memoryDatabase() {
+	const models = ["user", "session", "account", "verification", "organization", "member"];
+	const plugin = ["invitation", "subscription", "molliePayment", "mollieOperation"];
+	return memoryAdapter(Object.fromEntries([...models, ...plugin].map((model) => [model, []])));
+}
 
 export async function setup(input: SetupOptions = {}) {
 	const fake = input.fake ?? createFakeMollie();
@@ -66,6 +76,10 @@ export async function setup(input: SetupOptions = {}) {
 	const instance = await getTestInstance(
 		{
 			baseURL: BASE_URL,
+			// `TEST_DATABASE=memory` runs every test on the memory adapter.
+			...(input.memory || process.env.TEST_DATABASE === "memory"
+				? { database: memoryDatabase() }
+				: {}),
 			...input.auth,
 			plugins: [...(input.organization ? [organization()] : []), mollie(pluginOptions)],
 		},

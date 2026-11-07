@@ -21,6 +21,18 @@ import type {
 /** Rows are read in pages of this size. */
 export const PAGE_SIZE = 100;
 
+/**
+ * `field = date`, written as `>= date AND <= date`: the same in SQL, and
+ * also true in Better Auth's memory adapter, which compares `Date` values
+ * by identity for equality (never equal) but by time for ranges.
+ */
+export function sameDate(field: string, date: Date): Where[] {
+	return [
+		{ field, operator: "gte", value: date },
+		{ field, operator: "lte", value: date },
+	];
+}
+
 /** The row's `periodEnd` as a `Date` (adapters may hand back strings). */
 export function periodEndOf(subscription: Pick<Subscription, "periodEnd">): Date | null {
 	return subscription.periodEnd ? new Date(subscription.periodEnd) : null;
