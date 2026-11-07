@@ -2373,3 +2373,40 @@ describe("re-check of b0681af: payment truth and hooks are tracked apart", () =>
 		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([renewal.id]);
 	});
 });
+
+describe("re-check of 4eb7113: late checkouts of removed plans", () => {
+	it("refunds a late paid checkout of an ended subscription whose plan no longer exists", async () => {
+		const env = await setup();
+		const customer = await env.fake.client.customers.create({
+			idempotencyKey: "removed-plan",
+			entityCustomer: { name: "Removed" },
+		} as never);
+		const ended = await env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				referenceId: env.user.id,
+				plan: "discontinued",
+				status: "incomplete_expired",
+				mollieCustomerId: customer.id,
+				customerType: "user",
+				cancelAtPeriodEnd: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		const payment = await env.fake.client.payments.create({
+			idempotencyKey: "late-discontinued",
+			paymentRequest: {
+				amount: { currency: "EUR", value: "5.00" },
+				description: "discontinued",
+				sequenceType: "first",
+				customerId: customer.id,
+				redirectUrl: "https://app.example.com/done",
+				metadata: { subscriptionId: ended.id, plan: "discontinued", purpose: "checkout" },
+			},
+		} as never);
+		env.fake.completePayment(payment.id, "paid");
+		await env.webhook(`id=${payment.id}`);
+		expect(refundedIds(env)).toEqual([payment.id]);
+	});
+});

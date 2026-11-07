@@ -918,6 +918,9 @@ async function activateSubscription(
 	payment: MolliePayment,
 	lock: SubscriptionLock,
 ): Promise<Application> {
+	// No longer pending (activated by another payment, expired, ended): this
+	// payment pays for nothing, whatever its plan or other rows are doing.
+	if (initial.status !== "incomplete") return { kind: "covered" };
 	const metadata = metadataOf(payment);
 	const plan = await getPlanByName(
 		options,
@@ -940,9 +943,6 @@ async function activateSubscription(
 	// nothing, so it is refunded rather than starting a second subscription.
 	// Checked and applied under the identity's lock, so two pending rows
 	// activated at the same time cannot both pass.
-	// No longer pending (activated by another payment, expired, ended): this
-	// payment pays for nothing, whatever other rows are doing.
-	if (initial.status !== "incomplete") return { kind: "covered" };
 	const identity = { referenceId: initial.referenceId, customerType: initial.customerType ?? null };
 	return withReferenceLock(ctx, options, identity, async (fence): Promise<Application> => {
 		const covered = await coverage(ctx, options, identity, initial.id, new Date());
