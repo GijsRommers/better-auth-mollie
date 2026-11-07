@@ -87,7 +87,7 @@ npx @better-auth/cli generate   # or: npx @better-auth/cli migrate
 
 ### Webhooks and the cron
 
-Mollie calls `${baseURL}/mollie/webhook` (for example `https://example.com/api/auth/mollie/webhook`). The plugin sends this URL with every payment and subscription, so there is nothing to configure in the Mollie dashboard. Then schedule the [sync](#the-sync-cron), for example hourly:
+Mollie calls `${baseURL}/mollie/webhook` (for example `https://example.com/api/auth/mollie/webhook`). The plugin sends this URL with every payment and subscription, so there is nothing to configure in the Mollie dashboard. On `localhost`, see [local development](#webhooks). Then schedule the [sync](#the-sync-cron), for example hourly:
 
 ```ts
 import { syncMollieSubscriptions } from "better-auth-mollie";
@@ -141,11 +141,11 @@ The customer needs a payment method that can create a mandate: cards, PayPal, or
 
 Call `upgrade` with another plan while subscribed:
 
-| Change | When it applies | Charged |
-| --- | --- | --- |
-| Upgrade: higher price, same interval and currency | Right away | The pro-rata difference for the rest of the period, immediately on the mandate. From then on, the new price. |
-| Downgrade, or a different interval or currency | At the end of the period (`pendingPlan`) | The new price from the next period. |
-| Any change during a trial | Right away | Nothing now; the new plan's price when the trial ends. |
+| Change                                            | When it applies                          | Charged                                                                                                      |
+| ------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Upgrade: higher price, same interval and currency | Right away                               | The pro-rata difference for the rest of the period, immediately on the mandate. From then on, the new price. |
+| Downgrade, or a different interval or currency    | At the end of the period (`pendingPlan`) | The new price from the next period.                                                                          |
+| Any change during a trial                         | Right away                               | Nothing now; the new plan's price when the trial ends.                                                       |
 
 Calling `upgrade` with the current plan undoes a scheduled change or a pending cancellation.
 
@@ -179,15 +179,15 @@ if (await hasActiveSubscription(auth, user.id)) {
 
 ### Statuses
 
-| Status | Meaning | Access |
-| --- | --- | --- |
-| `incomplete` | Checkout started, first payment not paid yet | No |
-| `incomplete_expired` | First payment failed, expired or was canceled | No |
-| `trialing` | Free trial; mandate verified | Yes |
-| `active` | Paid up | Yes |
-| `past_due` | A charge failed; within `gracePeriodDays` (default 14) | Yes |
-| `unpaid` | Grace period over | No |
-| `canceled` | Ended | No |
+| Status               | Meaning                                                | Access |
+| -------------------- | ------------------------------------------------------ | ------ |
+| `incomplete`         | Checkout started, first payment not paid yet           | No     |
+| `incomplete_expired` | First payment failed, expired or was canceled          | No     |
+| `trialing`           | Free trial; mandate verified                           | Yes    |
+| `active`             | Paid up                                                | Yes    |
+| `past_due`           | A charge failed; within `gracePeriodDays` (default 14) | Yes    |
+| `unpaid`             | Grace period over                                      | No     |
+| `canceled`           | Ended                                                  | No     |
 
 `past_due` and `unpaid` return to `active` when a charge or a recovery payment succeeds.
 
@@ -228,13 +228,11 @@ Mollie's webhook only carries an id (`id=tr_…`). The plugin ignores everything
 
 The endpoint answers within Mollie's 15-second limit and runs your hooks in the background, through Better Auth's `advanced.backgroundTasks` (for example `waitUntil`) if configured. If something fails (Mollie unreachable, a concurrent operation), it answers with an error so that Mollie retries.
 
-**Local development:** Mollie cannot reach `localhost`. Use a tunnel and point `webhookUrl` at it:
+**Local development:** Mollie rejects webhook URLs it cannot reach, such as `localhost`. When `baseURL` is local, the plugin sends no webhook URL and logs a warning. The success redirect then syncs the first payment, and the cron syncs everything else. To receive webhooks locally, use a tunnel and point `webhookUrl` at it:
 
 ```ts
 mollie({ mollieClient, webhookUrl: "https://abc123.ngrok.app/api/auth/mollie/webhook", ... })
 ```
-
-Without a tunnel, the success redirect still syncs the first payment, and the cron syncs everything else.
 
 ## The sync cron
 
@@ -386,22 +384,22 @@ Each hook runs once per change, after the change is stored. A failing hook is lo
 
 **`subscription`**
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `id` | string | |
-| `referenceId` | string | User or organization id |
-| `plan` | string | Lower-cased plan name |
-| `pendingPlan` | string? | Scheduled plan change, applied at `periodEnd` |
-| `status` | string | See [Statuses](#statuses) |
-| `mollieCustomerId` | string? | `cst_…` |
-| `mollieMandateId` | string? | `mdt_…` |
-| `mollieSubscriptionId` | string? | `sub_…` |
-| `periodStart`, `periodEnd`, `trialEnd` | date? | |
-| `cancelAtPeriodEnd` | boolean | |
-| `customerType` | string? | `user` or `organization` |
-| `appliedPaymentId` | string? | The payment that last activated, recovered or renewed it |
-| `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number | Internal: a change still to reach Mollie |
-| `createdAt`, `updatedAt` | date | |
+| Field                                    | Type            | Notes                                                    |
+| ---------------------------------------- | --------------- | -------------------------------------------------------- |
+| `id`                                     | string          |                                                          |
+| `referenceId`                            | string          | User or organization id                                  |
+| `plan`                                   | string          | Lower-cased plan name                                    |
+| `pendingPlan`                            | string?         | Scheduled plan change, applied at `periodEnd`            |
+| `status`                                 | string          | See [Statuses](#statuses)                                |
+| `mollieCustomerId`                       | string?         | `cst_…`                                                  |
+| `mollieMandateId`                        | string?         | `mdt_…`                                                  |
+| `mollieSubscriptionId`                   | string?         | `sub_…`                                                  |
+| `periodStart`, `periodEnd`, `trialEnd`   | date?           |                                                          |
+| `cancelAtPeriodEnd`                      | boolean         |                                                          |
+| `customerType`                           | string?         | `user` or `organization`                                 |
+| `appliedPaymentId`                       | string?         | The payment that last activated, recovered or renewed it |
+| `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number | Internal: a change still to reach Mollie                 |
+| `createdAt`, `updatedAt`                 | date            |                                                          |
 
 **`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`).
 
@@ -413,51 +411,51 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 
 ## Options
 
-| Option | Default | |
-| --- | --- | --- |
-| `mollieClient` | required | `new Client({ security: { apiKey } })` from `mollie-api-typescript` |
-| `webhookUrl` | `${baseURL}/mollie/webhook` | Override, for example for a tunnel |
-| `requestTimeoutMs` | `10000` | Per Mollie request; the SDK has no timeout of its own |
-| `createCustomerOnSignUp` | `false` | Otherwise customers are created at the first checkout |
-| `getCustomerCreateParams`, `onCustomerCreate` | | Customize the Mollie customer for users |
-| `organization.getCustomerCreateParams`, `organization.onCustomerCreate` | | The same, for organizations |
-| `subscription.enabled` | | |
-| `subscription.plans` | required | Array or (async) function |
-| `subscription.customerType` | `"organization"` | Default billed party |
-| `subscription.authorizeReference` | | Required for organization billing |
-| `subscription.requireEmailVerification` | `false` | |
-| `subscription.verificationAmount` | `"0.02"` | First payment of a trial; `"0.00"` works for cards and PayPal |
-| `subscription.gracePeriodDays` | `14` | `past_due` keeps access this long |
-| `subscription.getFirstPaymentParams` | | For example `{ method: "creditcard" }` |
-| `subscription.tax` | | See [VAT](#vat) |
-| `subscription.refundDuplicatePayments` | `true` | |
-| `subscription.on…` | | See [Hooks](#hooks) |
-| `salesInvoices` | | See [Invoices](#invoices) |
-| `schema` | | Rename tables and fields |
+| Option                                                                  | Default                     |                                                                     |
+| ----------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------- |
+| `mollieClient`                                                          | required                    | `new Client({ security: { apiKey } })` from `mollie-api-typescript` |
+| `webhookUrl`                                                            | `${baseURL}/mollie/webhook` | Override, for example for a tunnel                                  |
+| `requestTimeoutMs`                                                      | `10000`                     | Per Mollie request; the SDK has no timeout of its own               |
+| `createCustomerOnSignUp`                                                | `false`                     | Otherwise customers are created at the first checkout               |
+| `getCustomerCreateParams`, `onCustomerCreate`                           |                             | Customize the Mollie customer for users                             |
+| `organization.getCustomerCreateParams`, `organization.onCustomerCreate` |                             | The same, for organizations                                         |
+| `subscription.enabled`                                                  |                             |                                                                     |
+| `subscription.plans`                                                    | required                    | Array or (async) function                                           |
+| `subscription.customerType`                                             | `"organization"`            | Default billed party                                                |
+| `subscription.authorizeReference`                                       |                             | Required for organization billing                                   |
+| `subscription.requireEmailVerification`                                 | `false`                     |                                                                     |
+| `subscription.verificationAmount`                                       | `"0.02"`                    | First payment of a trial; `"0.00"` works for cards and PayPal       |
+| `subscription.gracePeriodDays`                                          | `14`                        | `past_due` keeps access this long                                   |
+| `subscription.getFirstPaymentParams`                                    |                             | For example `{ method: "creditcard" }`                              |
+| `subscription.tax`                                                      |                             | See [VAT](#vat)                                                     |
+| `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                     |
+| `subscription.on…`                                                      |                             | See [Hooks](#hooks)                                                 |
+| `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                           |
+| `schema`                                                                |                             | Rename tables and fields                                            |
 
 Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND` and `SUBSCRIPTION_PERIOD_ENDED`.
 
 ## Compared with @better-auth/stripe
 
-| | `@better-auth/stripe` | `better-auth-mollie` |
-| --- | --- | --- |
-| Endpoints | `subscription.upgrade`, `cancel`, `restore`, `list`, `billingPortal` | `subscription.upgrade`, `cancel`, `restore`, `list` |
-| Checkout | Stripe Checkout session | Mollie hosted checkout (first payment creates the mandate) |
-| Recurring charges | Stripe Billing | Mollie Subscriptions API; state kept in your database |
-| Trials | Stripe trial | Verification payment (€0.02 by default), then billed from the trial end |
-| Upgrades | Stripe proration settings | Immediate; pro-rata difference charged right away |
-| Downgrades | Stripe proration settings | From the next period (`pendingPlan`) |
-| Cancel | At period end, via Stripe or the portal | At period end; Mollie billing stops right away |
-| Failed payments | Smart Retries, dunning emails | `past_due` + grace period → `unpaid`; recovery checkout via `upgrade` |
-| Customer portal | Stripe Billing Portal | None: build your own with `list`, `upgrade`, `cancel` and `restore` |
-| Seats / quantities | Yes | No |
-| Annual discount | `annualDiscountPriceId` | A separate plan, for example `interval: "12 months"` |
-| Tax | Stripe Tax | `tax.calculate` hook, or the `euVat()` helper |
-| Invoices | Stripe invoices | `onPaymentPaid`, or Mollie sales invoices (with Peppol) |
-| Webhook | Signed events at `/stripe/webhook` | Id-only pings at `/mollie/webhook`; the state is fetched from Mollie |
-| Cron | Not needed | `syncMollieSubscriptions`, hourly recommended |
-| Duplicate payments | Handled by Stripe | Detected and refunded automatically |
-| Payment methods | Cards, SEPA DD, … | Cards, PayPal, SEPA DD (via iDEAL, Bancontact, …) |
+|                    | `@better-auth/stripe`                                                | `better-auth-mollie`                                                    |
+| ------------------ | -------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Endpoints          | `subscription.upgrade`, `cancel`, `restore`, `list`, `billingPortal` | `subscription.upgrade`, `cancel`, `restore`, `list`                     |
+| Checkout           | Stripe Checkout session                                              | Mollie hosted checkout (first payment creates the mandate)              |
+| Recurring charges  | Stripe Billing                                                       | Mollie Subscriptions API; state kept in your database                   |
+| Trials             | Stripe trial                                                         | Verification payment (€0.02 by default), then billed from the trial end |
+| Upgrades           | Stripe proration settings                                            | Immediate; pro-rata difference charged right away                       |
+| Downgrades         | Stripe proration settings                                            | From the next period (`pendingPlan`)                                    |
+| Cancel             | At period end, via Stripe or the portal                              | At period end; Mollie billing stops right away                          |
+| Failed payments    | Smart Retries, dunning emails                                        | `past_due` + grace period → `unpaid`; recovery checkout via `upgrade`   |
+| Customer portal    | Stripe Billing Portal                                                | None: build your own with `list`, `upgrade`, `cancel` and `restore`     |
+| Seats / quantities | Yes                                                                  | No                                                                      |
+| Annual discount    | `annualDiscountPriceId`                                              | A separate plan, for example `interval: "12 months"`                    |
+| Tax                | Stripe Tax                                                           | `tax.calculate` hook, or the `euVat()` helper                           |
+| Invoices           | Stripe invoices                                                      | `onPaymentPaid`, or Mollie sales invoices (with Peppol)                 |
+| Webhook            | Signed events at `/stripe/webhook`                                   | Id-only pings at `/mollie/webhook`; the state is fetched from Mollie    |
+| Cron               | Not needed                                                           | `syncMollieSubscriptions`, hourly recommended                           |
+| Duplicate payments | Handled by Stripe                                                    | Detected and refunded automatically                                     |
+| Payment methods    | Cards, SEPA DD, …                                                    | Cards, PayPal, SEPA DD (via iDEAL, Bancontact, …)                       |
 
 ## Testing
 
