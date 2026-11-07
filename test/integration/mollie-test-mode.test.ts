@@ -133,6 +133,32 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		};
 	}
 
+	/**
+	 * Creates a recurring payment on the subscription's real mandate. A SEPA
+	 * mandate from an iDEAL or Bancontact first payment can take a moment to
+	 * become usable.
+	 */
+	async function chargeMandate(subscription: Subscription, description: string) {
+		const request = {
+			paymentRequest: {
+				amount: { currency: "EUR", value: "9.95" },
+				description,
+				sequenceType: "recurring" as const,
+				customerId: subscription.mollieCustomerId as string,
+				mandateId: subscription.mollieMandateId as string,
+				metadata: { subscriptionId: subscription.id, plan: "starter" },
+			},
+		};
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await env.real.payments.create(request);
+			} catch (error) {
+				if ((error as { statusCode?: number }).statusCode !== 422 || attempt >= 20) throw error;
+				await new Promise((resolve) => setTimeout(resolve, 1500));
+			}
+		}
+	}
+
 	/** Starts a checkout for a new user and completes it with `state`. */
 	async function subscribe(state: "paid" | "failed") {
 		const { headers, userId } = await env.newUser();
@@ -220,17 +246,7 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 
 	it("applies a real recurring payment as a renewal", async () => {
 		const { subscription } = await subscribe("paid");
-		const customerId = subscription.mollieCustomerId as string;
-		const payment = await env.real.payments.create({
-			paymentRequest: {
-				amount: { currency: "EUR", value: "9.95" },
-				description: "better-auth-mollie integration renewal",
-				sequenceType: "recurring",
-				customerId,
-				mandateId: subscription.mollieMandateId as string,
-				metadata: { subscriptionId: subscription.id, plan: "starter" },
-			},
-		});
+		const payment = await chargeMandate(subscription, "better-auth-mollie integration renewal");
 		if (payment.status !== "paid") {
 			const url = payment.links.changePaymentState?.href;
 			expect(url).toBeTruthy();
@@ -249,16 +265,10 @@ describe.skipIf(!apiKey)("Mollie test mode", () => {
 		"marks past_due when a real recurring payment fails (SEPA mandates only)",
 		async () => {
 			const { subscription } = await subscribe("paid");
-			const payment = await env.real.payments.create({
-				paymentRequest: {
-					amount: { currency: "EUR", value: "9.95" },
-					description: "better-auth-mollie integration failed renewal",
-					sequenceType: "recurring",
-					customerId: subscription.mollieCustomerId as string,
-					mandateId: subscription.mollieMandateId as string,
-					metadata: { subscriptionId: subscription.id, plan: "starter" },
-				},
-			});
+			const payment = await chargeMandate(
+				subscription,
+				"better-auth-mollie integration failed renewal",
+			);
 			await changePaymentState(payment.links.changePaymentState?.href as string, "failed");
 			env.links.set(payment.id, subscription.mollieSubscriptionId as string);
 			await env.webhook(payment.id);

@@ -31,10 +31,13 @@ async function open(url: string): Promise<Page> {
 async function chooseFinalState(page: Page, state: FinalState) {
 	await page.waitForURL(/\/checkout\/test-mode/, { timeout: 60_000 });
 	await page.locator(`input[name="final_state"][value="${state}"]`).check();
+	// Submitting sets the state; the page then reloads (or redirects, for a
+	// payment with a redirect URL).
 	await Promise.all([
-		page
-			.waitForURL((u) => !u.pathname.startsWith("/checkout/test-mode"), { timeout: 60_000 })
-			.catch(() => {}),
+		page.waitForEvent("framenavigated", {
+			predicate: (frame) => frame === page.mainFrame(),
+			timeout: 60_000,
+		}),
 		page.locator('button[name="submit"]').click(),
 	]);
 }
@@ -57,6 +60,13 @@ export async function completeCheckout(
 				page.locator(`button[name="method"][value="${method}"]`).click(),
 			]);
 			await page.waitForLoadState("networkidle");
+		}
+		if (page.url().includes("/select-issuer/")) {
+			// iDEAL and similar: any test bank leads to the test-mode page.
+			await Promise.all([
+				page.waitForURL((u) => !u.pathname.includes("/select-issuer/"), { timeout: 60_000 }),
+				page.locator('button[name="issuer"]').first().click(),
+			]);
 		}
 		if (page.url().includes("/credit-card/")) {
 			const card = page.frameLocator('iframe[src*="components/card"]');
