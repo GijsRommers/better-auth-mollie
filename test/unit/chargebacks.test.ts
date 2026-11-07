@@ -364,9 +364,9 @@ describe("chargebacks", () => {
 		expect(record.hooksDue).toBe(false);
 	});
 
-	it("does not look at reversed chargebacks again, also with the memory adapter", async () => {
-		const onChargeback = vi.fn(async (..._args: any[]) => {});
-		const env = await setup({ subscription: { onChargeback }, memory: true });
+	// Also on the memory adapter (`pnpm test:memory`), where `null >= "0"` holds.
+	it("does not look at reversed chargebacks again", async () => {
+		const { env } = await withChargebackHook();
 		const subscription = await subscribe(env);
 		const { payment } = await renew(env, subscription);
 		const chargeback = env.fake.chargeBack(payment.id);
