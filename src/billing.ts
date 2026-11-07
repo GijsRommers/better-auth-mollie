@@ -1,7 +1,16 @@
 import type { GenericEndpointContext, Where } from "better-auth";
 import { type BillingEvent, dispatchEvents } from "./events";
 import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } from "./gateway";
-import { type Fence, OperationInProgressError, runOperation, withLock } from "./operations";
+import { type SubscriptionLock, withSubscriptionLock } from "./lock";
+import {
+	LOCK_LEASE_MS,
+	mollieKey,
+	OperationInProgressError,
+	pendingOperations,
+	REPLAY_WINDOW_MS,
+	resolveOperation,
+	runOperation,
+} from "./operations";
 import { catchUpSalesInvoices } from "./sales-invoices";
 import {
 	ACCESS_STATUSES,
@@ -71,6 +80,7 @@ async function reload(ctx: Ctx, id: string): Promise<Subscription | null> {
  * Atomic, guarded update: only applies while the row's status is one of
  * `from` (and any extra conditions hold). Returns the updated row or `null`.
  *
+ * `lock` makes the update apply only while that subscription lock is held.
  * `mollieSync` marks a change Mollie has to follow (plan, mandate,
  * cancellation, …): the row keeps `mollieSyncNeeded` until `reconcileRemote`
  * has brought Mollie in line, so a failed attempt is retried by the next
@@ -82,7 +92,7 @@ export async function guardedUpdate(
 	from: readonly SubscriptionStatus[],
 	set: Partial<Subscription>,
 	extra: Where[] = [],
-	options: { mollieSync?: boolean } = {},
+	options: { mollieSync?: boolean; lock?: SubscriptionLock | undefined } = {},
 ): Promise<Subscription | null> {
 	return ctx.context.adapter.incrementOne<Subscription>({
 		model: "subscription",
@@ -90,6 +100,8 @@ export async function guardedUpdate(
 			{ field: "id", value: id },
 			{ field: "status", operator: "in", value: [...from] },
 			...extra,
+			// Under a lock: only while its lease holds (a stalled holder cannot write).
+			...(options.lock ? options.lock.held() : []),
 		],
 		increment: options.mollieSync ? { mollieSyncRevision: 1 } : {},
 		set: {
@@ -371,16 +383,47 @@ function refundsEnabled(options: MollieOptions): boolean {
  *   "this payment was applied" from "another payment paid for this";
  * - a duplicate is refunded (journaled, at most once), and a refund that
  *   failed or was interrupted is retried by the next delivery or sync;
- * - hook events are emitted once per transition.
+ * - hook events are emitted once per transition;
+ * - it runs under the subscription's lock (or the one the caller holds), so
+ *   it never interleaves with another payment, a plan change, a cancel or a
+ *   restore of the same subscription. `reconcile` (default: when not given
+ *   a lock) then brings Mollie in line, still under the lock.
  */
 export async function processPayment(
 	ctx: Ctx,
 	options: MollieOptions,
 	payment: MolliePayment,
+	opts: { lock?: SubscriptionLock | undefined; reconcile?: boolean } = {},
 ): Promise<ProcessResult> {
-	let subscription = await resolveSubscription(ctx, payment);
-	if (!subscription) return { subscription: null, events: [], ignored: "unknown payment" };
+	const target = await resolveSubscription(ctx, payment);
+	if (!target) return { subscription: null, events: [], ignored: "unknown payment" };
+	if (opts.lock?.subscriptionId === target.id) {
+		const fresh = (await reload(ctx, target.id)) ?? target;
+		return applyPayment(ctx, options, payment, fresh, opts.lock, opts.reconcile ?? false);
+	}
+	return withSubscriptionLock(
+		ctx,
+		target.id,
+		async (lock) => {
+			const fresh = (await reload(ctx, target.id)) ?? target;
+			return applyPayment(ctx, options, payment, fresh, lock, opts.reconcile ?? true);
+		},
+		{ waitMs: LOCK_WAIT_MS },
+	);
+}
 
+/** How long a payment (or a request) waits for a subscription that is busy. */
+export const LOCK_WAIT_MS = 2000;
+
+async function applyPayment(
+	ctx: Ctx,
+	options: MollieOptions,
+	payment: MolliePayment,
+	initial: Subscription,
+	lock: SubscriptionLock,
+	reconcile: boolean,
+): Promise<ProcessResult> {
+	let subscription = initial;
 	const recorded = await recordPayment(ctx, payment, subscription.id);
 	let record = recorded.record;
 	const purpose = paymentPurpose(payment);
@@ -390,7 +433,7 @@ export async function processPayment(
 	let activated = false;
 
 	if (status === "paid" && record.outcome === "pending") {
-		const result = await applyPaidPayment(ctx, options, subscription, payment, purpose);
+		const result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
 		if (result.kind === "applied") {
 			subscription = result.subscription;
 			if (result.activated) {
@@ -414,12 +457,12 @@ export async function processPayment(
 		if (purpose === "checkout" || purpose === "verification") {
 			// Driven by the payment's state, not by who saw it change first, so
 			// a crash right after recording the payment is repaired next time.
-			subscription = (await expireCheckout(ctx, subscription)) ?? subscription;
+			subscription = (await expireCheckout(ctx, subscription, lock)) ?? subscription;
 		} else if (
 			(purpose === "renewal" || purpose === "proration") &&
 			isFailedPaymentStatus(status)
 		) {
-			subscription = (await applyFailedRenewal(ctx, subscription, payment)) ?? subscription;
+			subscription = (await applyFailedRenewal(ctx, subscription, payment, lock)) ?? subscription;
 		}
 		// A failed recovery leaves the subscription as it was.
 	}
@@ -438,8 +481,8 @@ export async function processPayment(
 		}
 	}
 	// A new mandate, a new start or a postponed change: bring Mollie in line.
-	if (activated || subscription.mollieSyncNeeded || needsRemote(subscription)) {
-		await ensureRemoteQuietly(ctx, options, subscription.id);
+	if (reconcile && (activated || subscription.mollieSyncNeeded || needsRemote(subscription))) {
+		subscription = await reconcileQuietly(ctx, options, subscription.id, lock);
 	}
 	return { subscription, events };
 }
@@ -450,15 +493,16 @@ async function applyPaidPayment(
 	subscription: Subscription,
 	payment: MolliePayment,
 	purpose: PaymentPurpose,
+	lock: SubscriptionLock,
 ): Promise<Application> {
 	switch (purpose) {
 		case "checkout":
 		case "verification":
-			return activateSubscription(ctx, options, subscription, payment);
+			return activateSubscription(ctx, options, subscription, payment, lock);
 		case "recovery":
-			return recoverSubscription(ctx, options, subscription, payment);
+			return recoverSubscription(ctx, options, subscription, payment, lock);
 		case "renewal":
-			return applyRenewal(ctx, options, subscription, payment);
+			return applyRenewal(ctx, options, subscription, payment, lock);
 		case "proration":
 			return applyProration(subscription, payment);
 	}
@@ -586,6 +630,7 @@ async function activateSubscription(
 	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
+	lock: SubscriptionLock,
 ): Promise<Application> {
 	const metadata = metadataOf(payment);
 	const plan = await getPlanByName(
@@ -625,7 +670,7 @@ async function activateSubscription(
 				appliedPaymentId: payment.id,
 			},
 			[],
-			{ mollieSync: true },
+			{ mollieSync: true, lock },
 		);
 		if (updated) return { kind: "applied", subscription: updated, activated: true };
 		subscription = await reload(ctx, subscription.id);
@@ -644,6 +689,7 @@ async function recoverSubscription(
 	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
+	lock: SubscriptionLock,
 ): Promise<Application> {
 	const metadata = metadataOf(payment);
 	const plan = await getPlanByName(
@@ -686,7 +732,7 @@ async function recoverSubscription(
 				...(periodStart ? [{ field: "periodStart", value: periodStart }] : []),
 				...sameAppliedPayment(subscription),
 			],
-			{ mollieSync: true },
+			{ mollieSync: true, lock },
 		);
 		if (updated) return { kind: "applied", subscription: updated, activated: true };
 		subscription = await reload(ctx, subscription.id);
@@ -698,7 +744,11 @@ async function recoverSubscription(
  * A first payment failed, expired or was canceled. The checkout is over
  * unless another attempt for this subscription is still open or paid.
  */
-async function expireCheckout(ctx: Ctx, subscription: Subscription): Promise<Subscription | null> {
+async function expireCheckout(
+	ctx: Ctx,
+	subscription: Subscription,
+	lock?: SubscriptionLock,
+): Promise<Subscription | null> {
 	if (subscription.status !== "incomplete") return null;
 	const attempts = await ctx.context.adapter.findMany<MolliePaymentRecord>({
 		model: "molliePayment",
@@ -710,7 +760,9 @@ async function expireCheckout(ctx: Ctx, subscription: Subscription): Promise<Sub
 	});
 	if (attempts.length === 0) return null;
 	if (attempts.some((a) => !isFinalPaymentStatus(a.status) || a.status === "paid")) return null;
-	return guardedUpdate(ctx, subscription.id, ["incomplete"], { status: "incomplete_expired" });
+	return guardedUpdate(ctx, subscription.id, ["incomplete"], { status: "incomplete_expired" }, [], {
+		lock,
+	});
 }
 
 /**
@@ -734,6 +786,7 @@ async function applyRenewal(
 	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
+	lock: SubscriptionLock,
 ): Promise<Application> {
 	const customerId = payment.customerId ?? initial.mollieCustomerId;
 	const remoteId = payment.subscriptionId;
@@ -786,6 +839,7 @@ async function applyRenewal(
 				...(switchPlan ? { plan: subscription.pendingPlan as string, pendingPlan: null } : {}),
 			},
 			guards,
+			{ lock },
 		);
 		if (updated) return { kind: "applied", subscription: updated, activated: false };
 		subscription = await reload(ctx, subscription.id);
@@ -803,6 +857,7 @@ async function applyFailedRenewal(
 	ctx: Ctx,
 	subscription: Subscription,
 	payment: MolliePayment,
+	lock: SubscriptionLock,
 ): Promise<Subscription | null> {
 	if (subscription.status !== "trialing" && subscription.status !== "active") return null;
 	if (subscription.cancelAtPeriodEnd) return null;
@@ -817,6 +872,7 @@ async function applyFailedRenewal(
 		["trialing", "active"],
 		{ status: "past_due" },
 		subscription.periodEnd ? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }] : [],
+		{ lock },
 	);
 }
 
@@ -969,6 +1025,7 @@ export async function settleRecentCharges(
 	options: MollieOptions,
 	subscription: Subscription,
 	remoteId: string | null | undefined = subscription.mollieSubscriptionId,
+	lock?: SubscriptionLock,
 ): Promise<{ inProgress: boolean; processed: boolean }> {
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId || !remoteId) return { inProgress: false, processed: false };
@@ -982,18 +1039,63 @@ export async function settleRecentCharges(
 	if (recent.some((p) => !isFinalPaymentStatus(p.status as string))) {
 		return { inProgress: true, processed: false };
 	}
+	return { inProgress: false, processed: await processUnsettled(ctx, options, recent, lock) };
+}
+
+/** Whether a payment from Mollie still has to be processed locally. */
+async function isUnsettled(ctx: Ctx, payment: MolliePayment): Promise<boolean> {
+	const record = await findPaymentRecord(ctx, payment.id);
+	return !(
+		record?.status === payment.status &&
+		(payment.status !== "paid" || (record.outcome !== "pending" && record.outcome !== "duplicate"))
+	);
+}
+
+async function processUnsettled(
+	ctx: Ctx,
+	options: MollieOptions,
+	payments: MolliePayment[],
+	lock: SubscriptionLock | undefined,
+): Promise<boolean> {
 	let processed = false;
-	for (const payment of recent) {
-		const record = await findPaymentRecord(ctx, payment.id);
-		const settled =
-			record?.status === payment.status &&
-			(payment.status !== "paid" || record.outcome !== "pending");
-		if (settled) continue;
-		const result = await processPayment(ctx, options, payment);
+	for (const payment of payments) {
+		if (!(await isUnsettled(ctx, payment))) continue;
+		const result = await processPayment(ctx, options, payment, { lock, reconcile: !lock });
 		dispatchEvents(ctx, options, result.events);
 		processed = true;
 	}
-	return { inProgress: false, processed };
+	return processed;
+}
+
+/** How far back charges of a customer are looked for (SEPA can take days to settle). */
+const DISCOVERY_DAYS = 35;
+
+/**
+ * Finds the customer's charges for this subscription that were never
+ * processed: from any of its Mollie subscriptions (also canceled or stray
+ * ones), pro-rata charges, recovery checkouts. They are found by their
+ * metadata, so this does not depend on which Mollie subscription the row
+ * still points at. Returns whether one is still in progress.
+ */
+export async function settleCustomerCharges(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscription: Subscription,
+	now: Date,
+	lock?: SubscriptionLock,
+): Promise<{ inProgress: boolean; processed: boolean }> {
+	const customerId = subscription.mollieCustomerId;
+	if (!customerId) return { inProgress: false, processed: false };
+	const ours = (
+		await gatewayFor(options).listRecentCustomerPayments(customerId, addDays(now, -DISCOVERY_DAYS))
+	).filter(
+		(payment) =>
+			metadataOf(payment).subscriptionId === subscription.id ||
+			(!!payment.subscriptionId && payment.subscriptionId === subscription.mollieSubscriptionId),
+	);
+	const inProgress = ours.some((payment) => !isFinalPaymentStatus(payment.status as string));
+	const final = ours.filter((payment) => isFinalPaymentStatus(payment.status as string));
+	return { inProgress, processed: await processUnsettled(ctx, options, final, lock) };
 }
 
 /** Mollie subscription creations for this row that may still be in flight. */
@@ -1023,13 +1125,13 @@ async function cancelTagged(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
-	fence: Fence,
+	lock: SubscriptionLock,
 ): Promise<string[]> {
 	const customerId = subscription.mollieCustomerId as string;
 	const canceled: string[] = [];
 	for (const remote of await gatewayFor(options).listLiveCustomerSubscriptions(customerId)) {
 		if (metadataOf(remote).subscriptionId !== subscription.id) continue;
-		await fence();
+		await lock.fence();
 		await cancelMollieSubscription(ctx, options, {
 			...subscription,
 			mollieSubscriptionId: remote.id,
@@ -1069,10 +1171,11 @@ export async function reconcileRemote(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
-	now: Date = new Date(),
-	fence: Fence = async () => {},
+	now: Date,
+	lock: SubscriptionLock,
 	attempt = 0,
 ): Promise<Subscription> {
+	const fence = lock.fence;
 	const settled = (result: Subscription = subscription) =>
 		markMollieSynced(ctx, subscription, result);
 	const postpone = async () => {
@@ -1081,7 +1184,7 @@ export async function reconcileRemote(
 	};
 	const again = async (latest: Subscription | null) => {
 		if (!latest || attempt >= 2) return postpone();
-		return reconcileRemote(ctx, options, latest, now, fence, attempt + 1);
+		return reconcileRemote(ctx, options, latest, now, lock, attempt + 1);
 	};
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId || subscription.status === "incomplete") return settled();
@@ -1107,7 +1210,7 @@ export async function reconcileRemote(
 			await fence();
 			await cancelMollieSubscription(ctx, options, subscription);
 		}
-		const stopped = await cancelTagged(ctx, options, subscription, fence);
+		const stopped = await cancelTagged(ctx, options, subscription, lock);
 		// Billing is stopped. Charges those Mollie subscriptions made that were
 		// never processed (no webhook) are processed now: a charge for a canceled
 		// period is refunded. One still in progress is looked at again later, as
@@ -1115,9 +1218,14 @@ export async function reconcileRemote(
 		let pending = false;
 		for (const remoteId of new Set([subscription.mollieSubscriptionId, ...stopped])) {
 			if (!remoteId) continue;
-			if ((await settleRecentCharges(ctx, options, subscription, remoteId)).inProgress) {
+			if ((await settleRecentCharges(ctx, options, subscription, remoteId, lock)).inProgress) {
 				pending = true;
 			}
+		}
+		// Also charges of Mollie subscriptions canceled earlier (no longer listed
+		// as running) and other charges for this row.
+		if ((await settleCustomerCharges(ctx, options, subscription, now, lock)).inProgress) {
+			pending = true;
 		}
 		if (pending || (await creationInFlight(ctx, subscription, now))) return postpone();
 		return settled();
@@ -1137,6 +1245,10 @@ export async function reconcileRemote(
 	const amount = chargeAmount(plan, tax);
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	const paidThrough = periodEnd ? toMollieDate(periodEnd) : null;
+	// While the period runs, the next charge is due when it ends; a few days of
+	// slack absorb month-end differences, a later date would leave time unpaid.
+	const latestNextCharge =
+		periodEnd && periodEnd > now ? toMollieDate(addDays(periodEnd, NEXT_CHARGE_SLACK_DAYS)) : null;
 	const matches = (remote: MollieSubscription) =>
 		isLive(remote) &&
 		metadataOf(remote).plan === planName &&
@@ -1144,12 +1256,20 @@ export async function reconcileRemote(
 		remote.amount.value === amount &&
 		remote.amount.currency === planCurrency(plan) &&
 		remote.interval === plan.interval &&
-		// Never charging for time that is already paid for.
-		!(paidThrough && remote.nextPaymentDate && remote.nextPaymentDate < paidThrough);
+		// Never charging for time that is already paid for...
+		!(paidThrough && remote.nextPaymentDate && remote.nextPaymentDate < paidThrough) &&
+		// ...nor skipping time that is not.
+		!(latestNextCharge && remote.nextPaymentDate && remote.nextPaymentDate > latestNextCharge);
 	if (actual && matches(actual)) return settled();
 
 	if (actual) {
-		const charges = await settleRecentCharges(ctx, options, subscription);
+		const charges = await settleRecentCharges(
+			ctx,
+			options,
+			subscription,
+			subscription.mollieSubscriptionId,
+			lock,
+		);
 		if (charges.inProgress) {
 			ctx.context.logger.info(
 				`[mollie] ${subscription.id}: waiting for a charge in progress before updating Mollie`,
@@ -1212,6 +1332,7 @@ export async function reconcileRemote(
 			{ field: "mollieSyncRevision", value: subscription.mollieSyncRevision ?? 0 },
 			...(periodEnd ? [{ field: "periodEnd", value: periodEnd }] : []),
 		],
+		{ lock },
 	);
 	if (adopted) return settled(adopted);
 	const latest = await reload(ctx, subscription.id);
@@ -1221,6 +1342,8 @@ export async function reconcileRemote(
 	return again(latest);
 }
 
+const NEXT_CHARGE_SLACK_DAYS = 3;
+
 /** Runs `reconcileRemote` under the subscription's lock. */
 export async function ensureRemote(
 	ctx: Ctx,
@@ -1228,27 +1351,31 @@ export async function ensureRemote(
 	subscriptionId: string,
 	now: Date = new Date(),
 ): Promise<Subscription | null> {
-	const initial = await reload(ctx, subscriptionId);
-	if (!initial) return null;
-	return withLock(
-		ctx.context,
-		{ key: `lock:subscription:${subscriptionId}`, referenceId: initial.referenceId },
-		async (fence) => {
-			const fresh = await reload(ctx, subscriptionId);
-			return fresh ? reconcileRemote(ctx, options, fresh, now, fence) : null;
-		},
-	);
+	if (!(await reload(ctx, subscriptionId))) return null;
+	return withSubscriptionLock(ctx, subscriptionId, async (lock) => {
+		const fresh = await reload(ctx, subscriptionId);
+		return fresh ? reconcileRemote(ctx, options, fresh, now, lock) : null;
+	});
 }
 
-/** `ensureRemote` for background paths: failures are left for the next sync. */
-async function ensureRemoteQuietly(ctx: Ctx, options: MollieOptions, subscriptionId: string) {
+/** `reconcileRemote` under a held lock for background paths: failures are left for the next sync. */
+async function reconcileQuietly(
+	ctx: Ctx,
+	options: MollieOptions,
+	subscriptionId: string,
+	lock: SubscriptionLock,
+): Promise<Subscription> {
+	const fresh = await reload(ctx, subscriptionId);
+	if (!fresh) throw new Error(`Subscription ${subscriptionId} disappeared`);
 	try {
-		await ensureRemote(ctx, options, subscriptionId);
+		return await reconcileRemote(ctx, options, fresh, new Date(), lock);
 	} catch (error) {
-		if (error instanceof OperationInProgressError) return;
-		ctx.context.logger.error(
-			`[mollie] Could not bring Mollie in line for ${subscriptionId}: ${errorMessage(error)}`,
-		);
+		if (!(error instanceof OperationInProgressError)) {
+			ctx.context.logger.error(
+				`[mollie] Could not bring Mollie in line for ${subscriptionId}: ${errorMessage(error)}`,
+			);
+		}
+		return (await reload(ctx, subscriptionId)) ?? fresh;
 	}
 }
 
@@ -1558,9 +1685,14 @@ export async function syncSubscription(
 			customerId,
 			subscription.mollieSubscriptionId,
 		)) {
-			events.push(...(await processPayment(ctx, options, payment)).events);
+			if (await isUnsettled(ctx, payment)) {
+				events.push(...(await processPayment(ctx, options, payment)).events);
+			}
 		}
 	}
+	// Charges for this row by a stray or replaced Mollie subscription, or
+	// pro-rata charges, whose webhook never arrived.
+	await settleCustomerCharges(ctx, options, subscription, now);
 	// First adopt or create the right Mollie subscription (this also finishes
 	// an interrupted change), then cancel anything else tagged for this row.
 	subscription = (await ensureRemote(ctx, options, subscription.id, now)) ?? subscription;
@@ -1580,6 +1712,58 @@ export async function syncSubscription(
 	}
 	events.push(...(await applyTimeTransitions(ctx, options, subscription, now)).events);
 	return { events, checkedRemote };
+}
+
+/**
+ * Pro-rata charges whose creation was interrupted before they were recorded
+ * (the response was lost, or the process stopped): each upgrade attempt has
+ * its own journal entry, which nothing else revisits. Once its lock lease is
+ * long over, the charge is looked up at Mollie by its operation key; if it
+ * exists it is processed (a charge without its upgrade is refunded), and if
+ * Mollie no longer remembers the key and nothing carries it, it never
+ * happened.
+ */
+async function recoverAbandonedCharges(
+	ctx: Ctx,
+	options: MollieOptions,
+	now: Date,
+	onEvents: (events: BillingEvent[]) => void,
+	errors: SyncResult["errors"],
+): Promise<void> {
+	const gateway = gatewayFor(options);
+	const abandoned = await pendingOperations(
+		ctx.context,
+		"create_proration_payment",
+		new Date(now.getTime() - LOCK_LEASE_MS),
+	);
+	for (const op of abandoned) {
+		// `proration:<subscriptionId>:<plan>:<period end>:<attempt>#<n>`
+		const subscriptionId = op.idempotencyKey.split(":")[1] ?? "";
+		const subscription = await reload(ctx, subscriptionId);
+		const customerId = subscription?.mollieCustomerId;
+		if (!subscription || !customerId) continue;
+		try {
+			const createdAt = new Date(op.createdAt);
+			const found = await gateway.findCustomerPaymentByOperationKey(
+				customerId,
+				await mollieKey(op.idempotencyKey),
+				createdAt,
+			);
+			if (found) {
+				await resolveOperation(ctx.context, op.idempotencyKey, "succeeded", found);
+				const payment = await gateway.getPayment(found);
+				onEvents((await processPayment(ctx, options, payment)).events);
+			} else if (now.getTime() - createdAt.getTime() > REPLAY_WINDOW_MS) {
+				await resolveOperation(ctx.context, op.idempotencyKey, "failed", null);
+			}
+		} catch (error) {
+			if (error instanceof OperationInProgressError) continue;
+			errors.push({ subscriptionId, message: errorMessage(error) });
+			ctx.context.logger.error(
+				`[mollie] Recovering ${op.idempotencyKey} failed: ${errorMessage(error)}`,
+			);
+		}
+	}
 }
 
 export type SyncResult = {
@@ -1622,6 +1806,7 @@ export async function syncAllSubscriptions(
 		}
 	}
 	const result: SyncResult = { checked: 0, remoteChecked: 0, invoicesCreated: 0, errors: [] };
+	await recoverAbandonedCharges(ctx, options, now, input.onEvents, result.errors);
 	for (const id of ids) {
 		const subscription = await reload(ctx, id);
 		if (!subscription) continue;

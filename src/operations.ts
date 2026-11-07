@@ -114,7 +114,7 @@ export type OperationResult<T> = {
  * Guarded `pending → status` transition. Returns `false` when the row was no
  * longer pending (someone else resolved it first).
  */
-async function resolveOperation(
+export async function resolveOperation(
 	context: AuthContext,
 	idempotencyKey: string,
 	status: "succeeded" | "failed",
@@ -130,6 +130,31 @@ async function resolveOperation(
 		set: { status, mollieId },
 	});
 	return row !== null;
+}
+
+/** Pending journal rows of `kind` created before `createdBefore` (oldest first). */
+export async function pendingOperations(
+	context: AuthContext,
+	kind: MollieOperation["kind"],
+	createdBefore: Date,
+): Promise<MollieOperation[]> {
+	const found: MollieOperation[] = [];
+	for (let offset = 0; ; offset += PAGE_SIZE) {
+		const page = await context.adapter.findMany<MollieOperation>({
+			model: "mollieOperation",
+			where: [
+				{ field: "kind", value: kind },
+				{ field: "status", value: "pending" },
+				{ field: "createdAt", operator: "lt", value: createdBefore },
+			],
+			sortBy: { field: "createdAt", direction: "asc" },
+			limit: PAGE_SIZE,
+			offset,
+		});
+		found.push(...page);
+		if (page.length < PAGE_SIZE) break;
+	}
+	return found;
 }
 
 async function loadAttempts(context: AuthContext, options: RunOperationOptions<unknown>) {

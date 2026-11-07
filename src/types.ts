@@ -130,6 +130,9 @@ export interface Subscription {
 	mollieSyncNeeded?: boolean | null | undefined;
 	/** Incremented with every change that sets `mollieSyncNeeded`. */
 	mollieSyncRevision?: number | null | undefined;
+	/** Internal: the lease of whoever is changing this subscription (see `withSubscriptionLock`). */
+	lockToken?: string | null | undefined;
+	lockedUntil?: Date | null | undefined;
 	createdAt: Date;
 	updatedAt: Date;
 }

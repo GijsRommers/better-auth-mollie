@@ -160,6 +160,27 @@ export function createGateway(client: Client, config: { timeoutMs?: number | und
 			return page.result.embedded?.payments ?? [];
 		},
 
+		/**
+		 * A customer's payments created since `since`, newest first (paging back
+		 * to then). An error while paging propagates: an incomplete list never
+		 * counts as "nothing there".
+		 */
+		async listRecentCustomerPayments(customerId: string, since: Date) {
+			const cutoff = since.getTime() - RECOVERY_SLACK_MS;
+			const pages = await client.customers.listPayments(
+				{ customerId, limit: PAGE_LIMIT, sort: "desc" },
+				options,
+			);
+			const found: ListPaymentResponse[] = [];
+			for await (const page of pages) {
+				for (const payment of page.result.embedded?.payments ?? []) {
+					if (new Date(payment.createdAt).getTime() < cutoff) return found;
+					found.push(payment as ListPaymentResponse);
+				}
+			}
+			return found;
+		},
+
 		createSalesInvoice: (
 			body: SalesInvoiceRequest,
 			idempotencyKey: string,

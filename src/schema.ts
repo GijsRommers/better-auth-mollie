@@ -82,6 +82,17 @@ export const subscriptionSchema = {
 				defaultValue: 0,
 				input: false,
 			},
+			lockToken: {
+				type: "string",
+				required: false,
+				input: false,
+			},
+			lockedUntil: {
+				type: "date",
+				required: false,
+				defaultValue: () => new Date(0),
+				input: false,
+			},
 			createdAt: {
 				type: "date",
 				required: true,

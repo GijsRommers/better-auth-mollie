@@ -1,0 +1,81 @@
+import type { GenericEndpointContext, Where } from "better-auth";
+import { type Fence, LOCK_LEASE_MS, LockLostError, OperationInProgressError } from "./operations";
+import type { Subscription } from "./types";
+
+/**
+ * A lease on one subscription row, stored on the row itself
+ * (`lockToken`, `lockedUntil`).
+ *
+ * Everything that changes a subscription based on what it read (payments,
+ * plan changes, cancel, restore, reconciling Mollie) holds it, so those
+ * decisions are serialized. Because the lease lives on the row, a write can
+ * require it atomically: `held()` adds "the lease is still mine and has not
+ * expired" to the update's conditions, so a holder that stalled past its lease
+ * can never write, whether or not someone else took over.
+ */
+export type SubscriptionLock = {
+	subscriptionId: string;
+	/** Renews the lease; throws `LockLostError` once it expired or was taken over. */
+	fence: Fence;
+	/** Conditions that make an update of the row apply only while the lease is held. */
+	held: () => Where[];
+};
+
+const RETRY_MS = 100;
+
+export async function withSubscriptionLock<T>(
+	ctx: GenericEndpointContext,
+	subscriptionId: string,
+	fn: (lock: SubscriptionLock) => Promise<T>,
+	options: { waitMs?: number } = {},
+): Promise<T> {
+	const { adapter } = ctx.context;
+	const token = globalThis.crypto.randomUUID();
+	const key = `lock:subscription:${subscriptionId}`;
+	const claim = async (free: Where) =>
+		adapter.incrementOne<Subscription>({
+			model: "subscription",
+			where: [{ field: "id", value: subscriptionId }, free],
+			increment: {},
+			set: { lockToken: token, lockedUntil: new Date(Date.now() + LOCK_LEASE_MS) },
+		});
+	// Counted in tries, not by the clock (which may not move, e.g. in tests).
+	const tries = Math.ceil((options.waitMs ?? 0) / RETRY_MS);
+	for (let attempt = 0; ; attempt++) {
+		const claimed =
+			(await claim({ field: "lockedUntil", operator: "lt", value: new Date() })) ??
+			(await claim({ field: "lockedUntil", value: null }));
+		if (claimed) break;
+		if (attempt >= tries) throw new OperationInProgressError(key);
+		await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+	}
+
+	const held = (): Where[] => [
+		{ field: "lockToken", value: token },
+		{ field: "lockedUntil", operator: "gte", value: new Date() },
+	];
+	const fence: Fence = async () => {
+		const renewed = await adapter.incrementOne<Subscription>({
+			model: "subscription",
+			where: [{ field: "id", value: subscriptionId }, ...held()],
+			increment: {},
+			set: { lockedUntil: new Date(Date.now() + LOCK_LEASE_MS) },
+		});
+		if (!renewed) throw new LockLostError(key);
+	};
+	try {
+		return await fn({ subscriptionId, fence, held });
+	} finally {
+		await adapter
+			.incrementOne<Subscription>({
+				model: "subscription",
+				where: [
+					{ field: "id", value: subscriptionId },
+					{ field: "lockToken", value: token },
+				],
+				increment: {},
+				set: { lockedUntil: new Date(0) },
+			})
+			.catch(() => null);
+	}
+}
