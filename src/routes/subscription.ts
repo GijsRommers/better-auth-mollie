@@ -447,7 +447,7 @@ async function changePlan(
 	});
 	// The charge is recorded as the applied payment in the same update as the
 	// new plan: a charge without its upgrade is refunded (see processPayment).
-	if (proration) await settlePreviousPayment(ctx, current, proration);
+	if (proration) await settlePreviousPayment(ctx, options, current, proration);
 	const updated = await guardedUpdate(
 		ctx,
 		current.id,

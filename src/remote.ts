@@ -13,7 +13,7 @@ import {
 	subscriptionDescription,
 } from "./rows";
 import { mapMollieSubscriptionStatus } from "./status";
-import { chargeAmount, taxMetadata } from "./tax";
+import { chargeAmount, fromCents, taxMetadata, toCents } from "./tax";
 import type { MollieOptions, MolliePlan, Subscription, TaxBreakdown } from "./types";
 import {
 	getPlanByName,
@@ -163,7 +163,8 @@ export async function refundPayment(
 			gateway.createRefund(
 				payment.id,
 				{
-					amount: { currency: payment.amount.currency, value: payment.amount.value },
+					// What is left of it (part may be refunded by hand already).
+					amount: { currency: payment.amount.currency, value: refundableAmount(payment) },
 					description,
 					metadata: { subscriptionId: subscription.id, operationKey: idempotencyKey },
 				},
@@ -172,6 +173,13 @@ export async function refundPayment(
 		getId: (refund) => refund.id,
 		recover: (idempotencyKey) => gateway.findRefundByOperationKey(payment.id, idempotencyKey),
 	});
+}
+
+/** What Mollie can still refund of a payment, at most its amount. */
+export function refundableAmount(payment: MolliePayment): string {
+	const remaining = payment.amountRemaining;
+	if (!remaining) return payment.amount.value;
+	return fromCents(Math.min(toCents(remaining.value), toCents(payment.amount.value)));
 }
 
 /** Whether the journal holds our own cancellation of this Mollie subscription. */

@@ -190,6 +190,8 @@ export interface MolliePaymentRecord {
 	chargebackDue?: boolean | null | undefined;
 	/** Internal: a refund of this verification payment is still to be made. */
 	refundDue?: boolean | null | undefined;
+	/** Why the payment exists (see `PaymentPurpose`); `null` on older rows. */
+	purpose?: PaymentPurpose | null | undefined;
 	/** Internal: when the sync last checked a recorded chargeback for a reversal. */
 	chargebackCheckedAt?: Date | null | undefined;
 	/**

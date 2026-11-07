@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { setup } from "../helpers/setup";
+import { settle, setup, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -75,5 +75,70 @@ describe("refundVerificationPayment", () => {
 		env.fake.completePayment(payment.id, "paid");
 		await env.webhook(`id=${payment.id}`);
 		expect(env.fake.callsTo("refunds.create")).toEqual([]);
+	});
+
+	it("refunds what is left after part was refunded by hand", async () => {
+		const env = await setup({ subscription: { refundVerificationPayment: true } });
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		const { payment } = await startTrial(env);
+		await env.fake.client.refunds.create({
+			paymentId: payment.id,
+			refundRequest: { amount: { currency: "EUR", value: "0.01" }, description: "By hand" },
+		} as never);
+
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors).toEqual([]);
+		const amounts = [...env.fake.refunds.values()].map((refund) => refund.amount.value);
+		expect(amounts.sort()).toEqual(["0.01", "0.01"]);
+		expect((await record(env, payment.id)).refundDue).toBe(false);
+	});
+
+	it("still refunds when a renewal settles a verification whose outcome was not recorded", async () => {
+		const env = await setup({ subscription: { refundVerificationPayment: true } });
+		env.fake.failNext("refunds.create", new TypeError("fetch failed"));
+		const { payment, subscription } = await startTrial(env);
+		// The activation was stored, but the delivery stopped before recording
+		// the payment's outcome (and so its refund).
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: payment.id }],
+			update: { outcome: "pending", refundDue: false },
+		});
+		travel(new Date(subscription.trialEnd!).getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${renewal.id}`);
+		expect(await record(env, payment.id)).toMatchObject({ outcome: "applied", refundDue: true });
+
+		await syncMollieSubscriptions(env.auth as never);
+		expect([...env.fake.refunds.values()].map((r) => r.paymentId)).toEqual([payment.id]);
+		expect((await record(env, payment.id)).refundDue).toBe(false);
+	});
+
+	it("does not invoice a verification payment it refunds", async () => {
+		const getRecipient = vi.fn(async () => ({
+			type: "consumer" as const,
+			givenName: "Ada",
+			familyName: "Lovelace",
+			email: "ada@example.com",
+			streetAndNumber: "Keizersgracht 1",
+			postalCode: "1015 CJ",
+			city: "Amsterdam",
+			country: "NL",
+			locale: "nl_NL" as const,
+		}));
+		const env = await setup({
+			subscription: {
+				refundVerificationPayment: true,
+				tax: { calculate: () => ({ rate: "21.00", country: "NL" }) },
+			},
+			options: {
+				salesInvoices: { enabled: true, getRecipient, invoiceVerificationPayments: true },
+			},
+		});
+		await startTrial(env);
+		await settle();
+		await syncMollieSubscriptions(env.auth as never);
+		expect(env.fake.salesInvoices.size).toBe(0);
+		expect(getRecipient).not.toHaveBeenCalled();
 	});
 });

@@ -67,8 +67,12 @@ export async function createSalesInvoice(
 	// Never invoiced (recorded, so the catch-up does not look at it again):
 	// verification payments (unless asked), duplicates that are (being)
 	// refunded, and payments the app chose not to invoice.
+	// A verification that `refundVerificationPayment` refunds is not invoiced.
+	const refunded =
+		options.subscription?.enabled === true && !!options.subscription.refundVerificationPayment;
+	const verificationInvoiced = config.invoiceVerificationPayments && !refunded;
 	if (
-		(data.isVerification && !config.invoiceVerificationPayments) ||
+		(data.isVerification && !verificationInvoiced) ||
 		!INVOICED_OUTCOMES.includes(data.record.outcome)
 	) {
 		await markInvoice(ctx, data.payment.id, "skipped");

@@ -198,6 +198,11 @@ export const molliePaymentSchema = {
 				required: false,
 				input: false,
 			},
+			purpose: {
+				type: "string",
+				required: false,
+				input: false,
+			},
 			refundDue: {
 				type: "boolean",
 				required: false,

@@ -39,6 +39,8 @@ export type FakePayment = {
 	canceledAt?: string | null | undefined;
 	/** Charged back and not reversed (absent when nothing is). */
 	amountChargedBack?: Amount | undefined;
+	/** What can still be refunded, on a paid payment. */
+	amountRemaining?: Amount | undefined;
 	links: { self: Link; dashboard: Link; checkout?: Link; changePaymentState?: Link | null };
 };
 
@@ -174,7 +176,29 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				value: (cents / 100).toFixed(2),
 			};
 		} else delete payment.amountChargedBack;
+		updateRemaining(paymentId);
 	};
+	const toCents = (value: string) => Math.round(Number(value) * 100);
+	/** Mollie's `amountRemaining`: the amount less refunds and chargebacks. */
+	function remainingCents(paymentId: string): number {
+		const payment = payments.get(paymentId);
+		if (!payment) return 0;
+		const refunded = [...refunds.values()]
+			.filter((r) => r.paymentId === paymentId)
+			.reduce((sum, r) => sum + toCents(r.amount.value), 0);
+		const chargedBack = [...chargebacks.values()]
+			.filter((c) => c.paymentId === paymentId && !c.reversedAt)
+			.reduce((sum, c) => sum + toCents(c.amount.value), 0);
+		return Math.max(0, toCents(payment.amount.value) - refunded - chargedBack);
+	}
+	function updateRemaining(paymentId: string) {
+		const payment = payments.get(paymentId);
+		if (payment?.status !== "paid") return;
+		payment.amountRemaining = {
+			currency: payment.amount.currency,
+			value: (remainingCents(paymentId) / 100).toFixed(2),
+		};
+	}
 	/** Mollie's stored responses per idempotency key (kept for one hour in reality). */
 	const idempotency = new Map<string, { fingerprint: string; value?: unknown; error?: unknown }>();
 	const inFlight = new Set<string>();
@@ -484,6 +508,9 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 				idempotent("refunds.create", request, () => {
 					const payment = payments.get(request.paymentId);
 					if (payment?.status !== "paid") throw mollieError(422, "Not refundable");
+					if (toCents(request.refundRequest.amount.value) > remainingCents(request.paymentId)) {
+						throw mollieError(422, "The amount is higher than what can be refunded");
+					}
 					const refund = {
 						id: id("re"),
 						paymentId: request.paymentId,
@@ -492,6 +519,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 						createdAt: iso(),
 					};
 					refunds.set(refund.id, refund);
+					updateRemaining(request.paymentId);
 					return refund;
 				}),
 			async list(request: { paymentId: string; limit?: number }) {
@@ -598,6 +626,7 @@ export function createFakeMollie(options: { now?: () => Date } = {}) {
 			if (status === "paid") {
 				payment.paidAt = iso();
 				delete payment.links.checkout;
+				updateRemaining(paymentId);
 				if (payment.sequenceType === "first" && payment.customerId && !payment.mandateId) {
 					const mandate: FakeMandate = {
 						resource: "mandate",

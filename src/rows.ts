@@ -2,12 +2,14 @@ import type { GenericEndpointContext as Ctx, Where } from "better-auth";
 import type { SubscriptionLock } from "./lock";
 import { LockLostError } from "./operations";
 import { DEFAULT_GRACE_PERIOD_DAYS } from "./status";
+import { toCents } from "./tax";
 import type {
 	CustomerType,
 	MollieOptions,
 	MolliePaymentRecord,
 	MolliePlan,
 	PaymentOutcome,
+	PaymentPurpose,
 	Subscription,
 	SubscriptionStatus,
 } from "./types";
@@ -188,17 +190,32 @@ export async function claimPayment(
  */
 export async function settlePreviousPayment(
 	ctx: Ctx,
+	options: MollieOptions,
 	subscription: Subscription,
 	payment: { id: string },
 ): Promise<void> {
 	const previous = subscription.appliedPaymentId;
 	if (previous && previous !== payment.id) {
 		// It paid for the period as it is now (also when the delivery that
-		// applied it stopped before recording that).
+		// applied it stopped before recording that), and a verification still
+		// gets its refund.
+		const record = await findPaymentRecord(ctx, previous);
+		const refund = !!record?.purpose && refundsVerification(options, record.purpose, record.amount);
 		await setOutcome(ctx, previous, ["pending"], "applied", undefined, {
 			paidThrough: periodEndOf(subscription),
+			...(refund ? { refundDue: true } : {}),
 		});
 	}
+}
+
+/** Whether a payment is a verification that `refundVerificationPayment` refunds. */
+export function refundsVerification(
+	options: MollieOptions,
+	purpose: PaymentPurpose,
+	amount: string,
+): boolean {
+	const enabled = options.subscription?.enabled && options.subscription.refundVerificationPayment;
+	return !!enabled && purpose === "verification" && toCents(amount) > 0;
 }
 
 /**

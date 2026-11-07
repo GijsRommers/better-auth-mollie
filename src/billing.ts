@@ -10,6 +10,7 @@ import {
 	createScheduledSubscription,
 	findRemote,
 	isLive,
+	refundableAmount,
 	refundPayment,
 } from "./remote";
 import {
@@ -23,6 +24,7 @@ import {
 	lockWaitMs,
 	markMollieSynced,
 	periodEndOf,
+	refundsVerification,
 	reload,
 	sameAppliedPayment,
 	sameDate,
@@ -139,6 +141,7 @@ export async function recordPayment(
 					currency: payment.amount.currency,
 					status,
 					sequenceType: payment.sequenceType as MolliePaymentRecord["sequenceType"],
+					purpose: paymentPurpose(payment),
 					outcome: "pending",
 					claimSerial: 0,
 					hooksDue,
@@ -498,8 +501,7 @@ async function refundDuplicate(
 	claim?: number,
 ): Promise<BillingEvent[]> {
 	// Nothing left to refund (e.g. charged back): the money is back already.
-	const remaining = payment.amountRemaining;
-	if (!remaining || toCents(remaining.value) > 0) {
+	if (toCents(refundableAmount(payment)) > 0) {
 		await refundPayment(ctx, options, subscription, payment);
 	}
 	const refunded = await setOutcome(ctx, payment.id, ["duplicate"], "refunded", claim);
@@ -541,9 +543,7 @@ function verificationRefund(
 	purpose: PaymentPurpose,
 	payment: MolliePayment,
 ): { refundDue?: true } {
-	const enabled = options.subscription?.enabled && options.subscription.refundVerificationPayment;
-	if (!enabled || purpose !== "verification") return {};
-	return toCents(payment.amount.value) > 0 ? { refundDue: true } : {};
+	return refundsVerification(options, purpose, payment.amount.value) ? { refundDue: true } : {};
 }
 
 /**
@@ -562,8 +562,7 @@ async function refundVerification(
 	const record = await findPaymentRecord(ctx, payment.id);
 	if (!record?.refundDue) return;
 	try {
-		const remaining = payment.amountRemaining;
-		if (!remaining || toCents(remaining.value) > 0) {
+		if (toCents(refundableAmount(payment)) > 0) {
 			await refundPayment(
 				ctx,
 				options,
@@ -768,17 +767,28 @@ async function activateSubscription(
 		// Another row is being changed right now: come back shortly (409).
 		if (covered === "busy") throw new OperationInProgressError(`activate:${initial.id}`);
 		await fence();
-		const result = await activateRow(ctx, initial, payment, plan, customerId, anchor, lock, {
-			isTrial,
-			trialEnd,
-			periodEnd,
-		});
+		const result = await activateRow(
+			ctx,
+			options,
+			initial,
+			payment,
+			plan,
+			customerId,
+			anchor,
+			lock,
+			{
+				isTrial,
+				trialEnd,
+				periodEnd,
+			},
+		);
 		return result;
 	});
 }
 
 async function activateRow(
 	ctx: Ctx,
+	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
 	plan: MolliePlan,
@@ -791,7 +801,7 @@ async function activateRow(
 	let subscription: Subscription | null = initial;
 	for (let attempt = 0; attempt < APPLY_ATTEMPTS && subscription; attempt++) {
 		if (subscription.status !== "incomplete") return { kind: "covered" };
-		await settlePreviousPayment(ctx, subscription, payment);
+		await settlePreviousPayment(ctx, options, subscription, payment);
 		const updated = await guardedUpdate(
 			ctx,
 			subscription.id,
@@ -850,7 +860,7 @@ async function recoverSubscription(
 		if (subscription.cancelAtPeriodEnd) return { kind: "covered" };
 		const periodStart = subscription.periodStart ? new Date(subscription.periodStart) : null;
 		if (periodStart && periodStart >= anchor) return { kind: "covered" };
-		await settlePreviousPayment(ctx, subscription, payment);
+		await settlePreviousPayment(ctx, options, subscription, payment);
 		const updated = await guardedUpdate(
 			ctx,
 			subscription.id,
@@ -1014,7 +1024,7 @@ async function applyRenewal(
 		];
 		if (currentEnd) guards.push(...sameDate("periodEnd", currentEnd));
 		if (switchPlan) guards.push({ field: "pendingPlan", value: pendingPlan });
-		await settlePreviousPayment(ctx, subscription, payment);
+		await settlePreviousPayment(ctx, options, subscription, payment);
 		const updated = await guardedUpdate(
 			ctx,
 			subscription.id,
