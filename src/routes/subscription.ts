@@ -870,7 +870,9 @@ async function createCheckout(
 		const operation = await runOperation(ctx.context, {
 			kind: "create_first_payment",
 			referenceId,
-			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}`,
+			// Everything the checkout charges: an attempt recovered from the
+			// journal must be for this very price.
+			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}:${planCurrency(plan)}`,
 			reuseSucceeded: false,
 			execute: (idempotencyKey) =>
 				gateway.createPayment(

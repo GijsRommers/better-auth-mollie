@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { AUTH_URL, gate, settle, setup, travel } from "../helpers/setup";
+import { AUTH_URL, gate, PLANS, settle, setup, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -76,6 +76,22 @@ describe("subscription.upgrade (new subscription)", () => {
 		const subscriptions = await env.subscriptions();
 		expect(subscriptions).toHaveLength(1);
 		expect(subscriptions[0]?.plan).toBe("business");
+	});
+
+	it("does not recover a lost checkout in another currency", async () => {
+		let currency = "EUR";
+		const env = await setup({
+			subscription: {
+				plans: async () =>
+					PLANS.map((plan) => (plan.name === "starter" ? { ...plan, currency } : plan)),
+			},
+		});
+		env.fake.loseNextResponse("payments.create");
+		await expect(env.checkout("starter")).rejects.toBeTruthy();
+		currency = "USD";
+		const { result, payment } = await env.checkout("starter");
+		expect(payment.amount.currency).toBe("USD");
+		expect(result).toMatchObject({ url: payment.links.checkout?.href });
 	});
 
 	it("creates no checkout for a row that changed while getFirstPaymentParams ran", async () => {
