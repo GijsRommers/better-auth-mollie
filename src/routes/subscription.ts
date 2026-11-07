@@ -4,10 +4,13 @@ import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
 	applyDueTransitions,
+	beforeCancellationTakesEffect,
 	billsIdentity,
+	customerTypeOf,
 	findSubscription,
 	guardedUpdate,
 	lockWaitMs,
+	otherSubscriptionCovers,
 	paymentPurpose,
 	processPayment,
 	reconcileRemote,
@@ -200,6 +203,37 @@ function lockSubscription<T>(
 	});
 }
 
+/**
+ * Runs `op` for a change that may undo the subscription's pending
+ * cancellation (restore, a plan change): then under the billing identity's
+ * lock, after checking that the period has not ended and that no other
+ * subscription took over meanwhile (activation takes the same lock), so the
+ * identity never ends up with two billing subscriptions.
+ */
+async function whileCancellationHolds<T>(
+	ctx: GenericEndpointContext,
+	options: MollieOptions,
+	subscription: Subscription,
+	op: () => Promise<T>,
+): Promise<T> {
+	if (!subscription.cancelAtPeriodEnd) return op();
+	const identity = {
+		referenceId: subscription.referenceId,
+		customerType: await customerTypeOf(ctx, subscription),
+	};
+	return withReferenceLock(ctx, options, identity, async () => {
+		const now = new Date();
+		const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+		if (!periodEnd || periodEnd <= now) {
+			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PERIOD_ENDED);
+		}
+		if (await otherSubscriptionCovers(ctx, identity, subscription.id, now)) {
+			throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ANOTHER_SUBSCRIPTION_ACTIVE);
+		}
+		return op();
+	});
+}
+
 /** Guard for a row update: the row still points at the Mollie subscription we read. */
 function sameRemote(subscription: Subscription): Where[] {
 	return subscription.mollieSubscriptionId
@@ -378,7 +412,7 @@ async function changePlan(
 			current.id,
 			ACCESS_STATUSES,
 			{ pendingPlan: planName, cancelAtPeriodEnd: false },
-			sameRemote(current),
+			[...sameRemote(current), ...beforeCancellationTakesEffect(current)],
 			{ mollieSync: true, lock },
 		);
 		if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
@@ -412,7 +446,11 @@ async function changePlan(
 			cancelAtPeriodEnd: false,
 			...(proration ? { appliedPaymentId: proration.id } : {}),
 		},
-		[...sameRemote(current), ...(proration ? sameAppliedPayment(current) : [])],
+		[
+			...sameRemote(current),
+			...beforeCancellationTakesEffect(current),
+			...(proration ? sameAppliedPayment(current) : []),
+		],
 		{ mollieSync: true, lock },
 	);
 	if (!updated) {
@@ -439,7 +477,7 @@ async function cancelPendingChange(
 		current.id,
 		ACCESS_STATUSES,
 		{ pendingPlan: null, cancelAtPeriodEnd: false },
-		sameRemote(current),
+		[...sameRemote(current), ...beforeCancellationTakesEffect(current)],
 		{ mollieSync: true, lock },
 	);
 	if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
@@ -476,7 +514,11 @@ async function restore(
 		subscription.id,
 		ACCESS_STATUSES,
 		{ cancelAtPeriodEnd: false, pendingPlan: null },
-		[{ field: "cancelAtPeriodEnd", value: true }, ...sameRemote(subscription)],
+		[
+			{ field: "cancelAtPeriodEnd", value: true },
+			...sameRemote(subscription),
+			...beforeCancellationTakesEffect(subscription),
+		],
 		{ mollieSync: true, lock },
 	);
 	if (!updated) throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
@@ -700,12 +742,22 @@ export const upgradeSubscription = (options: MollieOptions) =>
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_ACTIVE);
 					}
 					if (fresh.plan === planName) {
-						if (fresh.pendingPlan) return cancelPendingChange(ctx, options, fresh, lock);
-						if (fresh.cancelAtPeriodEnd) return restore(ctx, options, fresh, lock);
+						if (fresh.pendingPlan) {
+							return whileCancellationHolds(ctx, options, fresh, () =>
+								cancelPendingChange(ctx, options, fresh, lock),
+							);
+						}
+						if (fresh.cancelAtPeriodEnd) {
+							return whileCancellationHolds(ctx, options, fresh, () =>
+								restore(ctx, options, fresh, lock),
+							);
+						}
 						throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.ALREADY_SUBSCRIBED_PLAN);
 					}
 					if (fresh.pendingPlan === planName && !fresh.cancelAtPeriodEnd) return fresh;
-					return changePlan(ctx, options, fresh, plan, customerType, lock);
+					return whileCancellationHolds(ctx, options, fresh, () =>
+						changePlan(ctx, options, fresh, plan, customerType, lock),
+					);
 				});
 				return respond(body.returnUrl ?? body.successUrl);
 			}
@@ -952,7 +1004,7 @@ export const restoreSubscription = (options: MollieOptions) =>
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_NOT_FOUND);
 			}
 			const restored = await lockSubscription(ctx, options, subscription, (fresh, lock) =>
-				restore(ctx, options, fresh, lock),
+				whileCancellationHolds(ctx, options, fresh, () => restore(ctx, options, fresh, lock)),
 			);
 			return ctx.json(withLimits(restored, await getPlans(options)));
 		},

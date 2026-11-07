@@ -477,7 +477,9 @@ export async function withReferenceLock<T>(
 	identity: { referenceId: string; customerType: CustomerType },
 	fn: (fence: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
-	const key = `lock:reference:${identity.customerType}:${identity.referenceId}`;
+	// Per reference, not per type: rows without a customer type match either
+	// identity, so both must be excluded by the same lock.
+	const key = `lock:reference:${identity.referenceId}`;
 	for (let attempt = 0; ; attempt++) {
 		let entered = false;
 		try {
@@ -491,6 +493,47 @@ export async function withReferenceLock<T>(
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 	}
+}
+
+/**
+ * Whether a subscription other than `exceptId` still covers this identity
+ * (looked at over all of the reference's billing rows). Call it under
+ * `withReferenceLock`.
+ */
+export async function otherSubscriptionCovers(
+	ctx: Ctx,
+	identity: { referenceId: string; customerType: CustomerType },
+	exceptId: string,
+	now: Date,
+): Promise<boolean> {
+	for (let offset = 0; ; offset += PAGE_SIZE) {
+		const page = await ctx.context.adapter.findMany<Subscription>({
+			model: "subscription",
+			where: [
+				{ field: "referenceId", value: identity.referenceId },
+				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
+			],
+			sortBy: { field: "id", direction: "asc" },
+			limit: PAGE_SIZE,
+			offset,
+		});
+		const covers = page.some(
+			(other) => other.id !== exceptId && billsIdentity(other, identity) && stillCovers(other, now),
+		);
+		if (covers) return true;
+		if (page.length < PAGE_SIZE) return false;
+	}
+}
+
+/**
+ * Conditions for an update that undoes a pending cancellation (restore, a
+ * plan change): only while the period has not ended, checked by the database
+ * at the moment of the write.
+ */
+export function beforeCancellationTakesEffect(subscription: Subscription): Where[] {
+	return subscription.cancelAtPeriodEnd
+		? [{ field: "periodEnd", operator: "gt", value: new Date() }]
+		: [];
 }
 
 /** Whether another subscription still covers this identity, by its state and the clock. */
@@ -779,21 +822,7 @@ async function activateSubscription(
 		customerType: await customerTypeOf(ctx, initial),
 	};
 	return withReferenceLock(ctx, options, identity, async (fence) => {
-		const others = await ctx.context.adapter.findMany<Subscription>({
-			model: "subscription",
-			where: [
-				{ field: "referenceId", value: initial.referenceId },
-				{ field: "status", operator: "in", value: [...BILLING_STATUSES] },
-			],
-			limit: 20,
-		});
-		const now = new Date();
-		if (
-			others.some(
-				(other) =>
-					other.id !== initial.id && billsIdentity(other, identity) && stillCovers(other, now),
-			)
-		) {
+		if (await otherSubscriptionCovers(ctx, identity, initial.id, new Date())) {
 			return { kind: "covered" };
 		}
 		await fence();

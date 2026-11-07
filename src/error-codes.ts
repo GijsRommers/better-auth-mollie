@@ -27,6 +27,7 @@ export const MOLLIE_ERROR_CODES = defineErrorCodes({
 	SUBSCRIPTION_NOT_ACTIVE: "Subscription is not active",
 	SUBSCRIPTION_NOT_PENDING_CHANGE: "Subscription has no pending cancellation",
 	SUBSCRIPTION_PERIOD_ENDED: "The subscription period has already ended",
+	ANOTHER_SUBSCRIPTION_ACTIVE: "Another subscription is already active for this reference",
 	ORGANIZATION_NOT_FOUND: "Organization not found",
 	ORGANIZATION_SUBSCRIPTION_NOT_ENABLED: "Organization subscription is not enabled",
 	AUTHORIZE_REFERENCE_REQUIRED:

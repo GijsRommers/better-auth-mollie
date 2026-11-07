@@ -1834,3 +1834,175 @@ describe("re-check of 569026d: one subscription per identity, under concurrency"
 		expect((await env.subscription(pending.id)).status).toBe("active");
 	});
 });
+
+describe("re-check of 51a5b35: restores at the deadline, legacy rows, many rows", () => {
+	async function row(env: TestEnv, data: Record<string, unknown>) {
+		return env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				plan: "starter",
+				cancelAtPeriodEnd: false,
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				...data,
+			},
+		});
+	}
+
+	async function paidCheckout(
+		env: TestEnv,
+		pending: { id: string; mollieCustomerId: string },
+		key: string,
+	) {
+		const payment = await env.fake.client.payments.create({
+			idempotencyKey: key,
+			paymentRequest: {
+				amount: { currency: "EUR", value: "9.95" },
+				description: "starter",
+				sequenceType: "first",
+				customerId: pending.mollieCustomerId,
+				redirectUrl: "https://app.example.com/done",
+				metadata: { subscriptionId: pending.id, plan: "starter", purpose: "checkout" },
+			},
+		} as never);
+		env.fake.completePayment(payment.id, "paid");
+		return payment;
+	}
+
+	function pauseNext(env: TestEnv, when: (args: any) => boolean) {
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (when(args)) {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		return { paused, release, restore: () => (adapter.incrementOne = original) };
+	}
+
+	const billing = async (env: TestEnv) =>
+		(await env.subscriptions()).filter(
+			(s) => (s.status === "active" || s.status === "trialing") && !s.cancelAtPeriodEnd,
+		);
+
+	it("never lets a restore at the deadline and another checkout both bill", async () => {
+		const env = await setup();
+		const first = await subscribe(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		const pending = await row(env, {
+			referenceId: first.referenceId,
+			status: "incomplete",
+			mollieCustomerId: first.mollieCustomerId,
+			customerType: "user",
+		});
+		const payment = await paidCheckout(env, pending, "other-checkout");
+		const periodEnd = new Date(first.periodEnd!).getTime();
+		travel(periodEnd - 60_000);
+		const { headers } = await env.signInWithTestUser();
+
+		// The restore is decided just before the period ends, then stalls...
+		const stall = pauseNext(
+			env,
+			(args) => args.model === "subscription" && args.set?.cancelAtPeriodEnd === false,
+		);
+		const restoring = env.api
+			.restoreSubscription({ body: { subscriptionId: first.id }, headers })
+			.catch((error: unknown) => error);
+		await stall.paused;
+		// ...while the period ends and the other checkout's payment arrives.
+		travel(periodEnd + 60_000);
+		await env.webhook(`id=${payment.id}`);
+		stall.release();
+		await restoring;
+		stall.restore();
+		await env.webhook(`id=${payment.id}`);
+
+		expect(await billing(env)).toHaveLength(1);
+		expect(env.fake.activeSubscriptionsFor(first.mollieCustomerId!).length).toBeLessThanOrEqual(1);
+	});
+
+	it("serializes a row without a customer type with typed rows of the same reference", async () => {
+		const env = await setup();
+		const customer = await env.fake.client.customers.create({
+			idempotencyKey: "shared-customer",
+			entityCustomer: { name: "Shared" },
+		} as never);
+		const legacy = await row(env, {
+			referenceId: env.user.id,
+			status: "incomplete",
+			mollieCustomerId: customer.id,
+		});
+		const typed = await row(env, {
+			referenceId: env.user.id,
+			status: "incomplete",
+			mollieCustomerId: customer.id,
+			customerType: "organization",
+		});
+		const legacyPayment = await paidCheckout(env, legacy, "legacy");
+		const typedPayment = await paidCheckout(env, typed, "typed");
+
+		const stall = pauseNext(
+			env,
+			(args) => args.model === "subscription" && args.set?.status === "active",
+		);
+		const first = env.webhook(`id=${legacyPayment.id}`);
+		await stall.paused;
+		const second = env.webhook(`id=${typedPayment.id}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		stall.release();
+		await first;
+		await second;
+		stall.restore();
+		await env.webhook(`id=${typedPayment.id}`);
+
+		expect(await billing(env)).toHaveLength(1);
+		expect(refundedIds(env)).toHaveLength(1);
+	});
+
+	it("finds the covering subscription among many rows", async () => {
+		const env = await setup();
+		const past = new Date(Date.now() - 86_400_000);
+		for (let i = 0; i < 21; i++) {
+			await row(env, {
+				referenceId: env.user.id,
+				status: "active",
+				cancelAtPeriodEnd: true,
+				periodEnd: past,
+				customerType: "user",
+			});
+		}
+		const customer = await env.fake.client.customers.create({
+			idempotencyKey: "many",
+			entityCustomer: { name: "Many" },
+		} as never);
+		await row(env, {
+			referenceId: env.user.id,
+			status: "active",
+			periodEnd: new Date(Date.now() + 20 * 86_400_000),
+			mollieCustomerId: customer.id,
+			customerType: "user",
+		});
+		const pending = await row(env, {
+			referenceId: env.user.id,
+			status: "incomplete",
+			mollieCustomerId: customer.id,
+			customerType: "user",
+		});
+		const payment = await paidCheckout(env, pending, "one-too-many");
+		await env.webhook(`id=${payment.id}`);
+
+		expect(refundedIds(env)).toEqual([payment.id]);
+		expect((await env.subscription(pending.id)).status).toBe("incomplete");
+	});
+});

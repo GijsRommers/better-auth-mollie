@@ -440,7 +440,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `salesInvoices`                                                         |                             | See [Invoices](#invoices)                                                                                                       |
 | `schema`                                                                |                             | Rename tables and fields                                                                                                        |
 
-Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND` and `SUBSCRIPTION_PERIOD_ENDED`.
+Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's names where the meaning is the same, for example `SUBSCRIPTION_NOT_FOUND`, `ALREADY_SUBSCRIBED_PLAN` and `ORGANIZATION_REFERENCE_ID_REQUIRED`. Mollie-specific codes include `PAYMENT_IN_PROGRESS`, `OPERATION_IN_PROGRESS`, `MANDATE_NOT_FOUND`, `SUBSCRIPTION_PERIOD_ENDED` and `ANOTHER_SUBSCRIPTION_ACTIVE`.
 
 ## Compared with @better-auth/stripe
 
