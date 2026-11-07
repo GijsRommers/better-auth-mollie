@@ -10,9 +10,11 @@ import { errorMessage, isMollieApiError } from "./utils";
  * bring Mollie in line with it. The sync reports it.
  */
 export class PlanNotConfiguredError extends Error {
+	readonly plan: string;
 	constructor(plan: string, subscriptionId: string) {
 		super(`Plan "${plan}" of ${subscriptionId} is not configured`);
 		this.name = "PlanNotConfiguredError";
+		this.plan = plan;
 	}
 }
 

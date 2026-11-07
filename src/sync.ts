@@ -291,12 +291,21 @@ export async function syncSubscription(
 	const errors: string[] = [];
 	let checkedRemote = false;
 	let certain = true;
+	// A plan missing from the configuration, once per run: it does not hold
+	// up the decisions here, which do not need it.
+	const missingPlans = new Set<string>();
+	const reportMissingPlan = (error: PlanNotConfiguredError) => {
+		if (missingPlans.has(error.plan)) return;
+		missingPlans.add(error.plan);
+		errors.push(error.message);
+		ctx.context.logger.error(`[mollie] ${error.message}`);
+	};
 	const step = async (label: string, fn: () => Promise<void>) => {
 		try {
 			await fn();
 		} catch (error) {
-			// Reported below on its own, and no reason to doubt the payments.
-			if (error instanceof PlanNotConfiguredError) return;
+			// No reason to doubt the payments.
+			if (error instanceof PlanNotConfiguredError) return reportMissingPlan(error);
 			certain = false;
 			if (!(error instanceof OperationInProgressError)) {
 				errors.push(`${label}: ${errorMessage(error)}`);
@@ -327,14 +336,21 @@ export async function syncSubscription(
 		});
 	}
 	const seen = (await reload(ctx, initial.id)) ?? initial;
-	// A plan missing from the configuration, on every run until it is back.
-	// It does not hold up the decisions below, which do not need it.
+	// Reported on every run until it is back (also for an unpaid row, which
+	// Mollie is not brought in line for). A failing `plans` provider is
+	// reported too, and holds up nothing that does not need a plan.
 	if (BILLING_STATUSES.includes(seen.status)) {
 		for (const name of new Set([seen.plan, seen.pendingPlan])) {
-			if (!name || (await getPlanByName(options, name))) continue;
-			const message = new PlanNotConfiguredError(name, seen.id).message;
-			errors.push(message);
-			ctx.context.logger.error(`[mollie] ${message}`);
+			if (!name) continue;
+			try {
+				if (!(await getPlanByName(options, name))) {
+					reportMissingPlan(new PlanNotConfiguredError(name, seen.id));
+				}
+			} catch (error) {
+				errors.push(`plans: ${errorMessage(error)}`);
+				ctx.context.logger.error(`[mollie] Loading plans failed: ${errorMessage(error)}`);
+				break;
+			}
 		}
 	}
 	// Customer charges found here; handed to reconciling below so it does not

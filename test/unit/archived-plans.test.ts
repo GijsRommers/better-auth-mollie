@@ -171,7 +171,50 @@ describe("archived plans", () => {
 			remove();
 			travel(new Date(subscription.periodEnd!).getTime() + 15 * 24 * 3_600_000);
 			reportsPlan(await syncMollieSubscriptions(env.auth as never));
-			expect((await env.subscription(subscription.id)).status).not.toBe("active");
+			// Past due once the grace period after periodEnd ran out, so unpaid at once.
+			expect((await env.subscription(subscription.id)).status).toBe("unpaid");
+		});
+
+		it("is reported when the plan disappears during the sync", async () => {
+			let current = PLANS;
+			let armed = false;
+			const env = await setup({
+				subscription: {
+					plans: async () => {
+						const plans = current;
+						// The first lookup of the sync still sees it, later ones do not.
+						if (armed) current = PLANS.filter((plan) => plan.name !== "starter");
+						return plans;
+					},
+				},
+			});
+			const subscription = await subscribe(env);
+			travel(new Date(subscription.periodEnd!).getTime() - 12 * 3_600_000);
+			armed = true;
+			reportsPlan(await syncMollieSubscriptions(env.auth as never));
+		});
+
+		it("keeps a cancellation going when loading plans fails", async () => {
+			let failing = false;
+			const env = await setup({
+				subscription: {
+					plans: async () => {
+						if (failing) throw new Error("plans are down");
+						return PLANS;
+					},
+				},
+			});
+			const subscription = await subscribe(env);
+			env.fake.failNext("subscriptions.cancel", new TypeError("fetch failed"));
+			await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+			expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
+
+			failing = true;
+			const result = await syncMollieSubscriptions(env.auth as never);
+			expect(result.errors.map((e) => e.message)).toContainEqual(
+				expect.stringContaining("plans are down"),
+			);
+			expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
 		});
 
 		it("is reported while unpaid", async () => {
