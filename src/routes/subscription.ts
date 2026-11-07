@@ -105,6 +105,7 @@ async function findOpenCheckout(
 	options: MollieOptions,
 	subscription: Subscription,
 	match: { plan: string; amount: string; purpose: PaymentPurpose },
+	lock: SubscriptionLock,
 ): Promise<{ url?: string; activated?: boolean }> {
 	const gateway = gatewayFor(options);
 	const attempts = await ctx.context.adapter.findMany<MolliePaymentRecord>({
@@ -128,7 +129,7 @@ async function findOpenCheckout(
 		) {
 			return { url };
 		}
-		const result = await processPayment(ctx, options, payment);
+		const result = await processPayment(ctx, options, payment, { lock, reconcile: true });
 		dispatchEvents(ctx, options, result.events);
 		if (result.subscription?.status === "active" || result.subscription?.status === "trialing") {
 			return { activated: true };
@@ -539,8 +540,13 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					: undefined;
 			}
 
+			/**
+			 * Issues (or reuses) a checkout for `candidate`, under its lock and on
+			 * the row as it is now, so it is serialized with the payments that
+			 * activate it and with the sync that expires it.
+			 */
 			const checkout = async (
-				row: Subscription,
+				candidate: Subscription,
 				input: { purpose: PaymentPurpose; trialDays: number; customerId: string },
 			) => {
 				const tax = await resolveTax(ctx, options, { referenceId, customerType, plan });
@@ -548,51 +554,82 @@ export const upgradeSubscription = (options: MollieOptions) =>
 					input.purpose === "verification"
 						? (config.verificationAmount ?? DEFAULT_VERIFICATION_AMOUNT)
 						: chargeAmount(plan, tax);
-				const open = await findOpenCheckout(ctx, options, row, {
-					plan: planName,
-					amount,
-					purpose: input.purpose,
-				});
-				if (open.activated) return respond(body.successUrl);
-				if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
-				// Processing earlier attempts may have moved the row on.
-				let target = (await findSubscription(ctx, [{ field: "id", value: row.id }])) ?? row;
-				if (input.purpose === "recovery") {
-					if (target.status !== "past_due" && target.status !== "unpaid") {
-						return respond(body.successUrl);
+				const recovery = input.purpose === "recovery";
+				const settled = (row: Subscription) =>
+					recovery
+						? (row.status !== "past_due" && row.status !== "unpaid") || !!row.cancelAtPeriodEnd
+						: row.status === "active" || row.status === "trialing";
+				return lockSubscription(ctx, candidate, async (fresh, lock) => {
+					let row = fresh;
+					// Activated (another tab, the webhook) or recovered meanwhile.
+					if (settled(row)) return respond(body.successUrl);
+					if (row.status === "incomplete") {
+						const differs =
+							row.plan !== planName ||
+							row.mollieCustomerId !== input.customerId ||
+							row.customerType !== customerType;
+						if (differs) {
+							const updated = await guardedUpdate(
+								ctx,
+								row.id,
+								["incomplete"],
+								{ plan: planName, mollieCustomerId: input.customerId, customerType },
+								[],
+								{ lock },
+							);
+							if (!updated) {
+								throw APIError.from("CONFLICT", MOLLIE_ERROR_CODES.OPERATION_IN_PROGRESS);
+							}
+							row = updated;
+						}
 					}
-				} else if (target.status === "active" || target.status === "trialing") {
-					// Activated meanwhile (another tab, the webhook): nothing to pay.
-					return respond(body.successUrl);
-				} else if (target.status === "incomplete_expired") {
-					target = await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
-						model: "subscription",
-						data: {
-							referenceId,
-							plan: planName,
-							status: "incomplete",
-							mollieCustomerId: input.customerId,
-							customerType,
-							cancelAtPeriodEnd: false,
-							createdAt: new Date(),
-							updatedAt: new Date(),
-						},
+					if (row.status === "incomplete" || recovery) {
+						const open = await findOpenCheckout(
+							ctx,
+							options,
+							row,
+							{ plan: planName, amount, purpose: input.purpose },
+							lock,
+						);
+						if (open.activated) return respond(body.successUrl);
+						if (open.url) return ctx.json({ url: open.url, redirect: !body.disableRedirect });
+						// Processing earlier attempts may have moved the row on.
+						row = (await findSubscription(ctx, [{ field: "id", value: row.id }])) ?? row;
+						if (settled(row)) return respond(body.successUrl);
+					}
+					let target = row;
+					if (!recovery && row.status !== "incomplete") {
+						// The checkout expired meanwhile: start over on a new row.
+						target = await ctx.context.adapter.create<Omit<Subscription, "id">, Subscription>({
+							model: "subscription",
+							data: {
+								referenceId,
+								plan: planName,
+								status: "incomplete",
+								mollieCustomerId: input.customerId,
+								customerType,
+								cancelAtPeriodEnd: false,
+								createdAt: new Date(),
+								updatedAt: new Date(),
+							},
+						});
+					}
+					await lock.fence();
+					const url = await createCheckout(ctx, options, {
+						row: target,
+						plan,
+						amount,
+						tax,
+						purpose: input.purpose,
+						trialDays: input.trialDays,
+						customerId: input.customerId,
+						referenceId,
+						body,
+						user,
+						session,
 					});
-				}
-				const url = await createCheckout(ctx, options, {
-					row: target,
-					plan,
-					amount,
-					tax,
-					purpose: input.purpose,
-					trialDays: input.trialDays,
-					customerId: input.customerId,
-					referenceId,
-					body,
-					user,
-					session,
+					return ctx.json({ url, redirect: !body.disableRedirect });
 				});
-				return ctx.json({ url, redirect: !body.disableRedirect });
 			};
 
 			if (current) {
@@ -637,29 +674,12 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			// New subscription: checkout for the first (mandate) payment.
 			const customerId = await getOrCreateCustomer(ctx, options, { customerType, referenceId });
 			const { adapter } = ctx.context;
+			// Reuse the pending row (updated under its lock in `checkout`), or start one.
 			let row =
 				target?.status === "incomplete"
 					? target
 					: subscriptions.find((s) => s.status === "incomplete");
-			if (row) {
-				if (
-					row.plan !== planName ||
-					row.mollieCustomerId !== customerId ||
-					row.customerType !== customerType
-				) {
-					row =
-						(await adapter.update<Subscription>({
-							model: "subscription",
-							where: [{ field: "id", value: row.id }],
-							update: {
-								plan: planName,
-								mollieCustomerId: customerId,
-								customerType,
-								updatedAt: new Date(),
-							},
-						})) ?? row;
-				}
-			} else {
+			if (!row) {
 				row = await adapter.create<Omit<Subscription, "id">, Subscription>({
 					model: "subscription",
 					data: {

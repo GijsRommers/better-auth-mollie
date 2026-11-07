@@ -40,6 +40,7 @@ import {
 	addDays,
 	addInterval,
 	billingCycle,
+	CHARGE_DATE_SLACK_MS,
 	ceilToUTCDate,
 	errorMessage,
 	fromMollieDate,
@@ -863,12 +864,30 @@ async function applyRenewal(
 		// for a period the customer canceled, so it is refunded.
 		if (subscription.cancelAtPeriodEnd) return { kind: "covered" };
 		if (!cycle) {
-			const remote = await gatewayFor(options).getSubscription(customerId, remoteId);
-			cycle = billingCycle(
-				fromMollieDate(remote.startDate),
-				remote.interval,
-				new Date(payment.createdAt),
-			);
+			const createdAt = new Date(payment.createdAt);
+			const remote = await gatewayFor(options)
+				.getSubscription(customerId, remoteId)
+				.catch((error: unknown) => {
+					if (isMollieNotFound(error)) return null;
+					throw error;
+				});
+			if (remote) {
+				cycle = billingCycle(fromMollieDate(remote.startDate), remote.interval, createdAt);
+			} else {
+				// Gone at Mollie: it pays the cycle that follows what is paid for.
+				const paidThrough = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+				const plan = await getPlanByName(
+					options,
+					typeof billedPlan === "string"
+						? billedPlan
+						: (subscription.pendingPlan ?? subscription.plan),
+				);
+				if (!paidThrough || !plan) return { kind: "unresolved" };
+				if (createdAt.getTime() < paidThrough.getTime() - CHARGE_DATE_SLACK_MS) {
+					return { kind: "covered" };
+				}
+				cycle = billingCycle(paidThrough, plan.interval, createdAt);
+			}
 		}
 		const currentEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 		if (
@@ -944,7 +963,9 @@ async function applyFailedRenewal(
 		if (remote) {
 			const cycle = billingCycle(fromMollieDate(remote.startDate), remote.interval, createdAt);
 			if (periodEnd && cycle.end <= periodEnd) return null;
-		} else if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) {
+		} else if (periodEnd && createdAt.getTime() < periodEnd.getTime() - CHARGE_DATE_SLACK_MS) {
+			// Gone at Mollie: a charge from before the paid-through date was for a
+			// cycle that is paid.
 			return null;
 		}
 	} else if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) {
@@ -1110,20 +1131,21 @@ export async function settleRecentCharges(
 	subscription: Subscription,
 	remoteId: string | null | undefined = subscription.mollieSubscriptionId,
 	lock?: SubscriptionLock,
-): Promise<{ inProgress: boolean; processed: boolean }> {
+): Promise<Settlement> {
 	const customerId = subscription.mollieCustomerId;
-	if (!customerId || !remoteId) return { inProgress: false, processed: false };
+	const nothing: Settlement = { inProgress: false, processed: false, errors: [] };
+	if (!customerId || !remoteId) return nothing;
 	let recent: MolliePayment[];
 	try {
 		recent = await gatewayFor(options).listSubscriptionPayments(customerId, remoteId, 5);
 	} catch (error) {
-		if (isMollieNotFound(error)) return { inProgress: false, processed: false };
+		if (isMollieNotFound(error)) return nothing;
 		throw error;
 	}
 	if (recent.some((p) => !isFinalPaymentStatus(p.status as string))) {
-		return { inProgress: true, processed: false };
+		return { ...nothing, inProgress: true };
 	}
-	return { inProgress: false, processed: await processUnsettled(ctx, options, recent, lock) };
+	return processUnsettled(ctx, options, recent, lock);
 }
 
 /**
@@ -1150,16 +1172,32 @@ async function processUnsettled(
 	options: MollieOptions,
 	payments: MolliePayment[],
 	lock: SubscriptionLock | undefined,
-): Promise<boolean> {
-	let processed = false;
+): Promise<Settlement> {
+	const settlement: Settlement = { inProgress: false, processed: false, errors: [] };
 	for (const payment of payments) {
 		if (!(await isUnsettled(ctx, payment))) continue;
-		const result = await processPayment(ctx, options, payment, { lock, reconcile: !lock });
-		dispatchEvents(ctx, options, result.events);
-		processed = true;
+		// Each payment on its own: one that cannot be processed now does not
+		// stop the others. It stays outstanding (and counts as in progress).
+		try {
+			const result = await processPayment(ctx, options, payment, { lock, reconcile: !lock });
+			dispatchEvents(ctx, options, result.events);
+			settlement.processed = true;
+		} catch (error) {
+			settlement.inProgress = true;
+			if (!(error instanceof OperationInProgressError)) {
+				settlement.errors.push(`${payment.id}: ${errorMessage(error)}`);
+			}
+		}
 	}
-	return processed;
+	return settlement;
 }
+
+/**
+ * Result of bringing charges up to date: whether one is still in progress
+ * (or could not be processed now), whether anything was processed, and the
+ * errors of payments that could not be processed.
+ */
+export type Settlement = { inProgress: boolean; processed: boolean; errors: string[] };
 
 /** How far back charges of a customer are looked for (SEPA can take days to settle). */
 const DISCOVERY_DAYS = 35;
@@ -1177,9 +1215,9 @@ export async function settleCustomerCharges(
 	subscription: Subscription,
 	now: Date,
 	lock?: SubscriptionLock,
-): Promise<{ inProgress: boolean; processed: boolean }> {
+): Promise<Settlement> {
 	const customerId = subscription.mollieCustomerId;
-	if (!customerId) return { inProgress: false, processed: false };
+	if (!customerId) return { inProgress: false, processed: false, errors: [] };
 	const ours = (
 		await gatewayFor(options).listRecentCustomerPayments(customerId, addDays(now, -DISCOVERY_DAYS))
 	).filter(
@@ -1189,7 +1227,8 @@ export async function settleCustomerCharges(
 	);
 	const inProgress = ours.some((payment) => !isFinalPaymentStatus(payment.status as string));
 	const final = ours.filter((payment) => isFinalPaymentStatus(payment.status as string));
-	return { inProgress, processed: await processUnsettled(ctx, options, final, lock) };
+	const settlement = await processUnsettled(ctx, options, final, lock);
+	return { ...settlement, inProgress: settlement.inProgress || inProgress };
 }
 
 /** Mollie subscription creations for this row that may still be in flight. */
@@ -1517,17 +1556,26 @@ export async function reconcileMollieSubscription(
 	options: MollieOptions,
 	subscription: Subscription,
 	mollieSubscription: MollieSubscription,
+	lock?: SubscriptionLock,
 ): Promise<BillingEvent[]> {
 	if (mollieSubscription.id !== subscription.mollieSubscriptionId) return [];
 	const implied = mapMollieSubscriptionStatus(mollieSubscription.status as string);
 	const sameRemote: Where[] = [{ field: "mollieSubscriptionId", value: mollieSubscription.id }];
 	if (implied === "past_due") {
-		await guardedUpdate(ctx, subscription.id, ["trialing", "active"], { status: "past_due" }, [
-			...sameRemote,
-			...(subscription.periodEnd
-				? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }]
-				: []),
-		]);
+		await guardedUpdate(
+			ctx,
+			subscription.id,
+			["trialing", "active"],
+			{ status: "past_due" },
+			[
+				...sameRemote,
+				{ field: "cancelAtPeriodEnd", value: false },
+				...(subscription.periodEnd
+					? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }]
+					: []),
+			],
+			{ lock },
+		);
 		return [];
 	}
 	if (implied !== "canceled" || subscription.cancelAtPeriodEnd) return [];
@@ -1541,7 +1589,7 @@ export async function reconcileMollieSubscription(
 			["past_due", "unpaid"],
 			{ status: "canceled", pendingPlan: null },
 			sameRemote,
-			{ mollieSync: true },
+			{ mollieSync: true, lock },
 		);
 		if (!canceled) return [];
 		const plan = await getPlanByName(options, canceled.plan);
@@ -1556,6 +1604,7 @@ export async function reconcileMollieSubscription(
 			["trialing", "active"],
 			{ cancelAtPeriodEnd: true, pendingPlan: null },
 			sameRemote,
+			{ lock },
 		);
 	}
 	return [];
@@ -1576,6 +1625,7 @@ export async function applyTimeTransitions(
 	options: MollieOptions,
 	subscription: Subscription,
 	now: Date,
+	lock?: SubscriptionLock,
 ): Promise<{ subscription: Subscription; events: BillingEvent[] }> {
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	if (!periodEnd || !BILLING_STATUSES.includes(subscription.status)) {
@@ -1593,7 +1643,7 @@ export async function applyTimeTransitions(
 				{ field: "cancelAtPeriodEnd", value: true },
 				{ field: "periodEnd", value: periodEnd },
 			],
-			{ mollieSync: true },
+			{ mollieSync: true, lock },
 		);
 		if (!canceled) return { subscription, events: [] };
 		const plan = await getPlanByName(options, canceled.plan);
@@ -1616,13 +1666,19 @@ export async function applyTimeTransitions(
 				{ field: "pendingPlan", value: subscription.pendingPlan },
 				{ field: "periodEnd", value: periodEnd },
 			],
+			{ lock },
 		);
-		if (switched) return applyTimeTransitions(ctx, options, switched, now);
+		if (switched) return applyTimeTransitions(ctx, options, switched, now, lock);
 	}
 	if (subscription.status === "past_due" && now >= addDays(periodEnd, gracePeriodDays(options))) {
-		const unpaid = await guardedUpdate(ctx, subscription.id, ["past_due"], { status: "unpaid" }, [
-			{ field: "periodEnd", value: periodEnd },
-		]);
+		const unpaid = await guardedUpdate(
+			ctx,
+			subscription.id,
+			["past_due"],
+			{ status: "unpaid" },
+			[{ field: "periodEnd", value: periodEnd }],
+			{ lock },
+		);
 		return { subscription: unpaid ?? subscription, events: [] };
 	}
 	return { subscription, events: [] };
@@ -1642,6 +1698,7 @@ async function cancelOrphans(
 	options: MollieOptions,
 	subscription: Subscription,
 	now: Date,
+	lock: SubscriptionLock,
 ): Promise<void> {
 	const customerId = subscription.mollieCustomerId;
 	if (!customerId) return;
@@ -1652,6 +1709,7 @@ async function cancelOrphans(
 		ctx.context.logger.warn(
 			`[mollie] Canceling orphaned Mollie subscription ${remote.id} of ${subscription.id}`,
 		);
+		await lock.fence();
 		await cancelMollieSubscription(ctx, options, {
 			...subscription,
 			mollieSubscriptionId: remote.id,
@@ -1732,105 +1790,126 @@ export async function syncSubscription(
 ): Promise<{ events: BillingEvent[]; checkedRemote: boolean; errors: string[] }> {
 	const gateway = gatewayFor(options);
 	const events: BillingEvent[] = [];
-	let checkedRemote = false;
-
-	// One payment that cannot be processed now must not hold up the rest of
-	// this subscription's sync; its error is reported and it is retried.
 	const errors: string[] = [];
+	let checkedRemote = false;
+	// Each step on its own: one that cannot be done now (a payment that fails
+	// to process, Mollie unreachable) is reported and retried by the next
+	// sync, and does not hold up the others. A busy subscription is skipped.
+	const step = async (label: string, fn: () => Promise<void>) => {
+		try {
+			await fn();
+		} catch (error) {
+			if (error instanceof OperationInProgressError) return;
+			errors.push(`${label}: ${errorMessage(error)}`);
+		}
+	};
+	const collect = (settlement: Settlement) => errors.push(...settlement.errors);
+
 	for (const record of await outstandingPayments(ctx, initial.id)) {
 		checkedRemote = true;
-		try {
-			const result = await processPayment(
-				ctx,
-				options,
-				await gateway.getPayment(record.molliePaymentId),
-			);
-			events.push(...result.events);
-		} catch (error) {
-			if (error instanceof OperationInProgressError) continue;
-			errors.push(`${record.molliePaymentId}: ${errorMessage(error)}`);
-		}
+		await step(record.molliePaymentId, async () => {
+			const payment = await gateway.getPayment(record.molliePaymentId);
+			events.push(...(await processPayment(ctx, options, payment)).events);
+		});
 	}
 
-	let subscription = (checkedRemote ? await reload(ctx, initial.id) : initial) ?? initial;
-	if (subscription.status === "incomplete") {
-		await expireCheckout(ctx, subscription);
-		return { events, checkedRemote, errors };
-	}
-	if (BILLING_STATUSES.includes(subscription.status)) {
-		const timed = await applyTimeTransitions(ctx, options, subscription, now);
-		events.push(...timed.events);
-		subscription = timed.subscription;
-	}
-	if (!BILLING_STATUSES.includes(subscription.status)) {
-		// Ended: make sure nothing at Mollie still bills it (e.g. a cancellation
-		// that failed at Mollie, or a replacement whose creation was lost).
-		if (subscription.mollieSyncNeeded) {
-			checkedRemote = true;
-			await ensureRemote(ctx, options, subscription.id, now);
-		}
-		return { events, checkedRemote, errors };
-	}
-	const customerId = subscription.mollieCustomerId;
-	if (!customerId) return { events, checkedRemote, errors };
-
-	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
-	const stable =
-		(subscription.status === "active" || subscription.status === "trialing") &&
-		!subscription.mollieSyncNeeded;
-	if (stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS) {
-		return { events, checkedRemote, errors };
-	}
-
-	checkedRemote = true;
-	if (subscription.mollieSubscriptionId) {
-		try {
-			const mollieSubscription = await gateway.getSubscription(
-				customerId,
-				subscription.mollieSubscriptionId,
-			);
-			events.push(
-				...(await reconcileMollieSubscription(ctx, options, subscription, mollieSubscription)),
-			);
-		} catch (error) {
-			if (!isMollieNotFound(error)) throw error;
-		}
-		const recent = await gateway
-			.listSubscriptionPayments(customerId, subscription.mollieSubscriptionId)
-			.catch((error: unknown) => {
-				if (isMollieNotFound(error)) return [];
-				throw error;
-			});
-		for (const payment of recent) {
-			if (await isUnsettled(ctx, payment)) {
-				events.push(...(await processPayment(ctx, options, payment)).events);
+	// Everything else under the subscription's lock, on the row as it is now,
+	// so no decision below acts on a stale read.
+	await step(initial.id, () =>
+		withSubscriptionLock(ctx, initial.id, async (lock) => {
+			let subscription = await reload(ctx, initial.id);
+			if (!subscription) return;
+			if (subscription.status === "incomplete") {
+				await expireCheckout(ctx, subscription, lock);
+				return;
 			}
-		}
-	}
-	// Charges for this row by a stray or replaced Mollie subscription, or
-	// pro-rata charges, whose webhook never arrived.
-	await settleCustomerCharges(ctx, options, subscription, now);
-	// First adopt or create the right Mollie subscription (this also finishes
-	// an interrupted change), then cancel anything else tagged for this row.
-	subscription = (await ensureRemote(ctx, options, subscription.id, now)) ?? subscription;
-	await cancelOrphans(ctx, options, subscription, now);
+			if (BILLING_STATUSES.includes(subscription.status)) {
+				const timed = await applyTimeTransitions(ctx, options, subscription, now, lock);
+				events.push(...timed.events);
+				subscription = timed.subscription;
+			}
+			if (!BILLING_STATUSES.includes(subscription.status)) {
+				// Ended: make sure nothing at Mollie still bills it (e.g. a cancellation
+				// that failed at Mollie, or a replacement whose creation was lost).
+				if (subscription.mollieSyncNeeded) {
+					checkedRemote = true;
+					await reconcileRemote(ctx, options, subscription, now, lock);
+				}
+				return;
+			}
+			const customerId = subscription.mollieCustomerId;
+			if (!customerId) return;
 
-	const grace = gracePeriodDays(options);
-	if (
-		(subscription.status === "active" || subscription.status === "trialing") &&
-		!subscription.cancelAtPeriodEnd &&
-		subscription.periodEnd &&
-		now >= addDays(new Date(subscription.periodEnd), grace)
-	) {
-		// No paid renewal long after the period ended: treat as delinquent, unless
-		// a renewal (or a cancellation) landed since this was read.
-		subscription =
-			(await guardedUpdate(ctx, subscription.id, ["trialing", "active"], { status: "past_due" }, [
-				{ field: "periodEnd", value: new Date(subscription.periodEnd) },
-				{ field: "cancelAtPeriodEnd", value: false },
-			])) ?? subscription;
-	}
-	events.push(...(await applyTimeTransitions(ctx, options, subscription, now)).events);
+			const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
+			const stable =
+				(subscription.status === "active" || subscription.status === "trialing") &&
+				!subscription.mollieSyncNeeded;
+			if (stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS) return;
+
+			checkedRemote = true;
+			const current = subscription;
+			if (current.mollieSubscriptionId) {
+				const remoteId = current.mollieSubscriptionId;
+				await step("mollie subscription", async () => {
+					try {
+						const mollieSubscription = await gateway.getSubscription(customerId, remoteId);
+						events.push(
+							...(await reconcileMollieSubscription(
+								ctx,
+								options,
+								current,
+								mollieSubscription,
+								lock,
+							)),
+						);
+					} catch (error) {
+						if (!isMollieNotFound(error)) throw error;
+					}
+				});
+				await step("recent charges", async () => {
+					collect(await settleRecentCharges(ctx, options, current, remoteId, lock));
+				});
+			}
+			// Charges for this row by a stray or replaced Mollie subscription, or
+			// pro-rata charges, whose webhook never arrived.
+			await step("charges", async () => {
+				collect(await settleCustomerCharges(ctx, options, current, now, lock));
+			});
+			// First adopt or create the right Mollie subscription (this also finishes
+			// an interrupted change), then cancel anything else tagged for this row.
+			await step("mollie", async () => {
+				const fresh = (await reload(ctx, initial.id)) ?? current;
+				subscription = await reconcileRemote(ctx, options, fresh, now, lock);
+			});
+			await step("orphans", async () => {
+				await cancelOrphans(ctx, options, subscription ?? current, now, lock);
+			});
+
+			let latest = (await reload(ctx, initial.id)) ?? current;
+			const grace = gracePeriodDays(options);
+			if (
+				(latest.status === "active" || latest.status === "trialing") &&
+				!latest.cancelAtPeriodEnd &&
+				latest.periodEnd &&
+				now >= addDays(new Date(latest.periodEnd), grace)
+			) {
+				// No paid renewal long after the period ended: treat as delinquent.
+				latest =
+					(await guardedUpdate(
+						ctx,
+						latest.id,
+						["trialing", "active"],
+						{ status: "past_due" },
+						[
+							{ field: "periodEnd", value: new Date(latest.periodEnd) },
+							{ field: "cancelAtPeriodEnd", value: false },
+						],
+						{ lock },
+					)) ?? latest;
+			}
+			events.push(...(await applyTimeTransitions(ctx, options, latest, now, lock)).events);
+		}),
+	);
 	return { events, checkedRemote, errors };
 }
 

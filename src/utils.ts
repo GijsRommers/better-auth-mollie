@@ -54,7 +54,7 @@ export function addInterval(date: Date, interval: MollieInterval | string, times
  * which can be the previous evening in UTC; retries come later the same
  * cycle. Shifting by half a day puts every payment in the right cycle.
  */
-const CHARGE_DATE_SLACK_MS = 12 * 60 * 60 * 1000;
+export const CHARGE_DATE_SLACK_MS = 12 * 60 * 60 * 1000;
 
 /**
  * The billing cycle a subscription payment pays for: the cycle of the Mollie

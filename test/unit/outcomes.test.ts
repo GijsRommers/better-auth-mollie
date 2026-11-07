@@ -1226,7 +1226,7 @@ describe("re-check of 8640b0f: vanished Mollie subscriptions, overdue races", ()
 		expect((await syncMollieSubscriptions(env.auth as never)).errors).toEqual([]);
 	});
 
-	it("does not mark a subscription overdue after a renewal landed during the sync", async () => {
+	it("never lets the sync's overdue decision overwrite a renewal", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env);
 		const periodEnd = new Date(subscription.periodEnd!);
@@ -1253,14 +1253,152 @@ describe("re-check of 8640b0f: vanished Mollie subscriptions, overdue races", ()
 		};
 		const sync = syncMollieSubscriptions(env.auth as never);
 		await paused;
+		// The sync holds the subscription: the renewal's delivery is told to come
+		// back (Mollie retries) instead of being overwritten.
 		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
-		await env.webhook(`id=${renewal.id}`);
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(409);
 		release();
 		await sync;
 		adapter.incrementOne = original;
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(200);
 
 		const row = await env.subscription(subscription.id);
 		expect(row.status).toBe("active");
 		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+	});
+});
+
+describe("re-check of ff9b5be: vanished subscriptions, checkout races", () => {
+	/** Pauses the first matching write (adapter `update` or `incrementOne`) until released. */
+	function pauseSubscriptionWrite(env: TestEnv, when: (set: any) => boolean) {
+		const adapter = env.context.adapter as any;
+		const originals = {
+			update: adapter.update.bind(adapter),
+			incrementOne: adapter.incrementOne.bind(adapter),
+		};
+		let armed = true;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		const wrap = (name: "update" | "incrementOne") => async (args: any) => {
+			const set = name === "update" ? args.update : args.set;
+			if (armed && args.model === "subscription" && set && when(set)) {
+				armed = false;
+				reached();
+				await gate;
+			}
+			return originals[name](args);
+		};
+		adapter.update = wrap("update");
+		adapter.incrementOne = wrap("incrementOne");
+		return {
+			paused,
+			release,
+			restore: () => {
+				adapter.update = originals.update;
+				adapter.incrementOne = originals.incrementOne;
+			},
+		};
+	}
+
+	it("judges a replayed failure by the paid-through date when the Mollie subscription is gone", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		adapter.incrementOne = async (args: any) => {
+			const result = await original(args);
+			if (args.model === "subscription" && args.set?.status === "past_due") {
+				adapter.incrementOne = original;
+				throw new Error("process stopped");
+			}
+			return result;
+		};
+		await env.webhook(`id=${failed.id}`);
+		adapter.incrementOne = original;
+		const retry = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${retry.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+
+		env.fake.subscriptions.delete(subscription.mollieSubscriptionId!);
+		await env.webhook(`id=${failed.id}`);
+		expect((await env.subscription(subscription.id)).status).toBe("active");
+	});
+
+	it("applies a paid renewal whose Mollie subscription is gone, without stopping the sync", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "open");
+		await env.webhook(`id=${renewal.id}`);
+		env.fake.subscriptions.delete(subscription.mollieSubscriptionId!);
+		env.fake.completePayment(renewal.id, "paid");
+
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors).toEqual([]);
+		const row = await env.subscription(subscription.id);
+		expect(row.appliedPaymentId).toBe(renewal.id);
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+	});
+
+	it("never grants a plan by reusing a checkout that was activated meanwhile", async () => {
+		const env = await setup();
+		const { payment: starter } = await env.checkout("starter");
+		env.fake.completePayment(starter.id, "paid");
+
+		// A checkout for business starts on the same pending row and stalls
+		// right before switching its plan; meanwhile the starter payment lands.
+		const stall = pauseSubscriptionWrite(env, (set) => set.plan === "business");
+		const business = env.api
+			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		await stall.paused;
+		await env.webhook(`id=${starter.id}`);
+		stall.release();
+		await business;
+		stall.restore();
+		await env.webhook(`id=${starter.id}`);
+
+		const [row] = await env.subscriptions();
+		expect(row).toMatchObject({ status: "active", plan: "starter" });
+		const [remote] = env.fake.activeSubscriptionsFor(row!.mollieCustomerId!);
+		expect(remote?.metadata).toMatchObject({ plan: "starter" });
+	});
+
+	it("never expires a checkout row while a new checkout is being issued for it", async () => {
+		const env = await setup();
+		const { payment: first } = await env.checkout("starter");
+		env.fake.completePayment(first.id, "failed");
+
+		// The sync finds the failed attempt and is about to expire the row...
+		const stall = pauseSubscriptionWrite(env, (set) => set.status === "incomplete_expired");
+		const sync = syncMollieSubscriptions(env.auth as never);
+		await stall.paused;
+		// ...while the customer starts another checkout.
+		const during = await env.api
+			.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers })
+			.catch((error: unknown) => error);
+		stall.release();
+		await sync;
+		stall.restore();
+		if (during instanceof Error) {
+			await env.api.upgradeSubscription({ body: { plan: "starter" }, headers: env.headers });
+		}
+
+		const latest = [...env.fake.payments.values()].at(-1)!;
+		expect(latest.id).not.toBe(first.id);
+		env.fake.completePayment(latest.id, "paid");
+		await env.webhook(`id=${latest.id}`);
+		expect(refundedIds(env)).toEqual([]);
+		const active = (await env.subscriptions()).filter((s) => s.status === "active");
+		expect(active).toHaveLength(1);
 	});
 });
