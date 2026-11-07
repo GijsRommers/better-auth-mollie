@@ -934,9 +934,19 @@ async function applyFailedRenewal(
 		if (payment.subscriptionId !== subscription.mollieSubscriptionId) return null;
 		const customerId = payment.customerId ?? subscription.mollieCustomerId;
 		if (!customerId) return null;
-		const remote = await gatewayFor(options).getSubscription(customerId, payment.subscriptionId);
-		const cycle = billingCycle(fromMollieDate(remote.startDate), remote.interval, createdAt);
-		if (periodEnd && cycle.end <= periodEnd) return null;
+		let remote: MollieSubscription | null = null;
+		try {
+			remote = await gatewayFor(options).getSubscription(customerId, payment.subscriptionId);
+		} catch (error) {
+			// Gone at Mollie: judge it like a standalone charge below.
+			if (!isMollieNotFound(error)) throw error;
+		}
+		if (remote) {
+			const cycle = billingCycle(fromMollieDate(remote.startDate), remote.interval, createdAt);
+			if (periodEnd && cycle.end <= periodEnd) return null;
+		} else if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) {
+			return null;
+		}
 	} else if (subscription.periodStart && createdAt < new Date(subscription.periodStart)) {
 		return null;
 	}
@@ -1512,13 +1522,12 @@ export async function reconcileMollieSubscription(
 	const implied = mapMollieSubscriptionStatus(mollieSubscription.status as string);
 	const sameRemote: Where[] = [{ field: "mollieSubscriptionId", value: mollieSubscription.id }];
 	if (implied === "past_due") {
-		await guardedUpdate(
-			ctx,
-			subscription.id,
-			["trialing", "active"],
-			{ status: "past_due" },
-			sameRemote,
-		);
+		await guardedUpdate(ctx, subscription.id, ["trialing", "active"], { status: "past_due" }, [
+			...sameRemote,
+			...(subscription.periodEnd
+				? [{ field: "periodEnd", value: new Date(subscription.periodEnd) }]
+				: []),
+		]);
 		return [];
 	}
 	if (implied !== "canceled" || subscription.cancelAtPeriodEnd) return [];
@@ -1720,25 +1729,33 @@ export async function syncSubscription(
 	options: MollieOptions,
 	initial: Subscription,
 	now: Date,
-): Promise<{ events: BillingEvent[]; checkedRemote: boolean }> {
+): Promise<{ events: BillingEvent[]; checkedRemote: boolean; errors: string[] }> {
 	const gateway = gatewayFor(options);
 	const events: BillingEvent[] = [];
 	let checkedRemote = false;
 
+	// One payment that cannot be processed now must not hold up the rest of
+	// this subscription's sync; its error is reported and it is retried.
+	const errors: string[] = [];
 	for (const record of await outstandingPayments(ctx, initial.id)) {
 		checkedRemote = true;
-		const result = await processPayment(
-			ctx,
-			options,
-			await gateway.getPayment(record.molliePaymentId),
-		);
-		events.push(...result.events);
+		try {
+			const result = await processPayment(
+				ctx,
+				options,
+				await gateway.getPayment(record.molliePaymentId),
+			);
+			events.push(...result.events);
+		} catch (error) {
+			if (error instanceof OperationInProgressError) continue;
+			errors.push(`${record.molliePaymentId}: ${errorMessage(error)}`);
+		}
 	}
 
 	let subscription = (checkedRemote ? await reload(ctx, initial.id) : initial) ?? initial;
 	if (subscription.status === "incomplete") {
 		await expireCheckout(ctx, subscription);
-		return { events, checkedRemote };
+		return { events, checkedRemote, errors };
 	}
 	if (BILLING_STATUSES.includes(subscription.status)) {
 		const timed = await applyTimeTransitions(ctx, options, subscription, now);
@@ -1752,17 +1769,17 @@ export async function syncSubscription(
 			checkedRemote = true;
 			await ensureRemote(ctx, options, subscription.id, now);
 		}
-		return { events, checkedRemote };
+		return { events, checkedRemote, errors };
 	}
 	const customerId = subscription.mollieCustomerId;
-	if (!customerId) return { events, checkedRemote };
+	if (!customerId) return { events, checkedRemote, errors };
 
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	const stable =
 		(subscription.status === "active" || subscription.status === "trialing") &&
 		!subscription.mollieSyncNeeded;
 	if (stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS) {
-		return { events, checkedRemote };
+		return { events, checkedRemote, errors };
 	}
 
 	checkedRemote = true;
@@ -1778,10 +1795,13 @@ export async function syncSubscription(
 		} catch (error) {
 			if (!isMollieNotFound(error)) throw error;
 		}
-		for (const payment of await gateway.listSubscriptionPayments(
-			customerId,
-			subscription.mollieSubscriptionId,
-		)) {
+		const recent = await gateway
+			.listSubscriptionPayments(customerId, subscription.mollieSubscriptionId)
+			.catch((error: unknown) => {
+				if (isMollieNotFound(error)) return [];
+				throw error;
+			});
+		for (const payment of recent) {
 			if (await isUnsettled(ctx, payment)) {
 				events.push(...(await processPayment(ctx, options, payment)).events);
 			}
@@ -1802,13 +1822,16 @@ export async function syncSubscription(
 		subscription.periodEnd &&
 		now >= addDays(new Date(subscription.periodEnd), grace)
 	) {
-		// No paid renewal long after the period ended: treat as delinquent.
+		// No paid renewal long after the period ended: treat as delinquent, unless
+		// a renewal (or a cancellation) landed since this was read.
 		subscription =
-			(await guardedUpdate(ctx, subscription.id, ["trialing", "active"], { status: "past_due" })) ??
-			subscription;
+			(await guardedUpdate(ctx, subscription.id, ["trialing", "active"], { status: "past_due" }, [
+				{ field: "periodEnd", value: new Date(subscription.periodEnd) },
+				{ field: "cancelAtPeriodEnd", value: false },
+			])) ?? subscription;
 	}
 	events.push(...(await applyTimeTransitions(ctx, options, subscription, now)).events);
-	return { events, checkedRemote };
+	return { events, checkedRemote, errors };
 }
 
 /** A payment as it was before Mollie finished it: recorded to be processed later. */
@@ -1926,9 +1949,10 @@ export async function syncAllSubscriptions(
 		if (!subscription) continue;
 		result.checked++;
 		try {
-			const { events, checkedRemote } = await syncSubscription(ctx, options, subscription, now);
-			if (checkedRemote) result.remoteChecked++;
-			input.onEvents(events);
+			const synced = await syncSubscription(ctx, options, subscription, now);
+			if (synced.checkedRemote) result.remoteChecked++;
+			input.onEvents(synced.events);
+			for (const message of synced.errors) result.errors.push({ subscriptionId: id, message });
 		} catch (error) {
 			if (error instanceof OperationInProgressError) continue;
 			result.errors.push({ subscriptionId: id, message: errorMessage(error) });

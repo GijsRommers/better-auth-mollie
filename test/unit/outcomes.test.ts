@@ -1205,3 +1205,62 @@ describe("re-check of 0d722f4: failure consequences under lease loss and replay"
 		expect((await env.subscription(subscription.id)).status).toBe("active");
 	});
 });
+
+describe("re-check of 8640b0f: vanished Mollie subscriptions, overdue races", () => {
+	it("keeps processing a failed renewal whose Mollie subscription is gone, and the sync moving", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+		const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "open");
+		await env.webhook(`id=${failed.id}`);
+		// Mollie no longer knows the subscription (e.g. test data was reset).
+		env.fake.subscriptions.delete(subscription.mollieSubscriptionId!);
+		env.fake.completePayment(failed.id, "failed");
+
+		const first = await syncMollieSubscriptions(env.auth as never);
+		expect(first.errors).toEqual([]);
+		expect((await env.subscription(subscription.id)).status).toBe("past_due");
+		expect((await env.payments()).find((r) => r.molliePaymentId === failed.id)?.outcome).toBe(
+			"handled",
+		);
+		expect((await syncMollieSubscriptions(env.auth as never)).errors).toEqual([]);
+	});
+
+	it("does not mark a subscription overdue after a renewal landed during the sync", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(addDays(periodEnd, 15));
+
+		// The sync decides the subscription is overdue; meanwhile the renewal lands.
+		const adapter = env.context.adapter as any;
+		const original = adapter.incrementOne.bind(adapter);
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let reached!: () => void;
+		const paused = new Promise<void>((resolve) => {
+			reached = resolve;
+		});
+		adapter.incrementOne = async (args: any) => {
+			if (args.model === "subscription" && args.set?.status === "past_due") {
+				adapter.incrementOne = original;
+				reached();
+				await gate;
+			}
+			return original(args);
+		};
+		const sync = syncMollieSubscriptions(env.auth as never);
+		await paused;
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "paid");
+		await env.webhook(`id=${renewal.id}`);
+		release();
+		await sync;
+		adapter.incrementOne = original;
+
+		const row = await env.subscription(subscription.id);
+		expect(row.status).toBe("active");
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+	});
+});
