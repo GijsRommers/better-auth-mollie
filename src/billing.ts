@@ -1,4 +1,5 @@
 import type { GenericEndpointContext as Ctx, Where } from "better-auth";
+import { PlanNotConfiguredError } from "./errors";
 import { type BillingEvent, dispatchEvents } from "./events";
 import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } from "./gateway";
 import { coverage, withReferenceLock } from "./identity";
@@ -1282,8 +1283,8 @@ export async function reconcileRemote(
 
 	const wanted = subscription.pendingPlan ?? subscription.plan;
 	const plan = await getPlanByName(options, wanted);
-	// Reported (the sync lists it in its errors); Mollie keeps billing as it was.
-	if (!plan) throw new Error(`Plan "${wanted}" of ${subscription.id} is not configured`);
+	// Mollie keeps billing as it was; the sync reports it.
+	if (!plan) throw new PlanNotConfiguredError(wanted, subscription.id);
 	const planName = plan.name.toLowerCase();
 	const tax = await resolveTax(ctx, options, {
 		referenceId: subscription.referenceId,

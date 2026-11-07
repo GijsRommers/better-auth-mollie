@@ -139,4 +139,52 @@ describe("archived plans", () => {
 		]);
 		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toHaveLength(1);
 	});
+
+	describe("a subscription whose plan was removed", () => {
+		async function onRemovedPlan() {
+			let current = PLANS;
+			const env = await setup({ subscription: { plans: async () => current } });
+			const subscription = await subscribe(env);
+			const remove = () => {
+				current = PLANS.filter((plan) => plan.name !== "starter");
+			};
+			return { env, subscription, remove };
+		}
+		const reportsPlan = (result: { errors: { message: string }[] }) =>
+			expect(result.errors.map((e) => e.message)).toEqual([
+				expect.stringContaining('Plan "starter"'),
+			]);
+
+		it("still becomes unpaid when its grace period ends", async () => {
+			const { env, subscription, remove } = await onRemovedPlan();
+			travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+			const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+			await env.webhook(`id=${failed.id}`);
+			remove();
+			travel(new Date(subscription.periodEnd!).getTime() + 15 * 24 * 3_600_000);
+			reportsPlan(await syncMollieSubscriptions(env.auth as never));
+			expect((await env.subscription(subscription.id)).status).toBe("unpaid");
+		});
+
+		it("still counts as delinquent when no renewal arrives", async () => {
+			const { env, subscription, remove } = await onRemovedPlan();
+			remove();
+			travel(new Date(subscription.periodEnd!).getTime() + 15 * 24 * 3_600_000);
+			reportsPlan(await syncMollieSubscriptions(env.auth as never));
+			expect((await env.subscription(subscription.id)).status).not.toBe("active");
+		});
+
+		it("is reported while unpaid", async () => {
+			const { env, subscription, remove } = await onRemovedPlan();
+			travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+			const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+			await env.webhook(`id=${failed.id}`);
+			travel(new Date(subscription.periodEnd!).getTime() + 15 * 24 * 3_600_000);
+			await syncMollieSubscriptions(env.auth as never);
+			expect((await env.subscription(subscription.id)).status).toBe("unpaid");
+			remove();
+			travel(Date.now() + 25 * 3_600_000);
+			reportsPlan(await syncMollieSubscriptions(env.auth as never));
+		});
+	});
 });

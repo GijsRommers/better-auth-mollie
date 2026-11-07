@@ -9,6 +9,7 @@ import {
 	settleCustomerCharges,
 	settleRecentCharges,
 } from "./billing";
+import { PlanNotConfiguredError } from "./errors";
 import type { BillingEvent } from "./events";
 import { gatewayFor, type MolliePayment, metadataOf } from "./gateway";
 import { type SubscriptionLock, withSubscriptionLock } from "./lock";
@@ -294,6 +295,8 @@ export async function syncSubscription(
 		try {
 			await fn();
 		} catch (error) {
+			// Reported below on its own, and no reason to doubt the payments.
+			if (error instanceof PlanNotConfiguredError) return;
 			certain = false;
 			if (!(error instanceof OperationInProgressError)) {
 				errors.push(`${label}: ${errorMessage(error)}`);
@@ -324,6 +327,16 @@ export async function syncSubscription(
 		});
 	}
 	const seen = (await reload(ctx, initial.id)) ?? initial;
+	// A plan missing from the configuration, on every run until it is back.
+	// It does not hold up the decisions below, which do not need it.
+	if (BILLING_STATUSES.includes(seen.status)) {
+		for (const name of new Set([seen.plan, seen.pendingPlan])) {
+			if (!name || (await getPlanByName(options, name))) continue;
+			const message = new PlanNotConfiguredError(name, seen.id).message;
+			errors.push(message);
+			ctx.context.logger.error(`[mollie] ${message}`);
+		}
+	}
 	// Customer charges found here; handed to reconciling below so it does not
 	// look them up again while holding the subscription.
 	let charges: Settlement | undefined;

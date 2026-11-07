@@ -117,7 +117,7 @@ type MolliePlan = {
 
 Changing a plan's `amount` instead re-prices the subscriptions on it: the sync updates each one's Mollie subscription before its next charge (a charge already in progress keeps the old amount, and an `unpaid` subscription keeps it until it recovers).
 
-Keep every plan that a subscription is on, or is scheduled to change to, in your configuration. Mollie keeps billing a subscription whose plan is missing, but the plugin can no longer change it, and the sync reports it in its `errors`.
+Keep every plan that a subscription is on, or is scheduled to change to, in your configuration. Mollie keeps billing a subscription whose plan is missing, and the plugin can no longer bring its Mollie subscription in line (a cancellation still reaches Mollie, and its status still follows its payments). The sync reports it in its `errors` on every run until the plan is back.
 
 ## Subscriptions
 
