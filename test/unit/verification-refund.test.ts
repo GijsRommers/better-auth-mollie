@@ -173,4 +173,33 @@ describe("refundVerificationPayment", () => {
 			expect((await record(env, payment.id)).purpose).toBe("verification");
 		});
 	});
+
+	it("charges nothing for an upgrade when the earlier payment cannot be classified", async () => {
+		const env = await setup({ subscription: { refundVerificationPayment: true } });
+		const { payment } = await env.checkout("starter");
+		env.fake.completePayment(payment.id, "paid");
+		await env.webhook(`id=${payment.id}`);
+		const [subscription] = await env.subscriptions();
+		// Its outcome was not recorded, and it has no purpose (an older row).
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: payment.id }],
+			update: { outcome: "pending", purpose: null },
+		});
+		const prorations = () =>
+			[...env.fake.payments.values()].filter(
+				(p) => (p.metadata as { purpose?: string }).purpose === "proration",
+			);
+
+		env.fake.failNext("payments.get", new TypeError("fetch failed"));
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		expect(prorations()).toEqual([]);
+		expect((await env.subscription(subscription!.id)).plan).toBe("starter");
+
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		expect(prorations()).toHaveLength(1);
+		expect((await env.subscription(subscription!.id)).plan).toBe("business");
+	});
 });

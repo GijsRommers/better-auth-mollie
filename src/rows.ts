@@ -193,10 +193,10 @@ export async function settlePreviousPayment(
 	ctx: Ctx,
 	options: MollieOptions,
 	subscription: Subscription,
-	payment: { id: string },
+	payment?: { id: string },
 ): Promise<void> {
 	const previous = subscription.appliedPaymentId;
-	if (previous && previous !== payment.id) {
+	if (previous && previous !== payment?.id) {
 		// It paid for the period as it is now (also when the delivery that
 		// applied it stopped before recording that), and a verification still
 		// gets its refund.

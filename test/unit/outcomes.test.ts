@@ -709,10 +709,10 @@ describe("re-check of 8ede203: lost charges, stalled writers, serialized payment
 	it("never grants an upgrade whose charge was refunded while it stalled after its last check", async () => {
 		const env = await setup();
 		const subscription = await subscribe(env, "starter");
-		// Stall right after the upgrade's last lease check, before it records the plan.
+		// Stall right after the upgrade's last lease check, as it records the plan.
 		const stall = pauseWrite(
 			env,
-			(args) => args.model === "molliePayment" && args.set?.outcome === "applied",
+			(args) => args.model === "subscription" && args.set?.plan === "business",
 		);
 		const upgrade = env.api
 			.upgradeSubscription({ body: { plan: "business" }, headers: env.headers })

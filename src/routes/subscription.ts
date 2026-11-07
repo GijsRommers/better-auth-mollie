@@ -432,6 +432,9 @@ async function changePlan(
 	}
 
 	const cents = mode === "upgrade" && oldPlan ? prorationCents(current, oldPlan, plan, now) : 0;
+	// The charge becomes the applied payment, so the one before is settled
+	// first: before charging, so that a failure here charges nothing.
+	if (cents > 0) await settlePreviousPayment(ctx, options, current);
 	// Charged first: if Mollie refuses the charge, nothing has changed yet.
 	const proration =
 		cents > 0
@@ -447,7 +450,6 @@ async function changePlan(
 	});
 	// The charge is recorded as the applied payment in the same update as the
 	// new plan: a charge without its upgrade is refunded (see processPayment).
-	if (proration) await settlePreviousPayment(ctx, options, current, proration);
 	const updated = await guardedUpdate(
 		ctx,
 		current.id,
