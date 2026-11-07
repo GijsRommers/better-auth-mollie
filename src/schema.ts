@@ -82,6 +82,11 @@ export const subscriptionSchema = {
 				defaultValue: 0,
 				input: false,
 			},
+			mollieCheckedAt: {
+				type: "date",
+				required: false,
+				input: false,
+			},
 			lockToken: {
 				type: "string",
 				required: false,

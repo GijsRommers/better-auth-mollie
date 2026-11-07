@@ -249,7 +249,7 @@ const result = await syncMollieSubscriptions(auth);
 // { checked, remoteChecked, invoicesCreated, errors: [{ subscriptionId, message }] }
 ```
 
-It is cheap: a stable subscription is only fetched from Mollie in the day before its next payment, or when a change still has to reach Mollie. The sync:
+It is cheap: a stable subscription is only fetched from Mollie in the day before its next payment, or when a change still has to reach Mollie. A `past_due` one is checked on every run, an `unpaid` one once a day. The sync:
 
 - processes payments whose webhook was missed;
 - applies clock-based transitions;
@@ -405,6 +405,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `customerType`                           | string?              | `user` or `organization`                                 |
 | `appliedPaymentId`                       | string?              | The payment that last activated, recovered or renewed it |
 | `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number      | Internal: a change still to reach Mollie                 |
+| `mollieCheckedAt`                        | date?                | Internal: when the sync last checked an `unpaid` one     |
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 

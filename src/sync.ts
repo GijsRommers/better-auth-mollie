@@ -245,16 +245,22 @@ async function outstandingPayments(
 
 /**
  * Whether the sync looks at Mollie for this subscription: around its next
- * payment date (from one day before `periodEnd`), when delinquent, or when a
- * change still has to reach Mollie. Other subscriptions are not fetched.
+ * payment date (from one day before `periodEnd`), while past due, once a day
+ * while unpaid, or when a change still has to reach Mollie. Other
+ * subscriptions are not fetched.
  */
 function needsRemoteCheck(subscription: Subscription, now: Date): boolean {
 	if (!BILLING_STATUSES.includes(subscription.status)) return false;
-	const stable =
-		(subscription.status === "active" || subscription.status === "trialing") &&
-		!subscription.mollieSyncNeeded;
+	if (subscription.mollieSyncNeeded) return true;
 	const periodEnd = periodEndOf(subscription);
-	return !(stable && periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS);
+	if (subscription.status === "active" || subscription.status === "trialing") {
+		return !(periodEnd && now.getTime() < periodEnd.getTime() - DAY_MS);
+	}
+	if (subscription.status === "past_due") return true;
+	// Unpaid: its Mollie subscription keeps charging (the customer may still
+	// pay), possibly for a long time. Once a day is enough for a fallback.
+	const checkedAt = subscription.mollieCheckedAt;
+	return !checkedAt || now.getTime() - new Date(checkedAt).getTime() >= DAY_MS;
 }
 
 /**
@@ -410,7 +416,12 @@ export async function syncSubscription(
 						{ lock },
 					)) ?? latest;
 			}
-			events.push(...(await applyTimeTransitions(ctx, options, latest, now, lock)).events);
+			const timed = await applyTimeTransitions(ctx, options, latest, now, lock);
+			events.push(...timed.events);
+			// Mollie was checked for every charge: an unpaid row waits a day for the next check.
+			if (timed.subscription.status === "unpaid") {
+				await guardedUpdate(ctx, latest.id, ["unpaid"], { mollieCheckedAt: now }, [], { lock });
+			}
 		}),
 	);
 	return { events, checkedRemote, errors };
