@@ -148,6 +148,7 @@ export async function recordPayment(
 					status,
 					sequenceType: payment.sequenceType as MolliePaymentRecord["sequenceType"],
 					purpose: paymentPurpose(payment),
+					createdAt: new Date(payment.createdAt),
 					outcome: "pending",
 					claimSerial: 0,
 					hooksDue,

@@ -15,6 +15,17 @@ export const BILLING_STATUSES: readonly SubscriptionStatus[] = [
 	"unpaid",
 ];
 
+/**
+ * Whether the customer will still be charged for this subscription: it is
+ * billing and not canceled at the end of its period. For your own checks,
+ * e.g. before deleting an account.
+ */
+export function willBeCharged(
+	subscription: Pick<Subscription, "status" | "cancelAtPeriodEnd">,
+): boolean {
+	return BILLING_STATUSES.includes(subscription.status) && !subscription.cancelAtPeriodEnd;
+}
+
 /** Statuses that `syncMollieSubscriptions` keeps an eye on. */
 export const SYNCABLE_STATUSES: readonly SubscriptionStatus[] = ["incomplete", ...BILLING_STATUSES];
 

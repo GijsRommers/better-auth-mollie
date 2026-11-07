@@ -23,7 +23,7 @@ import {
 	type subscriptionSchema,
 	type userSchema,
 } from "./schema";
-import { BILLING_STATUSES } from "./status";
+import { BILLING_STATUSES, willBeCharged } from "./status";
 import type { SyncResult } from "./sync";
 import type { CustomerType, MollieOptions, Subscription, WithMollieCustomerId } from "./types";
 import { errorMessage, isValidAmount, validatePlans } from "./utils";
@@ -97,7 +97,7 @@ function installOrganizationHooks(ctx: AuthContext, options: MollieOptions) {
 			],
 			limit: 100,
 		});
-		if (billing.some((s) => !s.cancelAtPeriodEnd)) {
+		if (billing.some(willBeCharged)) {
 			// Better Auth clears the active organization before this hook runs.
 			// The organization stays, so put the user back where they were.
 			const session = (hookCtx as GenericEndpointContext | undefined)?.context?.session?.session as
@@ -188,13 +188,8 @@ export const mollie = <O extends MollieOptions>(options: O) => {
 				);
 			}
 			const subscription = options.subscription;
-			if (subscription?.enabled && typeof subscription.plans === "function") {
-				Promise.resolve(subscription.plans())
-					.then(validatePlans)
-					.catch((error: unknown) =>
-						ctx.logger.error(`[mollie] Invalid plans: ${errorMessage(error)}`),
-					);
-			}
+			// A `plans` function is called (and checked) when plans are needed, not
+			// here: an app may create a Better Auth instance per request.
 			if (subscription?.enabled && isOrganizationBillingEnabled(options)) {
 				installOrganizationHooks(ctx, options);
 			}
@@ -295,7 +290,13 @@ export {
 	subscriptionSchema,
 	userSchema,
 } from "./schema";
-export { accessDeadline, hasSubscriptionAccess } from "./status";
+export {
+	ACCESS_STATUSES,
+	accessDeadline,
+	BILLING_STATUSES,
+	hasSubscriptionAccess,
+	willBeCharged,
+} from "./status";
 export type { SyncResult } from "./sync";
 export { computeTax } from "./tax";
 export type * from "./types";

@@ -199,6 +199,10 @@ export interface MolliePaymentRecord {
 	 * a verification payment, a duplicate, or `getRecipient` returned `null`).
 	 */
 	invoice?: "created" | "skipped" | null | undefined;
+	/** The Mollie sales invoice (`invoice_…`) created for it. */
+	salesInvoiceId?: string | null | undefined;
+	/** When Mollie created the payment. */
+	createdAt?: Date | null | undefined;
 }
 
 export type MollieOperationStatus = "pending" | "succeeded" | "failed";
@@ -417,6 +421,13 @@ export type SubscriptionOptions = {
 		  ) => Date | null | undefined | Promise<Date | null | undefined>)
 		| undefined;
 	/**
+	 * Make `upgrade`, `cancel` and `restore` callable from your server only
+	 * (`auth.api.*`), for apps that collect consent or billing details in
+	 * their own actions before calling them.
+	 * @default false
+	 */
+	serverOnly?: boolean | undefined;
+	/**
 	 * Customize the first (mandate) payment, e.g. restrict `method`.
 	 */
 	getFirstPaymentParams?:
@@ -532,6 +543,12 @@ export type SalesInvoicesOptions = {
 	vatRate?: string | undefined;
 	/** Deliver invoices through Peppol (Belgium, Germany and the Netherlands). */
 	eInvoice?: boolean | undefined;
+	/**
+	 * The memo on an invoice with reverse-charged VAT, e.g. with the legal
+	 * reference your country requires.
+	 * @default "VAT reverse charged"
+	 */
+	reverseChargeMemo?: string | undefined;
 	/**
 	 * Also invoice the small mandate-verification payment of trial plans.
 	 * @default false

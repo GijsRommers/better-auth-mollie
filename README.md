@@ -193,7 +193,7 @@ if (await hasActiveSubscription(auth, user.id)) {
 }
 ```
 
-`hasActiveSubscription` is true for `trialing`, `active` and `past_due`, including the grace period. For a row you already have, use `hasSubscriptionAccess(subscription, { gracePeriodDays })`.
+`hasActiveSubscription` is true for `trialing`, `active` and `past_due`, including the grace period. For a row you already have, use `hasSubscriptionAccess(subscription, { gracePeriodDays })`. `willBeCharged(subscription)` tells whether the customer will still be charged (billing and not canceled), for example before you delete an account; `BILLING_STATUSES` and `ACCESS_STATUSES` are exported too.
 
 ### Statuses
 
@@ -283,6 +283,8 @@ await syncMollieSubscriptions(auth, { referenceId: organizationId });
 ```
 
 If a user and an organization can share an id (custom ids), pass `customerType: "organization"` (or `"user"`) to sync only that one.
+
+**From a background worker.** The sync needs a Better Auth instance with the same configuration as your app (database, secret, plugins including `mollie` and, for organization billing, `organization`). Create one in the worker the way the app does, for example with a shared `createAuth()` function, and call `syncMollieSubscriptions(auth)` from its scheduled handler. It does not serve requests, so the app's base URL only matters for the webhook URL it sends to Mollie: use the same `baseURL`.
 
 ## Payment failures and recovery
 
@@ -381,6 +383,7 @@ mollie({
 			locale: "nl_NL",
 		}),
 		eInvoice: true, // deliver via Peppol (BE, DE, NL)
+		// reverseChargeMemo: "VAT reverse charged", // the memo when VAT is reverse charged
 		// vatRate: "21.00", // required when `subscription.tax` is not configured
 		// invoiceVerificationPayments: false,
 		// getInvoiceParams: (data, request) => ({ ...request, memo: "Thank you!" }),
@@ -435,7 +438,7 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 | `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
 | `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `purpose` (see [Hooks](#hooks)), `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced), `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue`, `chargebackCheckedAt` and `refundDue`.
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `createdAt` (when Mollie created it), `purpose` (see [Hooks](#hooks)), `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`, or `handled` for a payment that was not paid), `invoice` (`created`, or `skipped` for a payment that is not invoiced) and `salesInvoiceId`, `paidThrough` (the end of the period it paid for), `amountChargedBack` (charged back and not reversed), and internally `claimSerial`, `hooksDue`, `chargebackDue`, `chargebackCheckedAt` and `refundDue`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 
@@ -455,13 +458,14 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `getCustomerCreateParams`, `onCustomerCreate`                           |                             | Customize the Mollie customer for users                                                                                         |
 | `organization.getCustomerCreateParams`, `organization.onCustomerCreate` |                             | The same, for organizations                                                                                                     |
 | `subscription.enabled`                                                  |                             |                                                                                                                                 |
-| `subscription.plans`                                                    | required                    | Array or (async) function                                                                                                       |
+| `subscription.plans`                                                    | required                    | Array or (async) function, called (and checked) whenever plans are needed                                                       |
 | `subscription.customerType`                                             | `"organization"`            | Default billed party                                                                                                            |
 | `subscription.authorizeReference`                                       |                             | Required for organization billing                                                                                               |
 | `subscription.requireEmailVerification`                                 | `false`                     |                                                                                                                                 |
 | `subscription.verificationAmount`                                       | `"0.02"`                    | First payment of a trial; `"0.00"` works for cards and PayPal                                                                   |
 | `subscription.gracePeriodDays`                                          | `14`                        | `past_due` keeps access this long                                                                                               |
 | `subscription.getFirstPaymentParams`                                    |                             | For example `{ method: "creditcard" }`                                                                                          |
+| `subscription.serverOnly`                                               | `false`                     | `upgrade`, `cancel` and `restore` only through `auth.api`, e.g. when your own action collects consent first                     |
 | `subscription.tax`                                                      |                             | See [VAT](#vat)                                                                                                                 |
 | `subscription.refundDuplicatePayments`                                  | `true`                      |                                                                                                                                 |
 | `subscription.refundVerificationPayment`                                | `false`                     | Refund a trial's verification payment once the mandate exists                                                                   |

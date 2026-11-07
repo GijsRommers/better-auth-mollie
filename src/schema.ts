@@ -203,6 +203,16 @@ export const molliePaymentSchema = {
 				required: false,
 				input: false,
 			},
+			salesInvoiceId: {
+				type: "string",
+				required: false,
+				input: false,
+			},
+			createdAt: {
+				type: "date",
+				required: false,
+				input: false,
+			},
 			refundDue: {
 				type: "boolean",
 				required: false,

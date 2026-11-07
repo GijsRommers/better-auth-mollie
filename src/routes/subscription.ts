@@ -593,7 +593,10 @@ export const upgradeSubscription = (options: MollieOptions) =>
 		{
 			method: "POST",
 			body: upgradeSubscriptionBodySchema,
-			metadata: { openapi: { operationId: "upgradeSubscription" } },
+			metadata: {
+				openapi: { operationId: "upgradeSubscription" },
+				...(subscriptionOptions(options).serverOnly ? { SERVER_ONLY: true as const } : {}),
+			},
 			use: [
 				mollieSessionMiddleware,
 				referenceMiddleware(options, "upgrade-subscription"),
@@ -1029,7 +1032,10 @@ export const cancelSubscription = (options: MollieOptions) =>
 		{
 			method: "POST",
 			body: cancelSubscriptionBodySchema,
-			metadata: { openapi: { operationId: "cancelSubscription" } },
+			metadata: {
+				openapi: { operationId: "cancelSubscription" },
+				...(subscriptionOptions(options).serverOnly ? { SERVER_ONLY: true as const } : {}),
+			},
 			use: [
 				mollieSessionMiddleware,
 				referenceMiddleware(options, "cancel-subscription"),
@@ -1100,7 +1106,10 @@ export const restoreSubscription = (options: MollieOptions) =>
 		{
 			method: "POST",
 			body: restoreSubscriptionBodySchema,
-			metadata: { openapi: { operationId: "restoreSubscription" } },
+			metadata: {
+				openapi: { operationId: "restoreSubscription" },
+				...(subscriptionOptions(options).serverOnly ? { SERVER_ONLY: true as const } : {}),
+			},
 			use: [mollieSessionMiddleware, referenceMiddleware(options, "restore-subscription")],
 		},
 		async (ctx) => {

@@ -44,7 +44,7 @@ function defaultInvoiceRequest(
 			},
 		],
 		...(config?.eInvoice ? { isEInvoice: true } : {}),
-		...(tax?.reverseCharge ? { memo: "VAT reverse charged" } : {}),
+		...(tax?.reverseCharge ? { memo: config?.reverseChargeMemo ?? "VAT reverse charged" } : {}),
 	};
 }
 
@@ -111,7 +111,7 @@ export async function createSalesInvoice(
 		getId: (invoice) => invoice.id,
 		recover: (idempotencyKey) => gateway.findSalesInvoiceByOperationKey(idempotencyKey),
 	});
-	await markInvoice(ctx, data.payment.id, "created");
+	await markInvoice(ctx, data.payment.id, "created", operation.mollieId);
 	if (!operation.result) return null;
 	await config.onInvoiceCreated?.({ ...data, invoice: operation.result }, ctx);
 	return operation.result;
@@ -121,11 +121,12 @@ async function markInvoice(
 	ctx: GenericEndpointContext,
 	molliePaymentId: string,
 	invoice: "created" | "skipped",
+	salesInvoiceId?: string | null,
 ): Promise<void> {
 	await ctx.context.adapter.update({
 		model: "molliePayment",
 		where: [{ field: "molliePaymentId", value: molliePaymentId }],
-		update: { invoice },
+		update: { invoice, ...(salesInvoiceId ? { salesInvoiceId } : {}) },
 	});
 }
 
