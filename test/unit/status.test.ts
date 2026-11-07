@@ -2,43 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
 	accessDeadline,
 	canAdvancePayment,
-	canTransition,
 	hasSubscriptionAccess,
 	isFinalPaymentStatus,
 	mapMollieSubscriptionStatus,
-	statusesThatCanBecome,
 } from "../../src/status";
-
-describe("subscription status machine", () => {
-	it("follows trialing → active → past_due → unpaid | canceled", () => {
-		expect(canTransition("incomplete", "trialing")).toBe(true);
-		expect(canTransition("incomplete", "active")).toBe(true);
-		expect(canTransition("trialing", "active")).toBe(true);
-		expect(canTransition("active", "past_due")).toBe(true);
-		expect(canTransition("past_due", "unpaid")).toBe(true);
-		expect(canTransition("past_due", "canceled")).toBe(true);
-	});
-
-	it("lets a paid payment recover past_due and unpaid subscriptions", () => {
-		expect(canTransition("past_due", "active")).toBe(true);
-		expect(canTransition("unpaid", "active")).toBe(true);
-	});
-
-	it("never moves backwards or out of terminal states", () => {
-		expect(canTransition("active", "trialing")).toBe(false);
-		expect(canTransition("active", "incomplete")).toBe(false);
-		expect(canTransition("canceled", "active")).toBe(false);
-		expect(canTransition("incomplete_expired", "active")).toBe(false);
-		expect(canTransition("active", "active")).toBe(false);
-	});
-
-	it("derives guards for atomic updates", () => {
-		expect(statusesThatCanBecome("active").sort()).toEqual(
-			["incomplete", "past_due", "trialing", "unpaid"].sort(),
-		);
-		expect(statusesThatCanBecome("unpaid")).toEqual(["past_due"]);
-	});
-});
 
 describe("hasSubscriptionAccess", () => {
 	const periodEnd = new Date("2026-03-01T00:00:00Z");

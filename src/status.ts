@@ -4,31 +4,6 @@ import { addDays } from "./utils";
 export const DEFAULT_GRACE_PERIOD_DAYS = 14;
 export const DEFAULT_VERIFICATION_AMOUNT = "0.02";
 
-/**
- * Allowed subscription status transitions. Anything not listed is rejected,
- * so late or out-of-order webhooks can never move a subscription backwards.
- */
-const TRANSITIONS: Record<SubscriptionStatus, readonly SubscriptionStatus[]> = {
-	incomplete: ["trialing", "active", "incomplete_expired", "canceled"],
-	incomplete_expired: [],
-	trialing: ["active", "past_due", "canceled"],
-	active: ["past_due", "canceled"],
-	past_due: ["active", "unpaid", "canceled"],
-	unpaid: ["active", "canceled"],
-	canceled: [],
-};
-
-export function canTransition(from: SubscriptionStatus, to: SubscriptionStatus): boolean {
-	return TRANSITIONS[from]?.includes(to) ?? false;
-}
-
-/** Statuses that may move to `to`. Used as the guard of an atomic update. */
-export function statusesThatCanBecome(to: SubscriptionStatus): SubscriptionStatus[] {
-	return (Object.keys(TRANSITIONS) as SubscriptionStatus[]).filter((from) =>
-		canTransition(from, to),
-	);
-}
-
 /** Statuses in which access may still be granted (subject to dates). */
 export const ACCESS_STATUSES: readonly SubscriptionStatus[] = ["trialing", "active", "past_due"];
 
