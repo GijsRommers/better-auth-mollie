@@ -133,6 +133,7 @@ export interface Subscription {
 	/** Internal: the lease of whoever is changing this subscription (see `withSubscriptionLock`). */
 	lockToken?: string | null | undefined;
 	lockedUntil?: Date | null | undefined;
+	lockSerial?: number | null | undefined;
 	createdAt: Date;
 	updatedAt: Date;
 }
@@ -159,6 +160,8 @@ export interface MolliePaymentRecord {
 	paidAt?: Date | null | undefined;
 	failedAt?: Date | null | undefined;
 	outcome: PaymentOutcome;
+	/** Internal: the newest subscription lock that claimed this payment (see `claimPayment`). */
+	claimSerial?: number | null | undefined;
 }
 
 export type MollieOperationStatus = "pending" | "succeeded" | "failed";

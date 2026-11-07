@@ -4,6 +4,7 @@ import { gatewayFor, type MolliePayment, type MollieSubscription, metadataOf } f
 import { type SubscriptionLock, withSubscriptionLock } from "./lock";
 import {
 	LOCK_LEASE_MS,
+	LockLostError,
 	mollieKey,
 	OperationInProgressError,
 	pendingOperations,
@@ -46,6 +47,7 @@ import {
 	getWebhookUrl,
 	isMollieApiError,
 	isMollieNotFound,
+	parseInterval,
 	planCurrency,
 	toDate,
 	toMollieDate,
@@ -168,16 +170,44 @@ async function setOutcome(
 	molliePaymentId: string,
 	from: readonly PaymentOutcome[],
 	to: PaymentOutcome,
+	claim?: number,
 ): Promise<MolliePaymentRecord | null> {
 	return ctx.context.adapter.incrementOne<MolliePaymentRecord>({
 		model: "molliePayment",
 		where: [
 			{ field: "molliePaymentId", value: molliePaymentId },
 			{ field: "outcome", operator: "in", value: [...from] },
+			// Only while no newer lock holder has claimed the payment.
+			...(claim === undefined ? [] : [{ field: "claimSerial", value: claim }]),
 		],
 		increment: {},
 		set: { outcome: to },
 	});
+}
+
+/**
+ * Claims a payment for the holder of `lock` before it reads the payment's
+ * outcome and decides on it. Lock serials only grow, so once a newer holder
+ * (one that took over an expired lease) has claimed the payment, the older
+ * holder's outcome writes no longer apply: deciding on a payment and
+ * recording that decision cannot be split across two holders.
+ */
+async function claimPayment(
+	ctx: Ctx,
+	molliePaymentId: string,
+	lock: SubscriptionLock,
+): Promise<MolliePaymentRecord> {
+	const claimed = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+		model: "molliePayment",
+		where: [
+			{ field: "molliePaymentId", value: molliePaymentId },
+			{ field: "claimSerial", operator: "lte", value: lock.serial },
+		],
+		increment: {},
+		set: { claimSerial: lock.serial },
+	});
+	if (!claimed) throw new LockLostError(`payment:${molliePaymentId}`);
+	return claimed;
 }
 
 /**
@@ -289,6 +319,7 @@ export async function recordPayment(
 					status,
 					sequenceType: payment.sequenceType as MolliePaymentRecord["sequenceType"],
 					outcome: "pending",
+					claimSerial: 0,
 					...timestamps,
 				},
 			});
@@ -425,7 +456,8 @@ async function applyPayment(
 ): Promise<ProcessResult> {
 	let subscription = initial;
 	const recorded = await recordPayment(ctx, payment, subscription.id);
-	let record = recorded.record;
+	let record = await claimPayment(ctx, payment.id, lock);
+	const claim = lock.serial;
 	const purpose = paymentPurpose(payment);
 	const status = payment.status as string;
 	const events: BillingEvent[] = [];
@@ -441,14 +473,14 @@ async function applyPayment(
 				const plan = await getPlanByName(options, subscription.plan);
 				events.push({ type: "subscription.activated", subscription, plan, payment });
 			}
-			record = (await setOutcome(ctx, payment.id, ["pending"], "applied")) ?? record;
+			record = (await setOutcome(ctx, payment.id, ["pending"], "applied", claim)) ?? record;
 		} else {
 			subscription = (await reload(ctx, subscription.id)) ?? subscription;
 			if (subscription.appliedPaymentId === payment.id) {
 				// Applied by a concurrent delivery of this same payment.
-				record = (await setOutcome(ctx, payment.id, ["pending"], "applied")) ?? record;
+				record = (await setOutcome(ctx, payment.id, ["pending"], "applied", claim)) ?? record;
 			} else if (result.kind === "covered") {
-				const classified = await classifyDuplicate(ctx, options, payment, subscription);
+				const classified = await classifyDuplicate(ctx, options, payment, subscription, claim);
 				record = classified.record ?? record;
 				duplicateEvents.push(...classified.events);
 			}
@@ -477,7 +509,7 @@ async function applyPayment(
 	if (status === "paid") {
 		const current = (await findPaymentRecord(ctx, payment.id)) ?? record;
 		if (current.outcome === "duplicate") {
-			events.push(...(await refundDuplicate(ctx, options, payment, subscription)));
+			events.push(...(await refundDuplicate(ctx, options, payment, subscription, claim)));
 		}
 	}
 	// A new mandate, a new start or a postponed change: bring Mollie in line.
@@ -541,9 +573,16 @@ async function classifyDuplicate(
 	options: MollieOptions,
 	payment: MolliePayment,
 	subscription: Subscription,
+	claim: number,
 ): Promise<{ record: MolliePaymentRecord | null; events: BillingEvent[] }> {
 	const refund = refundsEnabled(options);
-	const marked = await setOutcome(ctx, payment.id, ["pending"], refund ? "duplicate" : "kept");
+	const marked = await setOutcome(
+		ctx,
+		payment.id,
+		["pending"],
+		refund ? "duplicate" : "kept",
+		claim,
+	);
 	if (!marked) return { record: await findPaymentRecord(ctx, payment.id), events: [] };
 	ctx.context.logger.warn(
 		`[mollie] Payment ${payment.id} pays for something already paid on ${subscription.id}${refund ? "; refunding" : ""}`,
@@ -587,9 +626,10 @@ async function refundDuplicate(
 	options: MollieOptions,
 	payment: MolliePayment,
 	subscription: Subscription,
+	claim?: number,
 ): Promise<BillingEvent[]> {
 	await refundPayment(ctx, options, subscription, payment);
-	const refunded = await setOutcome(ctx, payment.id, ["duplicate"], "refunded");
+	const refunded = await setOutcome(ctx, payment.id, ["duplicate"], "refunded", claim);
 	if (!refunded) return [];
 	return [
 		{
@@ -1245,10 +1285,12 @@ export async function reconcileRemote(
 	const amount = chargeAmount(plan, tax);
 	const periodEnd = subscription.periodEnd ? new Date(subscription.periodEnd) : null;
 	const paidThrough = periodEnd ? toMollieDate(periodEnd) : null;
-	// While the period runs, the next charge is due when it ends; a few days of
-	// slack absorb month-end differences, a later date would leave time unpaid.
+	// While the period runs, the next charge is due when it ends; for monthly
+	// intervals a few days absorb month-end differences (day and week
+	// intervals are exact). A later date would leave time unpaid.
+	const slackDays = parseInterval(plan.interval).unit === "month" ? MONTH_END_SLACK_DAYS : 0;
 	const latestNextCharge =
-		periodEnd && periodEnd > now ? toMollieDate(addDays(periodEnd, NEXT_CHARGE_SLACK_DAYS)) : null;
+		periodEnd && periodEnd > now ? toMollieDate(addDays(periodEnd, slackDays)) : null;
 	const matches = (remote: MollieSubscription) =>
 		isLive(remote) &&
 		metadataOf(remote).plan === planName &&
@@ -1342,7 +1384,8 @@ export async function reconcileRemote(
 	return again(latest);
 }
 
-const NEXT_CHARGE_SLACK_DAYS = 3;
+/** Less than the shortest month interval, so a skipped month is always caught. */
+const MONTH_END_SLACK_DAYS = 3;
 
 /** Runs `reconcileRemote` under the subscription's lock. */
 export async function ensureRemote(
@@ -1567,8 +1610,8 @@ const PAGE_SIZE = 100;
 const UNRESOLVED_PAYMENT_STATUSES = ["open", "pending", "authorized"] as const;
 
 /**
- * Payment records that still need processing: not final yet (only when
- * `subscriptionId` is given), or paid without a settled outcome.
+ * Payment records that still need processing: not final yet (across all
+ * subscriptions: only recurring charges), or paid without a settled outcome.
  */
 async function outstandingPayments(
 	ctx: Ctx,
@@ -1582,12 +1625,13 @@ async function outstandingPayments(
 			{ field: "outcome", operator: "in", value: ["pending", "duplicate"] },
 		],
 	];
-	if (subscriptionId) {
-		queries.unshift([
-			...scope,
-			{ field: "status", operator: "in", value: [...UNRESOLVED_PAYMENT_STATUSES] },
-		]);
-	}
+	queries.unshift([
+		...scope,
+		{ field: "status", operator: "in", value: [...UNRESOLVED_PAYMENT_STATUSES] },
+		// Across all subscriptions only charges (renewals, pro-rata), not
+		// abandoned checkouts.
+		...(subscriptionId ? [] : [{ field: "sequenceType", value: "recurring" }]),
+	]);
 	const found: MolliePaymentRecord[] = [];
 	for (const where of queries) {
 		for (let offset = 0; ; offset += PAGE_SIZE) {
@@ -1750,8 +1794,11 @@ async function recoverAbandonedCharges(
 				createdAt,
 			);
 			if (found) {
-				await resolveOperation(ctx.context, op.idempotencyKey, "succeeded", found);
+				// Recorded first: from then on the payment is outstanding locally and
+				// is processed by every sync until settled, whatever happens next.
 				const payment = await gateway.getPayment(found);
+				await recordPayment(ctx, payment, subscription.id);
+				await resolveOperation(ctx.context, op.idempotencyKey, "succeeded", found);
 				onEvents((await processPayment(ctx, options, payment)).events);
 			} else if (now.getTime() - createdAt.getTime() > REPLAY_WINDOW_MS) {
 				await resolveOperation(ctx.context, op.idempotencyKey, "failed", null);

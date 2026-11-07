@@ -93,6 +93,12 @@ export const subscriptionSchema = {
 				defaultValue: () => new Date(0),
 				input: false,
 			},
+			lockSerial: {
+				type: "number",
+				required: false,
+				defaultValue: 0,
+				input: false,
+			},
 			createdAt: {
 				type: "date",
 				required: true,
@@ -158,6 +164,12 @@ export const molliePaymentSchema = {
 				type: "string",
 				required: true,
 				defaultValue: "pending",
+				input: false,
+			},
+			claimSerial: {
+				type: "number",
+				required: false,
+				defaultValue: 0,
 				input: false,
 			},
 		},

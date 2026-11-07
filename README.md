@@ -387,25 +387,25 @@ Hooks run at most once per change, after the change is stored. A failing hook is
 
 **`subscription`**
 
-| Field                                    | Type            | Notes                                                    |
-| ---------------------------------------- | --------------- | -------------------------------------------------------- |
-| `id`                                     | string          |                                                          |
-| `referenceId`                            | string          | User or organization id                                  |
-| `plan`                                   | string          | Lower-cased plan name                                    |
-| `pendingPlan`                            | string?         | Scheduled plan change, applied at `periodEnd`            |
-| `status`                                 | string          | See [Statuses](#statuses)                                |
-| `mollieCustomerId`                       | string?         | `cst_…`                                                  |
-| `mollieMandateId`                        | string?         | `mdt_…`                                                  |
-| `mollieSubscriptionId`                   | string?         | `sub_…`                                                  |
-| `periodStart`, `periodEnd`, `trialEnd`   | date?           |                                                          |
-| `cancelAtPeriodEnd`                      | boolean         |                                                          |
-| `customerType`                           | string?         | `user` or `organization`                                 |
-| `appliedPaymentId`                       | string?         | The payment that last activated, recovered or renewed it |
-| `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number | Internal: a change still to reach Mollie                 |
-| `lockToken`, `lockedUntil` | string, date | Internal: lease of whoever is changing the subscription |
-| `createdAt`, `updatedAt`                 | date            |                                                          |
+| Field                                    | Type                 | Notes                                                    |
+| ---------------------------------------- | -------------------- | -------------------------------------------------------- |
+| `id`                                     | string               |                                                          |
+| `referenceId`                            | string               | User or organization id                                  |
+| `plan`                                   | string               | Lower-cased plan name                                    |
+| `pendingPlan`                            | string?              | Scheduled plan change, applied at `periodEnd`            |
+| `status`                                 | string               | See [Statuses](#statuses)                                |
+| `mollieCustomerId`                       | string?              | `cst_…`                                                  |
+| `mollieMandateId`                        | string?              | `mdt_…`                                                  |
+| `mollieSubscriptionId`                   | string?              | `sub_…`                                                  |
+| `periodStart`, `periodEnd`, `trialEnd`   | date?                |                                                          |
+| `cancelAtPeriodEnd`                      | boolean              |                                                          |
+| `customerType`                           | string?              | `user` or `organization`                                 |
+| `appliedPaymentId`                       | string?              | The payment that last activated, recovered or renewed it |
+| `mollieSyncNeeded`, `mollieSyncRevision` | boolean, number      | Internal: a change still to reach Mollie                 |
+| `lockToken`, `lockedUntil`, `lockSerial` | string, date, number | Internal: lease of whoever is changing the subscription  |
+| `createdAt`, `updatedAt`                 | date                 |                                                          |
 
-**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`).
+**`molliePayment`**: `molliePaymentId` (unique), `subscriptionId`, `amount`, `currency`, `status`, `sequenceType`, `paidAt`, `failedAt`, `outcome` (`pending`, `applied`, `duplicate`, `refunded`, `kept`), and internally `claimSerial`.
 
 **`mollieOperation`**: the journal of Mollie calls (`idempotencyKey`, `kind`, `referenceId`, `status`, `mollieId`, `createdAt`). The plugin uses it to resume interrupted calls and to recognize its own cancellations and invoices, so keep its rows.
 

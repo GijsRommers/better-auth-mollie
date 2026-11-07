@@ -19,6 +19,11 @@ export type SubscriptionLock = {
 	fence: Fence;
 	/** Conditions that make an update of the row apply only while the lease is held. */
 	held: () => Where[];
+	/**
+	 * Increases with every acquisition of this subscription's lock: a fencing
+	 * token for rows other than the subscription (see `claimPayment`).
+	 */
+	serial: number;
 };
 
 const RETRY_MS = 100;
@@ -36,16 +41,20 @@ export async function withSubscriptionLock<T>(
 		adapter.incrementOne<Subscription>({
 			model: "subscription",
 			where: [{ field: "id", value: subscriptionId }, free],
-			increment: {},
+			increment: { lockSerial: 1 },
 			set: { lockToken: token, lockedUntil: new Date(Date.now() + LOCK_LEASE_MS) },
 		});
 	// Counted in tries, not by the clock (which may not move, e.g. in tests).
 	const tries = Math.ceil((options.waitMs ?? 0) / RETRY_MS);
+	let serial = 0;
 	for (let attempt = 0; ; attempt++) {
 		const claimed =
 			(await claim({ field: "lockedUntil", operator: "lt", value: new Date() })) ??
 			(await claim({ field: "lockedUntil", value: null }));
-		if (claimed) break;
+		if (claimed) {
+			serial = Number(claimed.lockSerial ?? 0);
+			break;
+		}
 		if (attempt >= tries) throw new OperationInProgressError(key);
 		await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
 	}
@@ -64,7 +73,7 @@ export async function withSubscriptionLock<T>(
 		if (!renewed) throw new LockLostError(key);
 	};
 	try {
-		return await fn({ subscriptionId, fence, held });
+		return await fn({ subscriptionId, fence, held, serial });
 	} finally {
 		await adapter
 			.incrementOne<Subscription>({
