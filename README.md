@@ -4,7 +4,7 @@ Subscription billing with [Mollie](https://www.mollie.com) for [Better Auth](htt
 
 It follows the API of [`@better-auth/stripe`](https://www.better-auth.com/docs/plugins/stripe): the same endpoints (`subscription.upgrade`, `cancel`, `restore`, `list`), the same subscription statuses and error codes, and the same `referenceId` system for user and organization billing. Moving between the two is mostly a change of imports.
 
-Mollie Billing is simpler than Stripe Billing. Mollie charges a mandate on a schedule; it has no proration, no dunning logic, no VAT engine and no customer portal. The plugin fills in these gaps:
+Stripe Billing runs subscriptions for you; Mollie only charges a mandate on a schedule. It has no subscription statuses, proration, dunning, VAT engine or customer portal. The plugin fills in these gaps itself:
 
 - **Your database is the source of truth.** The `subscription` row holds plan, status and period. Mollie is kept in line with it, and is never trusted blindly.
 - **Duplicate charges are refunded.** Mutating Mollie calls go through a write-ahead journal with idempotency keys, so retries and crashes are safe. A payment that pays for something already paid is detected and refunded automatically (see [Known limits](#known-limits)).
@@ -36,8 +36,10 @@ Mollie Billing is simpler than Stripe Billing. Mollie charges a mandate on a sch
 ## Installation
 
 ```bash
-pnpm add better-auth-mollie mollie-api-typescript
+pnpm add better-auth-mollie@alpha mollie-api-typescript
 ```
+
+This is an alpha (see [Known limits](#known-limits)): pin the exact version, and read the [changelog](CHANGELOG.md) before upgrading. New versions may add database columns, so run your migration with each upgrade.
 
 ### Server
 
@@ -508,6 +510,8 @@ This is an alpha. The billing logic is tested against a stateful fake of the Mol
 | Webhook            | Signed events at `/stripe/webhook`                                   | Id-only pings at `/mollie/webhook`; the state is fetched from Mollie    |
 | Cron               | Not needed                                                           | `syncMollieSubscriptions`, hourly recommended                           |
 | Duplicate payments | Handled by Stripe                                                    | Detected and refunded automatically                                     |
+| Chargebacks        | Disputes, reported by webhook                                        | `past_due` from the charged-back period, and `onChargeback`             |
+| Price changes      | A new Price; existing subscriptions keep theirs                      | A new plan, and `archived: true` on the old one                         |
 | Payment methods    | Cards, SEPA DD, …                                                    | Cards, PayPal, SEPA DD (via iDEAL, Bancontact, …)                       |
 
 ## Testing

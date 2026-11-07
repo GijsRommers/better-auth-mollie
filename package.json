@@ -1,6 +1,6 @@
 {
 	"name": "better-auth-mollie",
-	"version": "0.1.0",
+	"version": "0.1.0-alpha.0",
 	"description": "Mollie subscriptions for Better Auth: mandates, recurring billing via the Mollie Subscriptions API, idempotent webhooks and organization billing.",
 	"type": "module",
 	"license": "MIT",
@@ -29,6 +29,7 @@
 	"files": [
 		"dist",
 		"README.md",
+		"CHANGELOG.md",
 		"LICENSE"
 	],
 	"main": "./dist/index.js",
