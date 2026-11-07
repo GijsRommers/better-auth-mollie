@@ -48,13 +48,16 @@ jobs:
         run: pnpm test:integration
       - run: pnpm build
       - run: pnpm lint:package
-      # A prerelease (1.0.0-alpha.0) goes out under its own dist-tag (alpha),
-      # so `latest` keeps pointing at the last stable version. (npm sets
-      # `latest` too on a package's very first publish, so until 1.0 it is
-      # an alpha; the README tells to install `@alpha` and pin it.)
+      # A prerelease (1.1.0-beta.0) goes out under its own dist-tag (beta),
+      # so `latest` keeps pointing at the last stable version. A version that
+      # is on npm already (e.g. the first one, published by hand) is skipped.
       - name: Publish
         run: |
           version="$(node -p 'require("./package.json").version')"
+          if npm view "better-auth-mollie@$version" version >/dev/null 2>&1; then
+            echo "better-auth-mollie@$version is on npm already"
+            exit 0
+          fi
           tag=latest
           case "$version" in *-*) pre="${version#*-}"; tag="${pre%%.*}" ;; esac
           pnpm publish --provenance --access public --no-git-checks --tag "$tag"

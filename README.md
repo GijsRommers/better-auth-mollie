@@ -36,10 +36,10 @@ Stripe Billing runs the whole subscription lifecycle for you. Mollie charges a m
 ## Installation
 
 ```bash
-pnpm add better-auth-mollie@alpha mollie-api-typescript
+pnpm add better-auth-mollie mollie-api-typescript
 ```
 
-This is an alpha (see [Known limits](#known-limits)): pin the exact version, and read the [changelog](CHANGELOG.md) before upgrading. New versions may add database columns, so run your migration with each upgrade.
+Until 1.0, a minor version can change behavior: pin the version, and read the [changelog](CHANGELOG.md) before upgrading. New versions may add database columns, so run your migration with each upgrade.
 
 ### Server
 
@@ -480,7 +480,7 @@ Error codes are exported as `MOLLIE_ERROR_CODES` and reuse the Stripe plugin's n
 
 ## Known limits
 
-This is an alpha. The billing logic is tested against a stateful fake of the Mollie SDK (including crashes, lost responses, stalled processes and concurrent deliveries) and against Mollie test mode, but it has not run in production yet.
+The billing logic is tested against a stateful fake of the Mollie SDK (including crashes, lost responses, stalled processes and concurrent deliveries) and against Mollie test mode. It is new: watch the sync's errors closely when you start using it.
 
 - **Run the sync, and watch it.** Missed webhooks, refunds that failed, interrupted changes, missed sales invoices and hooks still marked as due are completed by `syncMollieSubscriptions`. Run it at least hourly and alert on its `errors`, which include refunds that are still due and invoices that failed: one that keeps coming back needs a look. The plugin also logs every failure through Better Auth's logger.
 - **Eventually consistent, not instant.** A duplicate charge is refunded once it is detected (usually by its webhook, at the latest by the sync), so a customer can briefly be charged twice before the refund goes out.

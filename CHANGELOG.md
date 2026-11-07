@@ -2,9 +2,9 @@
 
 All notable changes to `better-auth-mollie`. The project follows [semantic versioning](https://semver.org); until 1.0, a minor version may break things, and every release says so here.
 
-## 0.1.0-alpha.0
+## 0.1.0
 
-The first public release. Not yet run in production: see [Known limits](README.md#known-limits).
+The first public release. See [Known limits](README.md#known-limits).
 
 - Subscriptions for users and organizations through Mollie: checkout with a mandate, recurring charges with the Subscriptions API, cancel at period end and restore, the same API as `@better-auth/stripe`.
 - Plan changes: upgrades right away with a pro-rata charge, downgrades from the next period; archived plans for price changes.
