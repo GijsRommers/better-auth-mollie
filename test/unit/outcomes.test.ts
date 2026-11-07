@@ -2259,3 +2259,40 @@ describe("re-check of 18c1571: activations that stall past their leases", () => 
 		expect(refundedIds(env)).toEqual([a.payment.id]);
 	});
 });
+
+describe("re-check of a354581: hooks when an activation has to come back", () => {
+	it("runs the paid hook once when the activation is retried after a busy pending row", async () => {
+		const onPaymentPaid = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentPaid } });
+		const { payment } = await env.checkout("starter");
+		const [rowA] = await env.subscriptions();
+		// Another pending row of the same customer is being processed right now.
+		const rowB = await env.context.adapter.create<any, any>({
+			model: "subscription",
+			data: {
+				referenceId: rowA!.referenceId,
+				plan: "starter",
+				status: "incomplete",
+				mollieCustomerId: rowA!.mollieCustomerId,
+				customerType: "user",
+				cancelAtPeriodEnd: false,
+				lockToken: "someone-else",
+				lockedUntil: new Date(Date.now() + 60_000),
+				createdAt: new Date(),
+				updatedAt: new Date(),
+			},
+		});
+		env.fake.completePayment(payment.id, "paid");
+		expect((await env.webhook(`id=${payment.id}`)).status).toBe(409);
+
+		await env.context.adapter.update({
+			model: "subscription",
+			where: [{ field: "id", value: rowB.id }],
+			update: { lockedUntil: new Date(0) },
+		});
+		expect((await env.webhook(`id=${payment.id}`)).status).toBe(200);
+		await settle();
+		expect((await env.subscription(rowA!.id)).status).toBe("active");
+		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([payment.id]);
+	});
+});

@@ -304,7 +304,12 @@ export async function recordPayment(
 	ctx: Ctx,
 	payment: MolliePayment,
 	subscriptionId: string,
-): Promise<{ record: MolliePaymentRecord; transitioned: boolean }> {
+): Promise<{
+	record: MolliePaymentRecord;
+	transitioned: boolean;
+	/** The status before this call (`null` when the record was created now). */
+	previous: MolliePaymentRecord["status"] | null;
+}> {
 	const { adapter } = ctx.context;
 	const where: Where[] = [{ field: "molliePaymentId", value: payment.id }];
 	const status = payment.status as MolliePaymentRecord["status"];
@@ -329,14 +334,16 @@ export async function recordPayment(
 					...timestamps,
 				},
 			});
-			return { record: created, transitioned: isFinalPaymentStatus(status) };
+			return { record: created, transitioned: isFinalPaymentStatus(status), previous: null };
 		} catch (error) {
 			// Unique molliePaymentId: someone else recorded it first.
 			existing = await adapter.findOne<MolliePaymentRecord>({ model: "molliePayment", where });
 			if (!existing) throw error;
 		}
 	}
-	if (!canAdvancePayment(existing.status, status)) return { record: existing, transitioned: false };
+	if (!canAdvancePayment(existing.status, status)) {
+		return { record: existing, transitioned: false, previous: existing.status };
+	}
 	const updated = await adapter.incrementOne<MolliePaymentRecord>({
 		model: "molliePayment",
 		where: [...where, { field: "status", value: existing.status }],
@@ -345,9 +352,9 @@ export async function recordPayment(
 	});
 	if (!updated) {
 		const current = await adapter.findOne<MolliePaymentRecord>({ model: "molliePayment", where });
-		return { record: current ?? existing, transitioned: false };
+		return { record: current ?? existing, transitioned: false, previous: existing.status };
 	}
-	return { record: updated, transitioned: isFinalPaymentStatus(status) };
+	return { record: updated, transitioned: isFinalPaymentStatus(status), previous: existing.status };
 }
 
 const PURPOSES: readonly PaymentPurpose[] = [
@@ -664,7 +671,27 @@ async function applyPayment(
 	let activated = false;
 
 	if (status === "paid" && record.outcome === "pending") {
-		const result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
+		let result: Application;
+		try {
+			result = await applyPaidPayment(ctx, options, subscription, payment, purpose, lock);
+		} catch (error) {
+			// Told to come back (e.g. another pending row is busy): undo recording
+			// the change to paid, so the retry sees it and runs its hooks.
+			if (recorded.transitioned && error instanceof OperationInProgressError) {
+				await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+					model: "molliePayment",
+					where: [
+						{ field: "molliePaymentId", value: payment.id },
+						{ field: "status", value: "paid" },
+						{ field: "outcome", value: "pending" },
+						{ field: "claimSerial", value: claim },
+					],
+					increment: {},
+					set: { status: recorded.previous ?? "open", paidAt: null },
+				});
+			}
+			throw error;
+		}
 		events.push(...(result.events ?? []));
 		if (result.kind === "applied") {
 			subscription = result.subscription;
