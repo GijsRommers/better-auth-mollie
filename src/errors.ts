@@ -4,19 +4,7 @@ import { MOLLIE_ERROR_CODES } from "./error-codes";
 import { OperationInProgressError, OperationSupersededError } from "./operations";
 import { errorMessage, isMollieApiError } from "./utils";
 
-/**
- * A subscription's plan (or the plan it is scheduled to change to) is not in
- * the configuration: Mollie keeps billing it as it is, but the plugin cannot
- * bring Mollie in line with it. The sync reports it.
- */
-export class PlanNotConfiguredError extends Error {
-	readonly plan: string;
-	constructor(plan: string, subscriptionId: string) {
-		super(`Plan "${plan}" of ${subscriptionId} is not configured`);
-		this.name = "PlanNotConfiguredError";
-		this.plan = plan;
-	}
-}
+export { InvalidPlansError, PlanConfigurationError, PlanNotConfiguredError } from "./plan-errors";
 
 /**
  * Converts an error from a Mollie call into an `APIError` for the client.

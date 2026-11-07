@@ -1,4 +1,5 @@
 import type { GenericEndpointContext } from "better-auth";
+import { InvalidPlansError } from "./plan-errors";
 import type { MollieInterval, MollieOptions, MolliePlan } from "./types";
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
@@ -158,6 +159,39 @@ export async function getPlans(options: MollieOptions): Promise<MolliePlan[]> {
 	const subscription = options.subscription;
 	if (!subscription?.enabled) return [];
 	return typeof subscription.plans === "function" ? await subscription.plans() : subscription.plans;
+}
+
+/**
+ * The plans, checked: for billing something new (a checkout, a plan change,
+ * a new Mollie subscription). Static plans were checked at startup.
+ */
+export async function getCheckedPlans(options: MollieOptions): Promise<MolliePlan[]> {
+	const plans = await getPlans(options);
+	const subscription = options.subscription;
+	if (subscription?.enabled && typeof subscription.plans === "function") {
+		try {
+			validatePlans(plans);
+		} catch (error) {
+			throw new InvalidPlansError(errorMessage(error));
+		}
+	}
+	return plans;
+}
+
+/** `name` in `plans`. */
+export function findPlan(plans: MolliePlan[], name: string): MolliePlan | undefined {
+	return plans.find((plan) => plan.name.toLowerCase() === name.toLowerCase());
+}
+
+/**
+ * The plan for hook data, after a change was stored: `undefined` when the
+ * plans cannot be loaded right now, so the hook is not lost over it.
+ */
+export async function planForHooks(
+	options: MollieOptions,
+	name: string,
+): Promise<MolliePlan | undefined> {
+	return getPlanByName(options, name).catch(() => undefined);
 }
 
 export async function getPlanByName(

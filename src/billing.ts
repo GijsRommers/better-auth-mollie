@@ -63,11 +63,14 @@ import {
 	ceilToUTCDate,
 	DAY_MS,
 	errorMessage,
+	findPlan,
 	fromMollieDate,
+	getCheckedPlans,
 	getPlanByName,
 	isMollieNotFound,
 	parseInterval,
 	planCurrency,
+	planForHooks,
 	toDate,
 	toMollieDate,
 } from "./utils";
@@ -198,7 +201,7 @@ export async function paymentHookData(
 		purpose,
 		record,
 		subscription,
-		plan: await getPlanByName(options, planName),
+		plan: await planForHooks(options, planName),
 		isVerification: purpose === "verification",
 		tax: purpose === "verification" ? null : trustedTax(options, metadata, payment.amount.currency),
 	};
@@ -285,7 +288,7 @@ async function applyPayment(
 			if (result.activated) {
 				activated = true;
 				// Applied already: a plans provider failing now must not lose the rest.
-				const plan = await getPlanByName(options, subscription.plan).catch(() => undefined);
+				const plan = await planForHooks(options, subscription.plan);
 				events.push({ type: "subscription.activated", subscription, plan, payment });
 			}
 			record =
@@ -384,9 +387,19 @@ async function applyPayment(
 	}
 	if (status === "paid") {
 		await refundVerification(ctx, options, payment, subscription, claim);
-		const chargeback = await settleChargeback(ctx, options, payment, subscription, lock, claim);
-		subscription = chargeback.subscription;
-		events.push(...chargeback.events);
+		// On its own: a failure here (e.g. Mollie unreachable) must not lose the
+		// events above. It stays to be done (see `isUnsettled`).
+		try {
+			const chargeback = await settleChargeback(ctx, options, payment, subscription, lock, claim);
+			subscription = chargeback.subscription;
+			events.push(...chargeback.events);
+		} catch (error) {
+			if (!(error instanceof OperationInProgressError)) {
+				ctx.context.logger.error(
+					`[mollie] Chargeback of ${payment.id} could not be processed; the sync retries it: ${errorMessage(error)}`,
+				);
+			}
+		}
 	}
 	// A new mandate, a new start or a postponed change: bring Mollie in line.
 	if (reconcile && (activated || subscription.mollieSyncNeeded || needsRemote(subscription))) {
@@ -1376,9 +1389,10 @@ export async function reconcileRemote(
 		return settled();
 	}
 
+	// Checked before anything at Mollie changes; Mollie keeps billing as it
+	// was, and the sync reports it.
 	const wanted = subscription.pendingPlan ?? subscription.plan;
-	const plan = await getPlanByName(options, wanted);
-	// Mollie keeps billing as it was; the sync reports it.
+	const plan = findPlan(await getCheckedPlans(options), wanted);
 	if (!plan) throw new PlanNotConfiguredError(wanted, subscription.id);
 	const planName = plan.name.toLowerCase();
 	const tax = await resolveTax(ctx, options, {

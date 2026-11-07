@@ -9,7 +9,7 @@ import {
 	settleCustomerCharges,
 	settleRecentCharges,
 } from "./billing";
-import { PlanNotConfiguredError } from "./errors";
+import { PlanConfigurationError, PlanNotConfiguredError } from "./errors";
 import type { BillingEvent } from "./events";
 import { gatewayFor, type MolliePayment, metadataOf } from "./gateway";
 import { billsIdentity } from "./identity";
@@ -37,7 +37,7 @@ import { catchUpSalesInvoices } from "./sales-invoices";
 import { BILLING_STATUSES, SYNCABLE_STATUSES } from "./status";
 import { toCents } from "./tax";
 import type { CustomerType, MollieOptions, MolliePaymentRecord, Subscription } from "./types";
-import { addDays, DAY_MS, errorMessage, getPlanByName } from "./utils";
+import { addDays, DAY_MS, errorMessage, getPlanByName, planForHooks } from "./utils";
 
 /**
  * What the clock and the cron do: transitions that depend only on time, and
@@ -75,7 +75,7 @@ export async function applyTimeTransitions(
 			{ mollieSync: true, lock },
 		);
 		if (!canceled) return { subscription, events: [] };
-		const plan = await getPlanByName(options, canceled.plan);
+		const plan = await planForHooks(options, canceled.plan);
 		return {
 			subscription: canceled,
 			events: [
@@ -301,10 +301,10 @@ export async function syncSubscription(
 	let certain = true;
 	// A plan missing from the configuration, once per run: it does not hold
 	// up the decisions here, which do not need it.
-	const missingPlans = new Set<string>();
-	const reportMissingPlan = (error: PlanNotConfiguredError) => {
-		if (missingPlans.has(error.plan)) return;
-		missingPlans.add(error.plan);
+	const planProblems = new Set<string>();
+	const reportPlanProblem = (error: PlanConfigurationError) => {
+		if (planProblems.has(error.message)) return;
+		planProblems.add(error.message);
 		errors.push(error.message);
 		ctx.context.logger.error(`[mollie] ${error.message}`);
 	};
@@ -313,7 +313,7 @@ export async function syncSubscription(
 			await fn();
 		} catch (error) {
 			// No reason to doubt the payments.
-			if (error instanceof PlanNotConfiguredError) return reportMissingPlan(error);
+			if (error instanceof PlanConfigurationError) return reportPlanProblem(error);
 			certain = false;
 			if (!(error instanceof OperationInProgressError)) {
 				errors.push(`${label}: ${errorMessage(error)}`);
@@ -352,7 +352,7 @@ export async function syncSubscription(
 			if (!name) continue;
 			try {
 				if (!(await getPlanByName(options, name))) {
-					reportMissingPlan(new PlanNotConfiguredError(name, seen.id));
+					reportPlanProblem(new PlanNotConfiguredError(name, seen.id));
 				}
 			} catch (error) {
 				errors.push(`plans: ${errorMessage(error)}`);

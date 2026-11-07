@@ -123,7 +123,7 @@ describe("when the plans provider fails or is invalid", () => {
 		};
 	}
 
-	it("keeps a payment's hooks due until they can be built", async () => {
+	it("still runs a payment's hooks, without the plan", async () => {
 		const provider = flaky();
 		const env = await setup({ subscription: { plans: provider.plans } });
 		const { payment } = await env.checkout("starter");
@@ -131,7 +131,8 @@ describe("when the plans provider fails or is invalid", () => {
 		env.fake.completePayment(payment.id, "failed");
 		await env.webhook(`id=${payment.id}`);
 		await settle();
-		expect(env.hooks.onPaymentFailed).not.toHaveBeenCalled();
+		expect(env.hooks.onPaymentFailed).toHaveBeenCalledTimes(1);
+		expect(env.hooks.onPaymentFailed.mock.calls[0]![0]).toMatchObject({ plan: undefined });
 
 		provider.set("ok");
 		await env.webhook(`id=${payment.id}`);
@@ -139,7 +140,7 @@ describe("when the plans provider fails or is invalid", () => {
 		expect(env.hooks.onPaymentFailed).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps a chargeback's hook due until it can be built", async () => {
+	it("still runs a chargeback's hook, without the plan", async () => {
 		const provider = flaky();
 		const onChargeback = vi.fn(async (..._args: any[]) => {});
 		const env = await setup({ subscription: { plans: provider.plans, onChargeback } });
@@ -151,7 +152,7 @@ describe("when the plans provider fails or is invalid", () => {
 		provider.set("down");
 		await env.webhook(`id=${renewal.id}`);
 		await settle();
-		expect(onChargeback).not.toHaveBeenCalled();
+		expect(onChargeback).toHaveBeenCalledTimes(1);
 
 		provider.set("ok");
 		await env.webhook(`id=${renewal.id}`);
@@ -177,6 +178,87 @@ describe("when the plans provider fails or is invalid", () => {
 				headers: (await env.signInWithTestUser()).headers,
 			}),
 		).rejects.toBeTruthy();
+	});
+});
+
+describe("plans that change or break", () => {
+	it("checks and uses the same plans in a checkout", async () => {
+		let calls = 0;
+		const env = await setup({
+			subscription: {
+				// A second lookup would see another price.
+				plans: async () =>
+					++calls === 1 ? PLANS : PLANS.map((plan) => ({ ...plan, amount: "1.00" })),
+			},
+		});
+		const { payment } = await env.checkout("starter");
+		expect(payment.amount.value).toBe("9.95");
+	});
+
+	it("does not schedule billing from invalid plans when restoring", async () => {
+		let invalid = false;
+		const env = await setup({
+			subscription: {
+				plans: async () => (invalid ? [...PLANS, { ...PLANS[0]!, amount: "1.00" }] : PLANS),
+			},
+		});
+		const subscription = await subscribe(env);
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+		invalid = true;
+		await env.api.restoreSubscription({ body: {}, headers: env.headers });
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+
+		travel(new Date(subscription.periodEnd!).getTime() - 12 * 3_600_000);
+		const result = await syncMollieSubscriptions(env.auth as never);
+		expect(result.errors.map((e) => e.message)).toContainEqual(
+			expect.stringContaining("Invalid plans"),
+		);
+		expect(env.fake.activeSubscriptionsFor(subscription.mollieCustomerId!)).toEqual([]);
+	});
+
+	it("still runs the duplicate and cancellation hooks while plans cannot be loaded", async () => {
+		let down = false;
+		const onDuplicatePayment = vi.fn(async () => {});
+		const env = await setup({
+			subscription: {
+				onDuplicatePayment,
+				plans: async () => {
+					if (down) throw new Error("plans are down");
+					return PLANS;
+				},
+			},
+		});
+		const first = await env.checkout("starter");
+		const second = await env.checkout("business");
+		env.fake.completePayment(first.payment.id, "paid");
+		env.fake.completePayment(second.payment.id, "paid");
+		await env.webhook(`id=${first.payment.id}`);
+		down = true;
+		await env.webhook(`id=${second.payment.id}`);
+		await settle();
+		expect(onDuplicatePayment).toHaveBeenCalledTimes(1);
+
+		down = false;
+		const [subscription] = (await env.subscriptions()).filter((s) => s.status === "active");
+		await env.api.cancelSubscription({ body: { returnUrl: "/account" }, headers: env.headers });
+		down = true;
+		travel(new Date(subscription!.periodEnd!).getTime() + 3_600_000);
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(env.hooks.onSubscriptionCanceled).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps the activation's hooks when the chargeback check fails", async () => {
+		const env = await setup();
+		const { payment } = await env.checkout("starter");
+		env.fake.completePayment(payment.id, "paid");
+		env.fake.chargeBack(payment.id);
+		env.fake.failNext("chargebacks.list", new TypeError("fetch failed"));
+		await env.webhook(`id=${payment.id}`);
+		await settle();
+		expect(env.hooks.onSubscriptionActivated).toHaveBeenCalledTimes(1);
+		expect(env.hooks.onPaymentPaid).toHaveBeenCalledTimes(1);
 	});
 });
 

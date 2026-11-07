@@ -408,7 +408,7 @@ subscription: {
 onCustomerCreate: async ({ mollieCustomer, user }) => {},
 ```
 
-Payment hooks receive `{ payment, purpose, record, subscription, plan, isVerification, tax }`. `purpose` is one of `checkout`, `verification`, `renewal`, `proration` or `recovery`.
+Payment hooks receive `{ payment, purpose, record, subscription, plan, isVerification, tax }`. `purpose` is one of `checkout`, `verification`, `renewal`, `proration` or `recovery`. `plan` (in every hook) is `undefined` when the plan is no longer configured or a `plans` function cannot be loaded at that moment: the hook still runs.
 
 Hooks run at most once per change, after the change is stored. A failing hook is logged and not retried, and it does not stop other hooks. If the process stops between storing a change and running its hooks, those hooks do not run. Don't rely on a hook alone for anything that must happen:
 
@@ -458,7 +458,7 @@ Rename tables or fields with the `schema` option, as in other Better Auth plugin
 | `getCustomerCreateParams`, `onCustomerCreate`                           |                             | Customize the Mollie customer for users                                                                                                                              |
 | `organization.getCustomerCreateParams`, `organization.onCustomerCreate` |                             | The same, for organizations                                                                                                                                          |
 | `subscription.enabled`                                                  |                             |                                                                                                                                                                      |
-| `subscription.plans`                                                    | required                    | Array or (async) function, called (and checked) whenever plans are needed                                                                                            |
+| `subscription.plans`                                                    | required                    | Array or (async) function, called when plans are needed and checked before anything new is billed                                                                    |
 | `subscription.customerType`                                             | `"organization"`            | Default billed party                                                                                                                                                 |
 | `subscription.authorizeReference`                                       |                             | Required for organization billing                                                                                                                                    |
 | `subscription.requireEmailVerification`                                 | `false`                     |                                                                                                                                                                      |

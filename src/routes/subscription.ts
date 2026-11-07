@@ -54,6 +54,8 @@ import {
 	ceilToUTCDate,
 	DAY_MS,
 	errorMessage,
+	findPlan,
+	getCheckedPlans,
 	getPlanByName,
 	getPlans,
 	getUrl,
@@ -62,7 +64,6 @@ import {
 	parseInterval,
 	planCurrency,
 	toMollieDate,
-	validatePlans,
 } from "../utils";
 
 function subscriptionOptions(options: MollieOptions): SubscriptionOptions {
@@ -615,10 +616,9 @@ export const upgradeSubscription = (options: MollieOptions) =>
 			if (config.requireEmailVerification && !user.emailVerified) {
 				throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.EMAIL_VERIFICATION_REQUIRED);
 			}
-			// Checked where money is asked for; payments already made are still
-			// processed with the plans as they are (a webhook must not fail on it).
-			if (typeof config.plans === "function") validatePlans(await getPlans(options));
-			const plan = await getPlanByName(options, body.plan);
+			// Loaded once and checked where money is asked for; payments already
+			// made are processed with the plans as they are.
+			const plan = findPlan(await getCheckedPlans(options), body.plan);
 			if (!plan) throw APIError.from("BAD_REQUEST", MOLLIE_ERROR_CODES.SUBSCRIPTION_PLAN_NOT_FOUND);
 			const planName = plan.name.toLowerCase();
 			// An archived plan stays for the subscriptions already on it.

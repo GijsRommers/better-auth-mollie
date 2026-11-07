@@ -16,11 +16,11 @@ import { mapMollieSubscriptionStatus } from "./status";
 import { chargeAmount, fromCents, taxMetadata, toCents } from "./tax";
 import type { MollieOptions, MolliePlan, Subscription, TaxBreakdown } from "./types";
 import {
-	getPlanByName,
 	getWebhookUrl,
 	isMollieApiError,
 	isMollieNotFound,
 	planCurrency,
+	planForHooks,
 	toMollieDate,
 } from "./utils";
 
@@ -254,7 +254,7 @@ export async function reconcileMollieSubscription(
 			{ mollieSync: true, lock },
 		);
 		if (!canceled) return [];
-		const plan = await getPlanByName(options, canceled.plan);
+		const plan = await planForHooks(options, canceled.plan);
 		return [
 			{ type: "subscription.canceled", subscription: canceled, plan, reason: "mollie_canceled" },
 		];
