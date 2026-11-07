@@ -7,6 +7,7 @@ import {
 	type MollieSubscription,
 	metadataOf,
 	paymentPurpose,
+	purposeOf,
 } from "./gateway";
 import { coverage, withReferenceLock } from "./identity";
 import { type SubscriptionLock, withSubscriptionLock } from "./lock";
@@ -194,7 +195,7 @@ export async function paymentHookData(
 	subscription: Subscription,
 ): Promise<PaymentHookData> {
 	const metadata = metadataOf(payment);
-	const purpose = paymentPurpose(payment);
+	const purpose = purposeOf(payment, record);
 	const planName = typeof metadata.plan === "string" ? metadata.plan : subscription.plan;
 	return {
 		payment,
@@ -275,7 +276,7 @@ async function applyPayment(
 	await recordPayment(ctx, payment, subscription.id);
 	let record = await claimPayment(ctx, payment.id, lock);
 	const claim = lock.serial;
-	const purpose = paymentPurpose(payment);
+	const purpose = purposeOf(payment, record);
 	const status = payment.status;
 	const events: BillingEvent[] = [];
 	const duplicateEvents: BillingEvent[] = [];
@@ -719,7 +720,7 @@ async function chargeBackPeriod(
 	lock: SubscriptionLock,
 ): Promise<Subscription | null> {
 	if (record.outcome !== "applied") return null;
-	const purpose = paymentPurpose(payment);
+	const purpose = purposeOf(payment, record);
 	if (purpose === "verification") return null;
 	// Applied, so it paid for an upgrade; one of an earlier period is left alone there.
 	if (purpose === "proration") return applyFailedRenewal(ctx, options, subscription, payment, lock);

@@ -55,6 +55,22 @@ export function paymentPurpose(payment: MolliePayment): PaymentPurpose {
 	return "renewal";
 }
 
+/**
+ * Why a payment exists: as recorded with it, else from its Mollie metadata.
+ * The record wins, so a payment imported from another billing system (whose
+ * Mollie metadata the plugin never set) is handled as what it was.
+ */
+export function purposeOf(
+	payment: MolliePayment,
+	record: { purpose?: string | null | undefined } | null | undefined,
+): PaymentPurpose {
+	const recorded = record?.purpose;
+	if (recorded && PURPOSES.includes(recorded as PaymentPurpose)) {
+		return recorded as PaymentPurpose;
+	}
+	return paymentPurpose(payment);
+}
+
 /** Payment metadata as a plain object (Mollie allows strings and arrays too). */
 export function metadataOf(resource: { metadata?: unknown }): Record<string, unknown> {
 	const metadata = resource.metadata;
