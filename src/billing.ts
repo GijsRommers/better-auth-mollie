@@ -197,15 +197,17 @@ async function claimPayment(
 	molliePaymentId: string,
 	lock: SubscriptionLock,
 ): Promise<MolliePaymentRecord> {
-	const claimed = await ctx.context.adapter.incrementOne<MolliePaymentRecord>({
-		model: "molliePayment",
-		where: [
-			{ field: "molliePaymentId", value: molliePaymentId },
-			{ field: "claimSerial", operator: "lte", value: lock.serial },
-		],
-		increment: {},
-		set: { claimSerial: lock.serial },
-	});
+	const claim = (unclaimed: Where) =>
+		ctx.context.adapter.incrementOne<MolliePaymentRecord>({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: molliePaymentId }, unclaimed],
+			increment: {},
+			set: { claimSerial: lock.serial },
+		});
+	const claimed =
+		(await claim({ field: "claimSerial", operator: "lte", value: lock.serial })) ??
+		// A record from before `claimSerial` existed (missing or NULL).
+		(await claim({ field: "claimSerial", value: null }));
 	if (!claimed) throw new LockLostError(`payment:${molliePaymentId}`);
 	return claimed;
 }
@@ -491,8 +493,10 @@ async function applyPayment(
 			// a crash right after recording the payment is repaired next time.
 			subscription = (await expireCheckout(ctx, subscription, lock)) ?? subscription;
 		} else if (
-			(purpose === "renewal" || purpose === "proration") &&
-			isFailedPaymentStatus(status)
+			isFailedPaymentStatus(status) &&
+			(purpose === "renewal" ||
+				// A failed pro-rata charge only matters for the upgrade it belongs to.
+				(purpose === "proration" && subscription.appliedPaymentId === payment.id))
 		) {
 			subscription = (await applyFailedRenewal(ctx, subscription, payment, lock)) ?? subscription;
 		}
@@ -1758,6 +1762,18 @@ export async function syncSubscription(
 	return { events, checkedRemote };
 }
 
+/** A payment as it was before Mollie finished it: recorded to be processed later. */
+function unprocessed(payment: MolliePayment): MolliePayment {
+	return {
+		...payment,
+		status: "open",
+		paidAt: null,
+		failedAt: null,
+		expiredAt: null,
+		canceledAt: null,
+	} as MolliePayment;
+}
+
 /**
  * Pro-rata charges whose creation was interrupted before they were recorded
  * (the response was lost, or the process stopped): each upgrade attempt has
@@ -1794,10 +1810,12 @@ async function recoverAbandonedCharges(
 				createdAt,
 			);
 			if (found) {
-				// Recorded first: from then on the payment is outstanding locally and
-				// is processed by every sync until settled, whatever happens next.
+				// Recorded first, as not yet processed (open): from then on the
+				// payment is outstanding locally and every sync processes it until
+				// settled, and processing still sees its change to paid or failed
+				// (so its hooks run).
 				const payment = await gateway.getPayment(found);
-				await recordPayment(ctx, payment, subscription.id);
+				await recordPayment(ctx, unprocessed(payment), subscription.id);
 				await resolveOperation(ctx.context, op.idempotencyKey, "succeeded", found);
 				onEvents((await processPayment(ctx, options, payment)).events);
 			} else if (now.getTime() - createdAt.getTime() > REPLAY_WINDOW_MS) {

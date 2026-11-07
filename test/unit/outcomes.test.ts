@@ -884,6 +884,8 @@ describe("re-check of 0830e45: takeover, recovery bookkeeping, short intervals",
 		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
 		const record = (await env.payments()).find((r) => r.molliePaymentId === renewal.id);
 		expect(record?.outcome).toBe("applied");
+		// The stalled processor's claim does not block anyone after it.
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(200);
 	});
 
 	it("keeps an abandoned pro-rata charge outstanding when recovering it fails halfway", async () => {
@@ -942,4 +944,105 @@ describe("re-check of 0830e45: takeover, recovery bookkeeping, short intervals",
 			expect(active[0]?.nextPaymentDate).toBe(toMollieDate(periodEnd));
 		});
 	}
+});
+
+describe("re-check of 5d94fe8: older records, hooks of recovered charges, ended subscriptions", () => {
+	const prorations = (env: TestEnv) =>
+		[...env.fake.payments.values()].filter((p) => metadataPurpose(p) === "proration");
+
+	async function loseUpgradeCharge(env: TestEnv) {
+		env.fake.afterNextCreate("payments.create", () => {
+			throw new TypeError("socket hang up");
+		});
+		await expect(
+			env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers }),
+		).rejects.toBeTruthy();
+		return prorations(env)[0]!;
+	}
+
+	it("processes payments and locks recorded before the serials existed", async () => {
+		const env = await setup();
+		const subscription = await subscribe(env);
+		const periodEnd = new Date(subscription.periodEnd!);
+		travel(periodEnd.getTime() + 3_600_000);
+		const renewal = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "open");
+		await env.webhook(`id=${renewal.id}`);
+		// As an older version left them: no serials.
+		await env.context.adapter.update({
+			model: "subscription",
+			where: [{ field: "id", value: subscription.id }],
+			update: { lockSerial: null },
+		});
+		await env.context.adapter.update({
+			model: "molliePayment",
+			where: [{ field: "molliePaymentId", value: renewal.id }],
+			update: { claimSerial: null },
+		});
+
+		env.fake.completePayment(renewal.id, "paid");
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(200);
+		const row = await env.subscription(subscription.id);
+		expect(row.appliedPaymentId).toBe(renewal.id);
+		expect(new Date(row.periodEnd!).getTime()).toBeGreaterThan(periodEnd.getTime());
+		expect(typeof row.lockSerial).toBe("number");
+		expect((await env.webhook(`id=${renewal.id}`)).status).toBe(200);
+	});
+
+	it("runs the paid hook of a recovered charge, then refunds it", async () => {
+		const onPaymentPaid = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentPaid } });
+		await subscribe(env, "starter");
+		await settle();
+		onPaymentPaid.mockClear();
+		const lost = await loseUpgradeCharge(env);
+		env.fake.completePayment(lost.id, "paid");
+
+		travel(Date.now() + 15 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([lost.id]);
+		expect(refundedIds(env)).toEqual([lost.id]);
+	});
+
+	it("runs the failure hook of a recovered charge that failed, without making anything past due", async () => {
+		const onPaymentFailed = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentFailed } });
+		const subscription = await subscribe(env, "starter");
+		const lost = await loseUpgradeCharge(env);
+		env.fake.completePayment(lost.id, "failed");
+
+		travel(Date.now() + 15 * 60_000);
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		expect(onPaymentFailed.mock.calls.map(([data]) => data.payment.id)).toEqual([lost.id]);
+		expect(await env.subscription(subscription.id)).toMatchObject({
+			status: "active",
+			plan: "starter",
+		});
+	});
+
+	it("finishes an unresolved charge of a subscription that has ended", async () => {
+		const onPaymentPaid = vi.fn(async (_data: any) => {});
+		const env = await setup({ subscription: { onPaymentPaid } });
+		const subscription = await subscribe(env, "starter");
+		await env.api.upgradeSubscription({ body: { plan: "business" }, headers: env.headers });
+		const [proration] = prorations(env);
+		expect(proration?.status).toBe("open");
+		// The subscription ended, with nothing else left to do, before the charge settled.
+		await env.context.adapter.update({
+			model: "subscription",
+			where: [{ field: "id", value: subscription.id }],
+			update: { status: "canceled", mollieSyncNeeded: false },
+		});
+		await settle();
+		onPaymentPaid.mockClear();
+		env.fake.completePayment(proration!.id, "paid");
+
+		await syncMollieSubscriptions(env.auth as never);
+		await settle();
+		const record = (await env.payments()).find((r) => r.molliePaymentId === proration!.id);
+		expect(record).toMatchObject({ status: "paid", outcome: "applied" });
+		expect(onPaymentPaid.mock.calls.map(([data]) => data.payment.id)).toEqual([proration!.id]);
+		expect(refundedIds(env)).toEqual([]);
+	});
 });

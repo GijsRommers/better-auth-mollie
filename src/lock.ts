@@ -52,11 +52,28 @@ export async function withSubscriptionLock<T>(
 			(await claim({ field: "lockedUntil", operator: "lt", value: new Date() })) ??
 			(await claim({ field: "lockedUntil", value: null }));
 		if (claimed) {
-			serial = Number(claimed.lockSerial ?? 0);
+			serial = await serialOf(claimed);
 			break;
 		}
 		if (attempt >= tries) throw new OperationInProgressError(key);
 		await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+	}
+
+	/** Rows from before `lockSerial` existed may hold `NULL` (and `NULL + 1` stays `NULL`). */
+	async function serialOf(claimed: Subscription): Promise<number> {
+		if (typeof claimed.lockSerial === "number") return claimed.lockSerial;
+		const started = await adapter.incrementOne<Subscription>({
+			model: "subscription",
+			where: [
+				{ field: "id", value: subscriptionId },
+				{ field: "lockToken", value: token },
+				{ field: "lockSerial", value: null },
+			],
+			increment: {},
+			set: { lockSerial: 1 },
+		});
+		if (!started) throw new LockLostError(key);
+		return 1;
 	}
 
 	const held = (): Where[] => [
