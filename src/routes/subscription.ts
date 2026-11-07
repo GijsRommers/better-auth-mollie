@@ -150,6 +150,8 @@ async function findOpenCheckout(
 		currency: string;
 		purpose: PaymentPurpose;
 		customerId: string;
+		/** The trial it gives (`trialTerms`): reused only for the same one. */
+		trial: string;
 	},
 	lock: SubscriptionLock,
 ): Promise<{ url?: string; activated?: boolean }> {
@@ -173,7 +175,8 @@ async function findOpenCheckout(
 			payment.amount.currency === match.currency &&
 			payment.customerId === match.customerId &&
 			metadataOf(payment).plan === match.plan &&
-			paymentPurpose(payment) === match.purpose
+			paymentPurpose(payment) === match.purpose &&
+			trialTerms(metadataOf(payment)) === match.trial
 		) {
 			return { url };
 		}
@@ -704,6 +707,11 @@ export const upgradeSubscription = (options: MollieOptions) =>
 								currency: planCurrency(plan),
 								purpose: input.purpose,
 								customerId: input.customerId,
+								trial: trialTerms(
+									input.trialEnd
+										? { trialEnd: input.trialEnd.toISOString() }
+										: { trialDays: input.trialDays },
+								),
 							},
 							lock,
 						);
@@ -836,6 +844,16 @@ export const upgradeSubscription = (options: MollieOptions) =>
 	);
 
 /**
+ * The trial a first payment gives, from its metadata (or the same fields
+ * for a new one): its fixed end, or its number of days. A checkout is only
+ * reused, or recovered from the journal, for the same trial.
+ */
+function trialTerms(metadata: { trialEnd?: unknown; trialDays?: unknown }): string {
+	if (typeof metadata.trialEnd === "string") return `until-${metadata.trialEnd}`;
+	return `days-${typeof metadata.trialDays === "number" ? metadata.trialDays : 0}`;
+}
+
+/**
  * The trial of a new subscription: `getTrialEnd` when it decides, or the
  * plan's `freeTrial` once per reference. `null` for none.
  */
@@ -931,7 +949,7 @@ async function createCheckout(
 			referenceId,
 			// Everything the checkout charges: an attempt recovered from the
 			// journal must be for this very price.
-			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}:${planCurrency(plan)}`,
+			scope: `${checkoutScope(purpose, row.id)}${planName}:${amount}:${planCurrency(plan)}:${trialTerms(trialEnd ? { trialEnd: trialEnd.toISOString() } : { trialDays })}`,
 			reuseSucceeded: false,
 			execute: async (idempotencyKey) => {
 				await input.fence();

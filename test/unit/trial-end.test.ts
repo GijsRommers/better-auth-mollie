@@ -92,4 +92,33 @@ describe("subscription.getTrialEnd", () => {
 		await expect(env.checkout("starter")).rejects.toBeTruthy();
 		expect(env.fake.callsTo("payments.create")).toEqual([]);
 	});
+
+	describe("when the app changes the trial end before payment", () => {
+		async function changing() {
+			let end = new Date(Date.now() + 20 * DAY);
+			const env = await setup({ subscription: { getTrialEnd: async () => end } });
+			return { env, change: (to: Date) => (end = to) };
+		}
+
+		it("does not reuse the open checkout of the earlier trial", async () => {
+			const { env, change } = await changing();
+			const first = await env.checkout("starter");
+			const shorter = change(new Date(Date.now() + 2 * DAY));
+			const second = await env.checkout("starter");
+			expect(second.payment.id).not.toBe(first.payment.id);
+			env.fake.completePayment(second.payment.id, "paid");
+			await env.webhook(`id=${second.payment.id}`);
+			const [subscription] = await env.subscriptions();
+			expect(new Date(subscription!.trialEnd!)).toEqual(ceilToUTCDate(shorter));
+		});
+
+		it("does not recover a lost checkout of the earlier trial", async () => {
+			const { env, change } = await changing();
+			env.fake.loseNextResponse("payments.create");
+			await expect(env.checkout("starter")).rejects.toBeTruthy();
+			const shorter = change(new Date(Date.now() + 2 * DAY));
+			const { payment } = await env.checkout("starter");
+			expect((payment.metadata as { trialEnd?: string }).trialEnd).toBe(shorter.toISOString());
+		});
+	});
 });
