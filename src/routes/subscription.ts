@@ -4,7 +4,6 @@ import type { PaymentRequest } from "mollie-api-typescript/models";
 import * as z from "zod";
 import {
 	checkoutScope,
-	paymentPurpose,
 	processPayment,
 	reconcileRemote,
 	recordPayment,
@@ -15,7 +14,7 @@ import { getOrCreateCustomer } from "../customer";
 import { MOLLIE_ERROR_CODES } from "../error-codes";
 import { toAPIError } from "../errors";
 import { dispatchEvents } from "../events";
-import { checkoutUrl, gatewayFor, metadataOf } from "../gateway";
+import { checkoutUrl, gatewayFor, metadataOf, purposeOf } from "../gateway";
 import { billsIdentity, coverage, withReferenceLock } from "../identity";
 import { type SubscriptionLock, withSubscriptionLock } from "../lock";
 import { mollieSessionMiddleware, referenceMiddleware } from "../middleware";
@@ -176,7 +175,7 @@ async function findOpenCheckout(
 			payment.amount.currency === match.currency &&
 			payment.customerId === match.customerId &&
 			metadataOf(payment).plan === match.plan &&
-			paymentPurpose(payment) === match.purpose &&
+			purposeOf(payment, attempt) === match.purpose &&
 			trialTerms(metadataOf(payment)) === match.trial
 		) {
 			return { url };

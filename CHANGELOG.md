@@ -6,7 +6,7 @@ All notable changes to `better-auth-mollie`. The project follows [semantic versi
 
 No breaking changes and no schema changes.
 
-- The purpose recorded with a payment (`molliePayment.purpose`) now decides how it is handled, over its Mollie metadata. A payment imported from earlier billing, such as a trial's verification payment without the plugin's metadata, is then handled as what it was: a chargeback of it no longer suspends the trial.
+- The purpose recorded with a payment (`molliePayment.purpose`) now decides how it is handled, over its Mollie metadata. A payment imported from earlier billing, such as a trial's verification payment without the plugin's metadata, is then handled as what it was: a chargeback of it no longer suspends the trial. A first payment whose recorded purpose does not match its trial terms starts nothing: it stays unprocessed and is logged.
 - `subscription.refundDescription`: the description of the refunds the plugin makes (duplicates and verification payments), e.g. in the customer's language.
 - README: the indexes the sync needs on a large `molliePayment` table, and that charged-back payments keep their sales invoice (the plugin issues no credit notes).
 

@@ -4,7 +4,7 @@
  * never set) is handled as what it was.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { settle, setup, type TestEnv } from "../helpers/setup";
+import { settle, setup, subscribe, type TestEnv, travel } from "../helpers/setup";
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -43,6 +43,63 @@ describe("the recorded purpose", () => {
 		expect(onChargeback.mock.calls[0]![0]).toMatchObject({
 			purpose: "verification",
 			isVerification: true,
+		});
+	});
+
+	describe("when it disagrees with the payment's trial terms", () => {
+		const setPurpose = (env: TestEnv, id: string, purpose: string) =>
+			env.context.adapter.update({
+				model: "molliePayment",
+				where: [{ field: "molliePaymentId", value: id }],
+				update: { purpose },
+			});
+		const expectNothingStarted = async (env: TestEnv) => {
+			expect((await env.subscriptions())[0]).toMatchObject({ status: "incomplete" });
+			expect(env.fake.refunds.size).toBe(0);
+			expect(env.fake.callsTo("subscriptions.create")).toEqual([]);
+		};
+
+		it("does not start a paid period from a recorded verification without trial terms", async () => {
+			const env = await setup({ subscription: { refundVerificationPayment: true } });
+			const { payment } = await env.checkout("pro");
+			env.fake.payments.get(payment.id)!.metadata = {
+				...(payment.metadata as object),
+				trial: false,
+				trialDays: 0,
+			};
+			env.fake.completePayment(payment.id, "paid");
+			await env.webhook(`id=${payment.id}`);
+			await expectNothingStarted(env);
+		});
+
+		it("does not start a paid period from a trial's payment recorded as a checkout", async () => {
+			const env = await setup();
+			const { payment } = await env.checkout("pro");
+			await setPurpose(env, payment.id, "checkout");
+			env.fake.completePayment(payment.id, "paid");
+			await env.webhook(`id=${payment.id}`);
+			await expectNothingStarted(env);
+		});
+
+		it("is compared when an open checkout could be reused", async () => {
+			const env = await setup();
+			const subscription = await subscribe(env);
+			travel(new Date(subscription.periodEnd!).getTime() + 3_600_000);
+			const failed = env.fake.chargeSubscription(subscription.mollieSubscriptionId!, "failed");
+			await env.webhook(`id=${failed.id}`);
+			const { headers } = await env.signInWithTestUser();
+			const recover = () => env.api.upgradeSubscription({ body: { plan: "starter" }, headers });
+			const latest = () => [...env.fake.payments.values()].at(-1)!;
+
+			await recover();
+			const first = latest();
+			expect(first).toMatchObject({ metadata: expect.objectContaining({ purpose: "recovery" }) });
+			await recover();
+			expect(latest().id).toBe(first.id);
+
+			await setPurpose(env, first.id, "checkout");
+			await recover();
+			expect(latest().id).not.toBe(first.id);
 		});
 	});
 

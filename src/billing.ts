@@ -420,7 +420,7 @@ async function applyPaidPayment(
 	switch (purpose) {
 		case "checkout":
 		case "verification":
-			return activateSubscription(ctx, options, subscription, payment, lock);
+			return activateSubscription(ctx, options, subscription, payment, purpose, lock);
 		case "recovery":
 			return recoverSubscription(ctx, options, subscription, payment, lock);
 		case "renewal":
@@ -753,6 +753,7 @@ async function activateSubscription(
 	options: MollieOptions,
 	initial: Subscription,
 	payment: MolliePayment,
+	purpose: PaymentPurpose,
 	lock: SubscriptionLock,
 ): Promise<Application> {
 	// No longer pending (activated by another payment, expired, ended): this
@@ -776,6 +777,14 @@ async function activateSubscription(
 	// charges from the next UTC date on.
 	const fixedEnd = typeof metadata.trialEnd === "string" ? toDate(metadata.trialEnd) : null;
 	const isTrial = metadata.trial === true && (trialDays > 0 || !!fixedEnd);
+	// The purpose decides whether it is refunded, the terms what it starts:
+	// when they disagree (a row written by hand), it must not start anything.
+	if ((purpose === "verification") !== isTrial) {
+		ctx.context.logger.error(
+			`[mollie] Cannot activate ${initial.id} from payment ${payment.id}: its purpose (${purpose}) does not match its trial terms`,
+		);
+		return { kind: "unresolved" };
+	}
 	const trialEnd = !isTrial
 		? null
 		: ceilToUTCDate(
