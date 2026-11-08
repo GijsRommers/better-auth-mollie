@@ -38,6 +38,40 @@ jobs:
       - name: Check the example app
         run: pnpm --filter better-auth-mollie-example-sveltekit check
 
+  adapters:
+    name: ${{ matrix.adapter }} / ${{ matrix.database }}${{ matrix.adapter == 'prisma' && matrix.database == 'mysql' && ' (known incompatibility)' || '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [kysely, drizzle, prisma]
+        database: [sqlite, postgres, mysql]
+        exclude:
+          # Covered on both Node versions by the check job.
+          - adapter: kysely
+            database: sqlite
+    env:
+      TZ: UTC
+      TEST_DATABASE: ${{ matrix.database }}
+      TEST_ADAPTER: ${{ matrix.adapter }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Start a disposable database
+        if: matrix.database != 'sqlite'
+        run: docker compose -f test/compose.yaml up -d --wait ${{ matrix.database }}
+      - name: Billing regressions
+        if: matrix.adapter != 'prisma' || matrix.database != 'mysql'
+        run: pnpm test
+      - name: Known Prisma 6 / MySQL guarded-update incompatibility
+        if: matrix.adapter == 'prisma' && matrix.database == 'mysql'
+        run: pnpm test:prisma-mysql-contract
+
   integration:
     name: Integration (Mollie test mode)
     # Needs the MOLLIE_TEST_API_KEY secret, which pull requests from forks do not get.

@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syncMollieSubscriptions } from "../../src";
-import { applyTimeTransitions } from "../../src/sync";
+import { applyTimeTransitions } from "../../src/transitions";
 import { addDays, toMollieDate } from "../../src/utils";
 import { mollieError } from "../helpers/fake-mollie";
 import { gate, PLANS, settle, setup, subscribe, type TestEnv, travel } from "../helpers/setup";
@@ -1956,7 +1956,7 @@ describe("re-check of 0aaf7d3: stalled restores, legacy rows both ways, paging",
 				status: "active",
 				cancelAtPeriodEnd: true,
 				periodEnd: past,
-				lockedUntil: new Date(0),
+				lockedUntil: new Date(Date.now() - 1_000),
 				plan: "starter",
 			});
 		}
@@ -2105,7 +2105,7 @@ describe("re-check of a354581: hooks when an activation has to come back", () =>
 		await env.context.adapter.update({
 			model: "subscription",
 			where: [{ field: "id", value: rowB.id }],
-			update: { lockedUntil: new Date(0) },
+			update: { lockedUntil: new Date(Date.now() - 1_000) },
 		});
 		expect((await env.webhook(`id=${payment.id}`)).status).toBe(200);
 		await settle();

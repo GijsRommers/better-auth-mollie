@@ -1,5 +1,4 @@
 import type { AuthContext } from "better-auth";
-import { getTestInstance } from "better-auth/test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createGateway, type MollieGateway } from "../../src/gateway";
 import {
@@ -14,6 +13,7 @@ import {
 } from "../../src/operations";
 import { mollieOperationSchema } from "../../src/schema";
 import type { MollieOperation } from "../../src/types";
+import { databaseTestInstance as getTestInstance } from "../helpers/database";
 import { createFakeMollie, type FakeMollie, mollieError } from "../helpers/fake-mollie";
 import { assertTestDatabase, gate, testDatabase } from "../helpers/setup";
 
@@ -150,7 +150,9 @@ describe("runOperation", () => {
 		const release = fake.hold("subscriptions.create", "arrival");
 		const operation = createSubscriptionOperation(fake, customerId);
 		const attemptA = runOperation(context, operation);
-		await vi.waitFor(async () => expect(await listOps(context)).toHaveLength(1));
+		// A must have consumed the fake's hold. Seeing its journal row alone
+		// does not mean its insert has returned or its request has started.
+		await vi.waitFor(() => expect(fake.callsTo("subscriptions.create")).toHaveLength(1));
 
 		// B arrives minutes later, finds nothing at Mollie, and re-sends key #1.
 		const attemptB = await runOperation(context, { ...operation, now: later(minutes(5)) });

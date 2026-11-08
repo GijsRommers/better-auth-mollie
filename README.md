@@ -503,7 +503,8 @@ The billing logic is tested against a stateful fake of the Mollie SDK (including
 - **Eventually consistent, not instant.** A duplicate charge is refunded once it is detected (usually by its webhook, at the latest by the sync), so a customer can briefly be charged twice before the refund goes out.
 - **Hooks are best effort.** `onPaymentPaid` and the other hooks run at most once; a crash at the wrong moment loses one. Derive access from the subscription (`hasActiveSubscription`, `hasSubscriptionAccess`), and make your own invoicing idempotent or use `salesInvoices`, which the sync retries for 30 days. Older missed invoices need manual recovery.
 - **Keep the plugin's data.** Do not delete `subscription`, `molliePayment` or `mollieOperation` rows, and run the migration before deploying a new version (new columns are not backfilled).
-- **Your database must support atomic guarded updates and unique fields.** The plugin relies on Better Auth's `incrementOne` with conditions, and on a second insert of a unique field failing (its locks and payment records). Every test runs on SQLite (Kysely); other SQL adapters, Prisma, Drizzle and MongoDB should behave the same but are not tested here.
+- **Your database must support atomic guarded updates and unique fields.** The plugin relies on Better Auth's `incrementOne` with conditions, and on a second insert of a unique field failing (its locks and payment records). The billing suite covers SQLite and PostgreSQL 17 through Kysely, Drizzle and Prisma, plus MySQL 8.4 through Kysely and Drizzle (the versions pinned in this repository). This tests adapter behavior with a fake Mollie client, not live billing. MongoDB and other adapter versions are not covered.
+- **Prisma 6 with MySQL is incompatible.** In the tested Better Auth 1.7.18 / Prisma 6.19.3 combination, a guarded update that loses to another writer can return a stale row instead of `null`. The plugin can then mistake a failed lease acquisition or state transition for success. Do not use this combination for billing; passing individual lifecycle tests does not establish safety. The dedicated contract diagnostic reproduces the problem. Other Prisma major versions are not validated here.
 - **The memory adapter is for development and tests only.** It does not enforce unique fields, so the plugin's guarantees against concurrent requests do not hold on it, and it orders strings differently when sorting and when comparing. The plugin logs a warning when it runs on it. The unit tests also run on it (`pnpm test:memory`), except those that need unique fields.
 - **Clocks.** Lock leases and deadlines use the application servers' clocks; keep them in sync (NTP).
 
@@ -533,11 +534,48 @@ The billing logic is tested against a stateful fake of the Mollie SDK (including
 
 ## Testing
 
+See [Billing lifecycle and recovery](docs/billing-lifecycle.md) for transition rules,
+code boundaries and the evidence to collect during a controlled rollout.
+
 ```bash
 pnpm test                 # unit tests, against a stateful fake of the Mollie SDK
 pnpm test:memory          # the same, on Better Auth's memory adapter
 pnpm test:integration     # against Mollie test mode
 ```
+
+### Database and adapter matrix
+
+The same billing suite covers eight combinations: SQLite and PostgreSQL through
+Kysely, Drizzle and Prisma, plus MySQL through Kysely and Drizzle. Tests assert the selected adapter rather
+than silently falling back to SQLite. Prisma coverage uses the Prisma 6 release in
+the lockfile, not every Prisma major version.
+
+```bash
+docker compose -p mollie-auth-tests -f test/compose.yaml up -d --wait
+pnpm test:adapters
+# Or one combination:
+TZ=UTC TEST_DATABASE=postgres TEST_ADAPTER=drizzle pnpm test
+docker compose -p mollie-auth-tests -f test/compose.yaml down -v
+```
+
+The compose file (also used by CI) serves PostgreSQL on port 55432 and MySQL on
+53306. Each test instance creates and drops its own database, or temporary SQLite
+file, so `TEST_POSTGRES_URL` and `TEST_MYSQL_URL` must point at a disposable
+server whose user may create and drop databases. Never point them at production.
+
+The Drizzle tables derive from Better Auth's schema and use its SQL migrations;
+the Prisma client and DDL are generated under `test/.generated/` before the
+workers start. The matrix checks adapter semantics, not an application's own
+migrations, field mappings or relational queries.
+
+Prisma 6/MySQL is excluded from the supported billing matrix. Its separate CI job
+runs `pnpm test:prisma-mysql-contract`, an expected-failure check for the guarded
+update contract. Database setup and durable-winner checks still fail normally;
+only the incorrect returned loser row is an expected failure. An unexpected pass
+requires revisiting support. This is not a passing billing test or a retry policy.
+A direct Prisma/MySQL billing test invocation stops with an incompatibility error.
+
+### Mollie test mode
 
 The integration test uses a real test-mode profile. It drives Mollie's hosted checkout and test-mode status pages with Playwright (`pnpm exec playwright install chromium`):
 

@@ -2,6 +2,15 @@
 
 All notable changes to `better-auth-mollie`. The project follows [semantic versioning](https://semver.org); until 1.0, a minor version may break things, and every release says so here.
 
+## 0.2.1
+
+No public API changes or database migration required. Prisma 6 with MySQL is now explicitly documented as incompatible; this release does not fix that upstream adapter defect.
+
+- Released subscription locks now use `NULL` instead of the Unix epoch, which MySQL TIMESTAMP rejects. The existing nullable column needs no migration; older expired leases remain supported.
+- Run billing regressions across eight SQL engine/adapter combinations in CI. Prisma 6/MySQL is explicitly incompatible because a losing guarded update can return a stale row; retain a separate expected-failure contract diagnostic. Add disposable local databases and `pnpm test:adapters`.
+- Fix synchronization in the operation replay test: wait for the original outbound call before starting its retry, so the retry cannot consume the original call's pause.
+- Separate clock-driven transitions from sync orchestration and document the lifecycle invariants and operational validation steps.
+
 ## 0.2.0
 
 No breaking changes and no schema changes.

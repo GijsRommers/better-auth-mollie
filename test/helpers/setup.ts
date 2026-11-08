@@ -1,7 +1,6 @@
 import type { AuthContext, BetterAuthOptions } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { organization } from "better-auth/plugins/organization";
-import { getTestInstance } from "better-auth/test";
 import { vi } from "vitest";
 import { mollie } from "../../src";
 import { mollieClient } from "../../src/client";
@@ -12,6 +11,7 @@ import type {
 	Subscription,
 	SubscriptionOptions,
 } from "../../src/types";
+import { databaseTestInstance as getTestInstance, adapter as selectedAdapter } from "./database";
 import { createFakeMollie, type FakeMollie } from "./fake-mollie";
 
 export const BASE_URL = "http://app.example.com";
@@ -43,7 +43,7 @@ type SetupOptions = {
 };
 
 /**
- * The database tests run on: SQLite, or Better Auth's memory adapter with
+ * SQL engines/adapters are selected in database.ts. Better Auth's memory adapter uses
  * `TEST_DATABASE=memory` (or `memory`).
  */
 export function testDatabase(memory = false): Pick<BetterAuthOptions, "database" | "advanced"> {
@@ -58,7 +58,7 @@ export function testDatabase(memory = false): Pick<BetterAuthOptions, "database"
 
 /** Fails a test that does not run on the database `TEST_DATABASE` asks for. */
 export function assertTestDatabase(context: AuthContext, memory = false) {
-	const expected = memory || process.env.TEST_DATABASE === "memory" ? "memory" : "kysely";
+	const expected = memory || process.env.TEST_DATABASE === "memory" ? "memory" : selectedAdapter;
 	const actual = (context.adapter as { id?: string }).id;
 	if (actual !== expected) throw new Error(`Tests run on ${actual}, expected ${expected}`);
 }

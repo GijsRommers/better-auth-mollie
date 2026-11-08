@@ -100,7 +100,8 @@ export async function withSubscriptionLock<T>(
 					{ field: "lockToken", value: token },
 				],
 				increment: {},
-				set: { lockedUntil: new Date(0) },
+				// NULL means no lease, and avoids MySQL TIMESTAMP rejecting the Unix epoch.
+				set: { lockedUntil: null },
 			})
 			.catch(() => null);
 	}

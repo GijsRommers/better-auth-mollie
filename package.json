@@ -1,6 +1,6 @@
 {
 	"name": "better-auth-mollie",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Mollie subscriptions for Better Auth: mandates, recurring billing via the Mollie Subscriptions API, idempotent webhooks and organization billing.",
 	"type": "module",
 	"license": "MIT",
@@ -30,7 +30,8 @@
 		"dist",
 		"README.md",
 		"CHANGELOG.md",
-		"LICENSE"
+		"LICENSE",
+		"docs"
 	],
 	"main": "./dist/index.js",
 	"module": "./dist/index.js",
@@ -75,7 +76,9 @@
 		"test:memory": "TEST_DATABASE=memory vitest run --project unit",
 		"test:watch": "vitest --project unit",
 		"test:integration": "vitest run --project integration",
-		"prepublishOnly": "pnpm run build"
+		"prepublishOnly": "pnpm run build",
+		"test:adapters": "node scripts/test-adapters.mjs",
+		"test:prisma-mysql-contract": "TZ=UTC TEST_DATABASE=mysql TEST_ADAPTER=prisma vitest run --project prisma-mysql-contract"
 	},
 	"dependencies": {
 		"sales-tax": "^2.23.0",
@@ -88,10 +91,18 @@
 	"devDependencies": {
 		"@arethetypeswrong/cli": "0.18.5",
 		"@biomejs/biome": "2.6.5",
+		"@prisma/client": "6.19.3",
+		"@types/better-sqlite3": "9.6.0",
 		"@types/node": "24.19.2",
+		"@types/pg": "8.23.1",
 		"better-auth": "1.7.18",
+		"better-sqlite3": "13.0.3",
+		"drizzle-orm": "0.45.4",
 		"mollie-api-typescript": "1.12.44",
+		"mysql2": "3.24.6",
+		"pg": "8.23.1",
 		"playwright": "1.65.0",
+		"prisma": "6.19.3",
 		"publint": "0.3.25",
 		"tsup": "9.0.0",
 		"typescript": "5.9.3",

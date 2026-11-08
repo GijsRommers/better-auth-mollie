@@ -127,7 +127,7 @@ async function fenceOut(ctx: Ctx, subscription: Subscription, now: Date): Promis
 			model: "subscription",
 			where: [{ field: "id", value: subscription.id }, unlocked],
 			increment: { lockSerial: 1 },
-			set: { lockToken: globalThis.crypto.randomUUID(), lockedUntil: new Date(0) },
+			set: { lockToken: globalThis.crypto.randomUUID(), lockedUntil: null },
 		});
 	const rotated =
 		(await rotate({ field: "lockedUntil", operator: "lt", value: now })) ??
@@ -164,7 +164,7 @@ async function endDueCancellation(
 				pendingPlan: null,
 				mollieSyncNeeded: true,
 				lockToken: globalThis.crypto.randomUUID(),
-				lockedUntil: new Date(0),
+				lockedUntil: null,
 				updatedAt: new Date(),
 			},
 		});
