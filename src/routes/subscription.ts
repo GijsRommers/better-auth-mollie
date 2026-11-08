@@ -35,8 +35,8 @@ import {
 	hasSubscriptionAccess,
 	isFinalPaymentStatus,
 } from "../status";
-import { applyDueTransitions } from "../sync";
 import { chargeAmount, fromCents, resolveTax, taxMetadata, toCents } from "../tax";
+import { applyDueTransitions } from "../transitions";
 import type {
 	CustomerType,
 	FirstPaymentParams,

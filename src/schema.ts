@@ -95,7 +95,6 @@ export const subscriptionSchema = {
 			lockedUntil: {
 				type: "date",
 				required: false,
-				defaultValue: () => new Date(0),
 				input: false,
 			},
 			lockSerial: {

@@ -9,3 +9,4 @@ coverage/
 *.log
 .svelte-kit/
 examples/*/build/
+test/.generated/
