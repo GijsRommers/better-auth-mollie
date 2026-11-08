@@ -1,4 +1,4 @@
-import type { AuthContext } from "better-auth";
+import type { AuthContext, BetterAuthOptions } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { organization } from "better-auth/plugins/organization";
 import { getTestInstance } from "better-auth/test";
@@ -46,8 +46,14 @@ type SetupOptions = {
  * The database tests run on: SQLite, or Better Auth's memory adapter with
  * `TEST_DATABASE=memory` (or `memory`).
  */
-export function testDatabase(memory = false): { database?: ReturnType<typeof memoryAdapter> } {
-	return memory || process.env.TEST_DATABASE === "memory" ? { database: memoryDatabase() } : {};
+export function testDatabase(memory = false): Pick<BetterAuthOptions, "database" | "advanced"> {
+	if (!memory && process.env.TEST_DATABASE !== "memory") return {};
+	return {
+		database: memoryDatabase(),
+		// Lowercase ids: this adapter sorts strings and compares them differently,
+		// so paging by a mixed-case id can skip a row (see the README's limits).
+		advanced: { database: { generateId: () => crypto.randomUUID().replaceAll("-", "") } },
+	};
 }
 
 /** Fails a test that does not run on the database `TEST_DATABASE` asks for. */
